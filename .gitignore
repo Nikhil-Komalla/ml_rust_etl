@@ -3,6 +3,7 @@ dev/
 dev-answer/
 out/
 scratch/
+target/
 __pycache__/
 *.pyc
 tests/__pycache__/

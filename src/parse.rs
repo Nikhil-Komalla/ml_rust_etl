@@ -1,0 +1,267 @@
+use serde::Deserialize;
+
+pub const MS_SECOND: i64 = 1_000;
+pub const MS_DAY: i64 = 86_400_000;
+pub const MS_SESSION_GAP: i64 = 1_800_000;
+pub const MS_CLICK_REACH: i64 = 604_800_000;
+
+#[derive(Deserialize)]
+pub struct Manifest {
+    pub window_start: String,
+    pub window_end: String,
+}
+
+#[inline(always)]
+pub fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+#[inline(always)]
+pub fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+#[inline(always)]
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468
+}
+
+#[inline(always)]
+fn d2(a: u8, b: u8) -> Option<i64> {
+    let x = a.wrapping_sub(b'0');
+    let y = b.wrapping_sub(b'0');
+    if x < 10 && y < 10 {
+        Some((x as i64) * 10 + (y as i64))
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn d4(b: &[u8]) -> Option<i64> {
+    let a = b[0].wrapping_sub(b'0');
+    let c = b[1].wrapping_sub(b'0');
+    let d = b[2].wrapping_sub(b'0');
+    let e = b[3].wrapping_sub(b'0');
+    if a < 10 && c < 10 && d < 10 && e < 10 {
+        Some((a as i64) * 1000 + (c as i64) * 100 + (d as i64) * 10 + (e as i64))
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn parse_civil_datetime_19(b: &[u8]) -> Option<i64> {
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let year = d4(&b[0..4])?;
+    let month = d2(b[5], b[6])?;
+    let day = d2(b[8], b[9])?;
+    let dim = days_in_month(year, month);
+    if day < 1 || day > dim {
+        return None;
+    }
+    let hour = d2(b[11], b[12])?;
+    let minute = d2(b[14], b[15])?;
+    let second = d2(b[17], b[18])?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * MS_SECOND)
+}
+
+#[inline(always)]
+pub fn parse_f1_ms(b: &[u8]) -> Option<i64> {
+    if b.len() == 20 && b[19] == b'Z' {
+        parse_civil_datetime_19(b)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+pub fn parse_ts_ms(b: &[u8]) -> Option<i64> {
+    let len = b.len();
+    if len == 0 {
+        return None;
+    }
+    if len == 20 && b[19] == b'Z' {
+        return parse_civil_datetime_19(b);
+    }
+    if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+        let base = parse_civil_datetime_19(b)?;
+        let oh = d2(b[20], b[21])?;
+        let om = d2(b[23], b[24])?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let off_ms = (oh * 3_600 + om * 60) * MS_SECOND;
+        return Some(if b[19] == b'+' {
+            base - off_ms
+        } else {
+            base + off_ms
+        });
+    }
+    // F3: non-empty ASCII digits [0-9]+. Fast path <= 18 digits cannot overflow i64.
+    if len <= 18 {
+        let mut acc: i64 = 0;
+        for &ch in b {
+            let d = ch.wrapping_sub(b'0');
+            if d >= 10 {
+                return None;
+            }
+            acc = acc * 10 + d as i64;
+        }
+        return Some(acc);
+    }
+    let mut acc: i64 = 0;
+    let mut overflow = false;
+    for &ch in b {
+        let d = ch.wrapping_sub(b'0');
+        if d >= 10 {
+            return None;
+        }
+        if !overflow {
+            match acc.checked_mul(10).and_then(|v| v.checked_add(d as i64)) {
+                Some(v) => acc = v,
+                None => overflow = true,
+            }
+        }
+    }
+    if overflow {
+        None
+    } else {
+        Some(acc)
+    }
+}
+
+#[inline(always)]
+pub fn parse_price_cents(b: &[u8]) -> Option<u32> {
+    if b.is_empty() {
+        return None;
+    }
+    if b.len() <= 8 {
+        let mut acc: u32 = 0;
+        for &ch in b {
+            let d = ch.wrapping_sub(b'0');
+            if d >= 10 {
+                return None;
+            }
+            acc = acc * 10 + d as u32;
+        }
+        if (1..=10_000_000).contains(&acc) {
+            return Some(acc);
+        }
+        return None;
+    }
+    let mut acc: u64 = 0;
+    let mut over = false;
+    for &ch in b {
+        let d = ch.wrapping_sub(b'0');
+        if d >= 10 {
+            return None;
+        }
+        if !over {
+            acc = acc * 10 + d as u64;
+            if acc > 10_000_000 {
+                over = true;
+            }
+        }
+    }
+    if !over && (1..=10_000_000).contains(&acc) {
+        Some(acc as u32)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_f1_f2_f3_timestamps() {
+        let expected = parse_f1_ms(b"2026-10-03T23:58:10Z").unwrap();
+        assert_eq!(expected, 1_791_071_890_000);
+        assert_eq!(parse_ts_ms(b"2026-10-03T23:58:10Z"), Some(expected));
+        assert_eq!(parse_ts_ms(b"2026-10-03T19:58:10-04:00"), Some(expected));
+        assert_eq!(parse_ts_ms(b"2026-10-04T01:28:10+01:30"), Some(expected));
+        assert_eq!(parse_ts_ms(b"1791071890000"), Some(expected));
+        assert_eq!(parse_ts_ms(b"2026-10-03T23:58:10-00:00"), Some(expected));
+
+        // Leap years
+        assert!(parse_f1_ms(b"2028-02-29T00:00:00Z").is_some());
+        assert!(parse_f1_ms(b"2024-02-29T23:59:59Z").is_some());
+        assert!(parse_f1_ms(b"2000-02-29T00:00:00Z").is_some());
+        assert!(parse_f1_ms(b"2027-02-29T00:00:00Z").is_none());
+        assert!(parse_f1_ms(b"1900-02-29T00:00:00Z").is_none());
+
+        // Bad forms
+        for bad in [
+            b"".as_slice(),
+            b"2026-10-03T23:58:10.000Z",
+            b"2026-10-03T23:58:10z",
+            b"2026-10-03t23:58:10Z",
+            b"2026-10-03 23:58:10Z",
+            b"2026-10-03T23:58:10",
+            b"2026-13-03T23:58:10Z",
+            b"2026-02-30T23:58:10Z",
+            b"2026-10-03T24:00:00Z",
+            b"2026-10-03T23:58:60Z",
+            b"2026-10-03T23:58:10+24:00",
+            b"2026-10-03T23:58:10+05:60",
+            b"2026-10-03T23:58:10+0200",
+            b"1791071890000.0",
+            b"1.79e12",
+            b"-5",
+            b"2026-10-03T23:58:10Z\r",
+            "٢٥٠".as_bytes(),
+        ] {
+            assert_eq!(parse_ts_ms(bad), None, "expected None for {:?}", String::from_utf8_lossy(bad));
+        }
+
+        // Hundreds of leading zeros & huge 500-digit integer
+        let mut zeros = vec![b'0'; 300];
+        zeros.extend_from_slice(b"1791021600000");
+        assert_eq!(parse_ts_ms(&zeros), Some(1_791_021_600_000));
+        let huge = vec![b'9'; 500];
+        assert_eq!(parse_ts_ms(&huge), None);
+        assert_eq!(parse_ts_ms(&vec![b'0'; 300]), Some(0));
+    }
+
+    #[test]
+    fn test_price_cents() {
+        assert_eq!(parse_price_cents(b"1"), Some(1));
+        assert_eq!(parse_price_cents(b"0250"), Some(250));
+        assert_eq!(parse_price_cents(b"10000000"), Some(10_000_000));
+
+        let mut leading = vec![b'0'; 300];
+        leading.extend_from_slice(b"250");
+        assert_eq!(parse_price_cents(&leading), Some(250));
+
+        assert_eq!(parse_price_cents(b"0"), None);
+        assert_eq!(parse_price_cents(b"00"), None);
+        assert_eq!(parse_price_cents(b"10000001"), None);
+        assert_eq!(parse_price_cents(b"-5"), None);
+        assert_eq!(parse_price_cents(b"19.99"), None);
+        assert_eq!(parse_price_cents(b"900\r"), None);
+        assert_eq!(parse_price_cents(&vec![b'9'; 500]), None);
+    }
+}

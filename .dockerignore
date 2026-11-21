@@ -1,5 +1,9 @@
 fixtures/
 dev/
+dev-answer/
 out/
+target/
+scratch/
+.venv/
 *.md
 .git
