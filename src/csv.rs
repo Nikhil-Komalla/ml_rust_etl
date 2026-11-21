@@ -582,6 +582,11 @@ pub struct LineBounds<const K: usize> {
 }
 
 impl<const K: usize> LineBounds<K> {
+    pub const ZERO: Self = Self {
+        line_start: 0,
+        commas_and_end: [0; K],
+    };
+
     #[inline(always)]
     pub fn span(&self, idx: usize) -> (usize, usize) {
         let raw_s = if idx == 0 {
@@ -596,12 +601,10 @@ impl<const K: usize> LineBounds<K> {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-const BATCH_SCAN_FLUSH: usize = 512;
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg(test)]
 const BATCH_SCAN_FLUSH: usize = 512;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 fn push_line_bounds_if_valid<const K: usize>(
     padded_buf: &[u8],
@@ -649,7 +652,7 @@ fn push_line_bounds_if_valid<const K: usize>(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn scan_avx2_step64<const K: usize>(
     padded_buf: &[u8],
@@ -713,7 +716,7 @@ unsafe fn scan_avx2_step64<const K: usize>(
     *non_ascii |= (na_mask != 0) as u32;
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
 pub fn scan_lines_batched_avx2<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
@@ -826,7 +829,7 @@ pub fn scan_lines_batched_avx2<const K: usize>(
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg(all(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
 pub fn scan_lines_batched_avx2<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
@@ -872,6 +875,337 @@ pub fn scan_lines_batched_avx2<const K: usize>(
     if !batch.is_empty() {
         on_batch(padded_buf, batch);
         batch.clear();
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn push_lb_l1<const K: usize>(
+    padded_buf: &[u8],
+    line_start: usize,
+    line_end: usize,
+    commas_ptr: *const u32,
+    n_commas: usize,
+    total_quotes: u32,
+    non_ascii: u32,
+    batch: &mut [LineBounds<K>; 64],
+    batch_len: &mut usize,
+    on_batch: &mut impl FnMut(&[u8], &[LineBounds<K>]),
+) {
+    if line_end <= line_start || n_commas != K - 1 || (total_quotes & 1) != 0 {
+        return;
+    }
+    if non_ascii != 0 && std::str::from_utf8(&padded_buf[line_start..line_end]).is_err() {
+        return;
+    }
+    let ptr = padded_buf.as_ptr();
+    let mut commas_and_end = [0u32; K];
+    let mut prev = line_start;
+    let mut expected_quotes = 0u32;
+    let mut i = 0usize;
+    while i < K {
+        let end = if i < K - 1 {
+            *commas_ptr.add(i) as usize
+        } else {
+            line_end
+        };
+        let last = if end > prev { end - 1 } else { prev };
+        let is_q = usize::from(
+            (end.wrapping_sub(prev) >= 2)
+                & (*ptr.add(prev) == b'"')
+                & (*ptr.add(last) == b'"'),
+        );
+        *commas_and_end.get_unchecked_mut(i) = (end as u32) | ((is_q as u32) << 31);
+        expected_quotes += (is_q as u32) << 1;
+        prev = end + 1;
+        i += 1;
+    }
+    if expected_quotes == total_quotes {
+        let len = *batch_len;
+        *batch.get_unchecked_mut(len) = LineBounds {
+            line_start: line_start as u32,
+            commas_and_end,
+        };
+        let new_len = len + 1;
+        if new_len == 64 {
+            on_batch(padded_buf, batch);
+            *batch_len = 0;
+        } else {
+            *batch_len = new_len;
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn scan_step64_l1<const K: usize>(
+    padded_buf: &[u8],
+    p: usize,
+    mut nl_mask: u64,
+    cm_mask: u64,
+    qt_mask: u64,
+    na_mask: u64,
+    line_start: &mut usize,
+    cm_buf: &mut [u32; 576],
+    cm_head: &mut usize,
+    cm_tail: &mut usize,
+    total_quotes: &mut u32,
+    non_ascii: &mut u32,
+    batch: &mut [LineBounds<K>; 64],
+    batch_len: &mut usize,
+    on_batch: &mut impl FnMut(&[u8], &[LineBounds<K>]),
+) {
+    if *cm_tail >= 512 {
+        let carry = *cm_tail - *cm_head;
+        if carry <= K {
+            std::ptr::copy(cm_buf.as_ptr().add(*cm_head), cm_buf.as_mut_ptr(), carry);
+            *cm_head = 0;
+            *cm_tail = carry;
+        } else {
+            *cm_head = 0;
+            *cm_tail = K + 1;
+        }
+    }
+
+    let base_tail = *cm_tail;
+    let block_cm = cm_mask.count_ones() as usize;
+    {
+        let mut m = cm_mask;
+        let dst = cm_buf.as_mut_ptr().add(base_tail);
+        *dst.add(0) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        *dst.add(1) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        *dst.add(2) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        *dst.add(3) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        *dst.add(4) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        *dst.add(5) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        *dst.add(6) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        *dst.add(7) = (p + m.trailing_zeros() as usize) as u32;
+        m &= m.wrapping_sub(1);
+        if m != 0 {
+            let mut i = 8usize;
+            while m != 0 {
+                *dst.add(i) = (p + m.trailing_zeros() as usize) as u32;
+                i += 1;
+                m &= m.wrapping_sub(1);
+            }
+        }
+    }
+
+    let mut prev_done = 0u64;
+    while nl_mask != 0 {
+        let nl_bit = nl_mask.trailing_zeros();
+        let line_end = p + nl_bit as usize;
+        let nl_flag = 1u64 << nl_bit;
+        let before_nl = nl_flag - 1;
+        let seg = before_nl & !prev_done;
+        let line_cm_end = base_tail + (cm_mask & before_nl).count_ones() as usize;
+        let n_commas = line_cm_end - *cm_head;
+        *total_quotes += (qt_mask & seg).count_ones();
+        *non_ascii |= ((na_mask & seg) != 0) as u32;
+
+        push_lb_l1::<K>(
+            padded_buf,
+            *line_start,
+            line_end,
+            cm_buf.as_ptr().add(*cm_head),
+            n_commas,
+            *total_quotes,
+            *non_ascii,
+            batch,
+            batch_len,
+            on_batch,
+        );
+
+        *line_start = line_end + 1;
+        *cm_head = line_cm_end;
+        *total_quotes = 0;
+        *non_ascii = 0;
+        prev_done = before_nl | nl_flag;
+        nl_mask &= nl_mask - 1;
+    }
+
+    *cm_tail = base_tail + block_cm;
+    let rem = !prev_done;
+    *total_quotes += (qt_mask & rem).count_ones();
+    *non_ascii |= ((na_mask & rem) != 0) as u32;
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub fn scan_lines_l1_batched_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_batch: impl FnMut(&[u8], &[LineBounds<K>]),
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    if valid_len == 0 {
+        return;
+    }
+    let mut line_start = 0usize;
+    let mut cm_buf = [0u32; 576];
+    let mut cm_head = 0usize;
+    let mut cm_tail = 0usize;
+    let mut total_quotes = 0u32;
+    let mut non_ascii = 0u32;
+    let mut batch = [LineBounds::<K>::ZERO; 64];
+    let mut batch_len = 0usize;
+    let mut p = 0usize;
+
+    unsafe {
+        use std::arch::x86_64::*;
+        let v_nl = _mm256_set1_epi8(b'\n' as i8);
+        let v_cm = _mm256_set1_epi8(b',' as i8);
+        let v_qt = _mm256_set1_epi8(b'"' as i8);
+        let base = padded_buf.as_ptr();
+
+        while p + 64 <= valid_len {
+            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+            let nl_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32);
+            let cm_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32);
+            let qt_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32);
+            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+                0u64
+            } else {
+                (_mm256_movemask_epi8(v0) as u32 as u64)
+                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32)
+            };
+            scan_step64_l1::<K>(
+                padded_buf,
+                p,
+                nl_mask,
+                cm_mask,
+                qt_mask,
+                na_mask,
+                &mut line_start,
+                &mut cm_buf,
+                &mut cm_head,
+                &mut cm_tail,
+                &mut total_quotes,
+                &mut non_ascii,
+                &mut batch,
+                &mut batch_len,
+                &mut on_batch,
+            );
+            p += 64;
+        }
+
+        if p < valid_len {
+            let rem = valid_len - p;
+            let valid_mask = (1u64 << rem) - 1;
+            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+            let nl_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32))
+                & valid_mask;
+            let cm_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32))
+                & valid_mask;
+            let qt_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32))
+                & valid_mask;
+            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+                0u64
+            } else {
+                ((_mm256_movemask_epi8(v0) as u32 as u64)
+                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32))
+                    & valid_mask
+            };
+            scan_step64_l1::<K>(
+                padded_buf,
+                p,
+                nl_mask,
+                cm_mask,
+                qt_mask,
+                na_mask,
+                &mut line_start,
+                &mut cm_buf,
+                &mut cm_head,
+                &mut cm_tail,
+                &mut total_quotes,
+                &mut non_ascii,
+                &mut batch,
+                &mut batch_len,
+                &mut on_batch,
+            );
+        }
+
+        if line_start < valid_len {
+            push_lb_l1::<K>(
+                padded_buf,
+                line_start,
+                valid_len,
+                cm_buf.as_ptr().add(cm_head),
+                cm_tail - cm_head,
+                total_quotes,
+                non_ascii,
+                &mut batch,
+                &mut batch_len,
+                &mut on_batch,
+            );
+        }
+        if batch_len > 0 {
+            on_batch(padded_buf, &batch[..batch_len]);
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+pub fn scan_lines_l1_batched_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_batch: impl FnMut(&[u8], &[LineBounds<K>]),
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    let data = &padded_buf[..valid_len];
+    let base = padded_buf.as_ptr() as usize;
+    let mut batch = [LineBounds::<K>::ZERO; 64];
+    let mut batch_len = 0usize;
+    for_each_line_fields_slice::<K>(data, |fields| {
+        let raw_0 = (fields[0].as_ptr() as usize) - base;
+        let line_start = if raw_0 > 0 && padded_buf[raw_0 - 1] == b'"' {
+            raw_0 - 1
+        } else {
+            raw_0
+        };
+        let mut commas_and_end = [0u32; K];
+        for i in 0..K {
+            let f_s = (fields[i].as_ptr() as usize) - base;
+            let f_e = f_s + fields[i].len();
+            let is_q = if i == 0 {
+                f_s > line_start
+            } else {
+                let prev_raw_e = (commas_and_end[i - 1] & 0x7FFF_FFFF) as usize;
+                f_s > prev_raw_e + 1
+            };
+            let raw_e = f_e + usize::from(is_q);
+            commas_and_end[i] = (raw_e as u32) | ((is_q as u32) << 31);
+        }
+        batch[batch_len] = LineBounds {
+            line_start: line_start as u32,
+            commas_and_end,
+        };
+        batch_len += 1;
+        if batch_len == 64 {
+            on_batch(padded_buf, &batch);
+            batch_len = 0;
+        }
+    });
+    if batch_len > 0 {
+        on_batch(padded_buf, &batch[..batch_len]);
     }
 }
 
@@ -960,6 +1294,23 @@ fn read_at_full(file: &File, mut dst: &mut [u8], mut offset: u64) -> io::Result<
     Ok(total)
 }
 
+#[cfg(unix)]
+#[inline]
+fn fadvise_sequential(file: &File, len: usize) {
+    if len == 0 {
+        return;
+    }
+    use std::os::raw::c_int;
+    use std::os::unix::io::AsRawFd;
+    const POSIX_FADV_SEQUENTIAL: c_int = 2;
+    extern "C" {
+        fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+    }
+    unsafe {
+        let _ = posix_fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
+}
+
 impl CsvSource {
     pub fn open(paths: &[PathBuf]) -> io::Result<Self> {
         let mut files = Vec::with_capacity(paths.len());
@@ -968,6 +1319,8 @@ impl CsvSource {
         for path in paths {
             let file = File::open(path)?;
             let len = file.metadata()?.len() as usize;
+            #[cfg(unix)]
+            fadvise_sequential(&file, len);
             files.push(file);
             lens.push(len);
             total_bytes += len;
@@ -1125,6 +1478,19 @@ impl CsvSource {
         Ok(())
     }
 
+    #[inline(always)]
+    pub fn for_each_chunk_l1_batch<const K: usize>(
+        &self,
+        task: ChunkTask,
+        buf: &mut Vec<u8>,
+        mut on_batch: impl FnMut(&[u8], &[LineBounds<K>]),
+    ) -> io::Result<()> {
+        self.for_each_chunk_blocks(task, buf, 64, |padded, valid_len| {
+            scan_lines_l1_batched_avx2::<K>(padded, valid_len, &mut on_batch);
+        })
+    }
+
+    #[cfg(test)]
     pub fn for_each_chunk_batch<const K: usize>(
         &self,
         task: ChunkTask,
@@ -1456,5 +1822,82 @@ mod tests {
             cmp_raw_keys(k_special, k_long, &arenas, &arenas),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn test_scan_lines_fused_edge_cases() {
+        let mut data = Vec::new();
+        for i in 0..150 {
+            data.extend_from_slice(format!("a{i},b{i}\n").as_bytes());
+        }
+        let rem = (64 - (data.len() % 64)) % 64;
+        for _ in 0..rem {
+            data.push(b'\n');
+        }
+        assert_eq!(data.len() % 64, 0);
+        // 63 payload bytes + \n at exact offset 63
+        data.extend_from_slice(&[b'x'; 58]);
+        data.extend_from_slice(b",yyyy\n");
+        assert_eq!(data.len() % 64, 0);
+        // Odd quotes (malformed)
+        data.extend_from_slice(b"\"a,b\n");
+        data.extend_from_slice(b"a\",b\n");
+        data.extend_from_slice(b"\"\"\"a,b\n");
+        // >600 commas malformed line followed by valid line
+        for _ in 0..700 {
+            data.push(b',');
+        }
+        data.push(b'\n');
+        data.extend_from_slice(b"after700,ok700\n");
+        for _ in 0..520 {
+            data.push(b',');
+        }
+        data.push(b'\n');
+        data.extend_from_slice(b"tail_k1,tail_k2");
+
+        let mut padded = data.clone();
+        padded.resize(data.len() + 64, 0);
+        let mut fused_got = Vec::new();
+        let mut batch_sizes = Vec::new();
+        scan_lines_l1_batched_avx2::<2>(&padded, data.len(), |d, lines| {
+            batch_sizes.push(lines.len());
+            for lb in lines {
+                let (s0, e0) = lb.span(0);
+                let (s1, e1) = lb.span(1);
+                fused_got.push((d[s0..e0].to_vec(), d[s1..e1].to_vec()));
+            }
+        });
+        assert!(batch_sizes.len() >= 3 && batch_sizes[0] == 64 && batch_sizes[1] == 64);
+        let mut scalar_expected = Vec::new();
+        for_each_line_fields_slice::<2>(&data, |f| {
+            scalar_expected.push((f[0].to_vec(), f[1].to_vec()));
+        });
+        assert_eq!(fused_got, scalar_expected);
+
+        // K=7 events schema including 8+ commas in a 64B chunk and quoted/empty fields
+        let mut ev_data = Vec::new();
+        ev_data.extend_from_slice(b"e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p1,\n");
+        ev_data.extend_from_slice(b"bad,,,,,,,,,,,,,,,,\n");
+        ev_data.extend_from_slice(b"\"e2\",\"u2\",2026-10-03T10:05:00Z,2026-10-03T10:06:00Z,cart,p2,\n");
+        ev_data.extend_from_slice(b"e3,u3,2026-10-03T10:10:00Z,2026-10-03T10:11:00Z,purchase,p3,500");
+        let mut ev_pad = ev_data.clone();
+        ev_pad.resize(ev_data.len() + 64, 0);
+        let mut ev_fused = Vec::new();
+        scan_lines_l1_batched_avx2::<7>(&ev_pad, ev_data.len(), |d, lines| {
+            for lb in lines {
+                let row: Vec<Vec<u8>> = (0..7)
+                    .map(|k| {
+                        let (s, e) = lb.span(k);
+                        d[s..e].to_vec()
+                    })
+                    .collect();
+                ev_fused.push(row);
+            }
+        });
+        let mut ev_scalar = Vec::new();
+        for_each_line_fields_slice::<7>(&ev_data, |f| {
+            ev_scalar.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
+        });
+        assert_eq!(ev_fused, ev_scalar);
     }
 }

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use hashbrown::{HashMap, HashTable};
 use parquet::basic::Compression;
+use rayon::prelude::*;
 
 use crate::csv::{
     cmp_raw_keys, for_each_line_fields_slice, hash_bytes_fast, hash_raw_key, list_csv_files,
@@ -20,9 +21,9 @@ use crate::parse::{
 use crate::parquet_out::{clean_parquet_dir, write_campaign_daily, CampaignRow, UserDailyWriter};
 
 const P_DEDUP: usize = 256;
-const P_PERSON: usize = 128;
+const P_PERSON: usize = 256;
 const USE_NT_STORES: bool = true;
-const USER_DAILY_BATCH_ROWS: usize = 131_072;
+const USER_DAILY_BATCH_ROWS: usize = 65_536;
 
 const META_TAG_SHIFT: u32 = 62;
 const META_VALID_FAST: u64 = 0u64 << META_TAG_SHIFT;
@@ -207,9 +208,9 @@ impl CampDailyAcc {
                 credits,
                 ..
             } => {
-                let d_off = day - *start_day;
-                if d_off >= 0 && (d_off as usize) < *num_days && (camp_id as usize) < *num_camps {
-                    let idx = (d_off as usize) * (*num_camps) + (camp_id as usize);
+                let d_off = (day.wrapping_sub(*start_day) as u32) as usize;
+                if d_off < *num_days && (camp_id as usize) < *num_camps {
+                    let idx = d_off * (*num_camps) + (camp_id as usize);
                     let c = unsafe { credits.get_unchecked_mut(idx) };
                     c.sessions += 1;
                     c.purchasing_sessions += has_purchase as u32;
@@ -237,9 +238,9 @@ impl CampDailyAcc {
                 assists,
                 ..
             } => {
-                let d_off = day - *start_day;
-                if d_off >= 0 && (d_off as usize) < *num_days && (camp_id as usize) < *num_camps {
-                    let idx = (d_off as usize) * (*num_camps) + (camp_id as usize);
+                let d_off = (day.wrapping_sub(*start_day) as u32) as usize;
+                if d_off < *num_days && (camp_id as usize) < *num_camps {
+                    let idx = d_off * (*num_camps) + (camp_id as usize);
                     unsafe {
                         *assists.get_unchecked_mut(idx) += cnt as u32;
                     }
@@ -266,10 +267,10 @@ impl CampDailyAcc {
                 assists,
                 ..
             } => {
-                let d_off = day - *start_day;
-                if d_off >= 0 && (d_off as usize) < *num_days {
+                let d_off = (day.wrapping_sub(*start_day) as u32) as usize;
+                if d_off < *num_days {
                     let n_c = *num_camps;
-                    let row_base = (d_off as usize) * n_c;
+                    let row_base = d_off * n_c;
                     for &camp_id in camps {
                         let c = camp_id as usize;
                         if c < n_c {
@@ -511,8 +512,8 @@ fn load_lookups(data_dir: &Path) -> io::Result<Lookups> {
 
     let mut raw_cats: Vec<(usize, usize, u64)> = Vec::with_capacity(64);
     let mut cat_table: HashTable<u32> = HashTable::with_capacity(64);
-    let est_prods = (prod_buf.len() / 10).max(16);
-    let p_cap = (est_prods * 2).next_power_of_two();
+    let est_prods = (prod_buf.len() / 16).max(16);
+    let p_cap = ((est_prods * 10) / 6).max(16).next_power_of_two();
     let mut tmp_prod_slots = vec![FlatKvSlot::EMPTY; p_cap];
     let mut tmp_prod_mask = p_cap - 1;
     let mut prod_count = 0usize;
@@ -760,6 +761,7 @@ trait ClickEmit: Stage5Click {
 
 trait DedupEmit: Stage5Event {
     fn empty_tmpl() -> Self;
+    fn set_person_key(&mut self, pk: CompactKey64);
     fn from_winner(
         ev: &ParsedEvent,
         window_start_ms: i64,
@@ -775,6 +777,11 @@ impl DedupEmit for PersonEvent16 {
             ts_rel_ms: 0,
             price_cat: 0,
         }
+    }
+
+    #[inline(always)]
+    fn set_person_key(&mut self, pk: CompactKey64) {
+        self.person_key = pk;
     }
 
     #[inline(always)]
@@ -801,6 +808,11 @@ impl DedupEmit for PersonEventWide {
             price_cents: 0,
             cat_id: 0,
         }
+    }
+
+    #[inline(always)]
+    fn set_person_key(&mut self, pk: CompactKey64) {
+        self.person_key = pk;
     }
 
     #[inline(always)]
@@ -893,25 +905,307 @@ struct DedupProbeU32 {
     slot: u32,
 }
 
-fn run_events_dedup<E: DedupEmit>(
+struct ClicksDedupOut<E, C> {
+    person_event_batches: Vec<Vec<Vec<E>>>,
+    person_event_counts: Vec<usize>,
+    person_click_batches: Vec<Vec<Vec<C>>>,
+    person_click_counts: Vec<usize>,
+    cl_worker_arenas: Vec<LongArena>,
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn flush_dedup_pending<E: DedupEmit, const SWCB_DEDUP: usize>(
+    n_pending: usize,
+    pending_ev: &[E; 64],
+    pending_uh: &[u64; 64],
+    hit_idxs: &mut [u8; 64],
+    link_map: &LinkMap,
+    swcb: &mut [E],
+    swcb_cnt: &mut [u8; P_PERSON],
+    person_out: &mut [Vec<E>],
+) {
+    let mut n_hits = 0usize;
+    for j in 0..n_pending {
+        let uh = pending_uh[j];
+        if link_map.bloom_may_contain(uh) {
+            link_map.prefetch_slot(uh);
+            hit_idxs[n_hits] = j as u8;
+            n_hits += 1;
+        } else {
+            let pshard = ((uh >> 52) as usize) & (P_PERSON - 1);
+            swcb_push_nt::<E, SWCB_DEDUP>(swcb, swcb_cnt, person_out, pshard, pending_ev[j]);
+        }
+    }
+    for k in 0..n_hits {
+        let j = hit_idxs[k] as usize;
+        let mut item = pending_ev[j];
+        let uk = item.person_key();
+        let uh = pending_uh[j];
+        let pk = link_map.probe_inline_with_hash(uk, uh);
+        let ph = if pk.0 == uk.0 { uh } else { mix64(pk.0) };
+        item.set_person_key(pk);
+        let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+        swcb_push_nt::<E, SWCB_DEDUP>(swcb, swcb_cnt, person_out, pshard, item);
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn flush_cl_pending<C: ClickEmit, const SWCB_CL: usize>(
+    n_pending: usize,
+    pending_cl: &[C; 64],
+    pending_uh: &[u64; 64],
+    hit_idxs: &mut [u8; 64],
+    link_map: &LinkMap,
+    swcb: &mut [C],
+    swcb_cnt: &mut [u8; P_PERSON],
+    cl_buckets: &mut [Vec<C>],
+) {
+    let mut n_hits = 0usize;
+    for j in 0..n_pending {
+        let uh = pending_uh[j];
+        if link_map.bloom_may_contain(uh) {
+            link_map.prefetch_slot(uh);
+            hit_idxs[n_hits] = j as u8;
+            n_hits += 1;
+        } else {
+            let pshard = ((uh >> 52) as usize) & (P_PERSON - 1);
+            swcb_push_nt::<C, SWCB_CL>(swcb, swcb_cnt, cl_buckets, pshard, pending_cl[j]);
+        }
+    }
+    for k in 0..n_hits {
+        let j = hit_idxs[k] as usize;
+        let mut pc = pending_cl[j];
+        let uk = pc.person_key();
+        let uh = pending_uh[j];
+        let pk = link_map.probe_inline_with_hash(uk, uh);
+        let ph = if pk.0 == uk.0 { uh } else { mix64(pk.0) };
+        pc.set_person_key(pk);
+        let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+        swcb_push_nt::<C, SWCB_CL>(swcb, swcb_cnt, cl_buckets, pshard, pc);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn process_cl_batch<C: ClickEmit, const SWCB_CL: usize>(
+    padded: &[u8],
+    lines: &[LineBounds<4>],
+    dcache: &mut DateCache,
+    lookups: &Lookups,
+    link_map: &LinkMap,
+    lm_empty: bool,
+    wid: usize,
+    click_window_start_ms: i64,
+    window_end_ms: i64,
+    cl_arena_out: &mut LongArena,
+    cl_buckets: &mut [Vec<C>],
+    swcb: &mut [C],
+    swcb_cnt: &mut [u8; P_PERSON],
+    pending_cl: &mut [C; 64],
+    pending_uh: &mut [u64; 64],
+    n_pending: &mut usize,
+    hit_idxs: &mut [u8; 64],
+) {
+    for lb in lines {
+        let (cl_s, cl_e) = lb.span(0);
+        let cl_len = cl_e - cl_s;
+        let (u_s, u_e) = lb.span(1);
+        let u_len = u_e - u_s;
+        if cl_len == 0 || u_len == 0 {
+            continue;
+        }
+        let (c_s, c_e) = lb.span(2);
+        let Some(cid) = lookups.get_campaign_padded(padded, c_s, c_e - c_s) else {
+            continue;
+        };
+        let (ts_s, ts_e) = lb.span(3);
+        let Some(ts_ms) = dcache.parse_ts_ms_padded_dc(padded, ts_s, ts_e - ts_s) else {
+            continue;
+        };
+        if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
+            continue;
+        }
+        let click_id_key =
+            CompactKey64::encode_raw_inline_padded(padded, cl_s, cl_len).unwrap_or_else(|| {
+                let click_id = unsafe { padded.get_unchecked(cl_s..cl_e) };
+                cl_arena_out.push_ref(wid, click_id)
+            });
+
+        if let Some(uk) = CompactKey64::encode_raw_inline_padded(padded, u_s, u_len) {
+            let uh = mix64(uk.0);
+            if lm_empty {
+                let pshard = ((uh >> 52) as usize) & (P_PERSON - 1);
+                swcb_push_nt::<C, SWCB_CL>(
+                    swcb,
+                    swcb_cnt,
+                    cl_buckets,
+                    pshard,
+                    C::from_parsed(uk, click_id_key, ts_ms, click_window_start_ms, cid),
+                );
+            } else {
+                link_map.prefetch_bloom(uh);
+                let p_idx = *n_pending;
+                pending_cl[p_idx] =
+                    C::from_parsed(uk, click_id_key, ts_ms, click_window_start_ms, cid);
+                pending_uh[p_idx] = uh;
+                *n_pending = p_idx + 1;
+                if p_idx + 1 == 64 {
+                    flush_cl_pending::<C, SWCB_CL>(
+                        64,
+                        pending_cl,
+                        pending_uh,
+                        hit_idxs,
+                        link_map,
+                        swcb,
+                        swcb_cnt,
+                        cl_buckets,
+                    );
+                    *n_pending = 0;
+                }
+            }
+        } else {
+            let uid = unsafe { padded.get_unchecked(u_s..u_e) };
+            let (pk, ph) = if let Some(pk) = link_map.resolve_long(uid) {
+                (pk, mix64(pk.0))
+            } else {
+                (cl_arena_out.push_ref(wid, uid), hash_bytes_fast(uid))
+            };
+            let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+            swcb_push_nt::<C, SWCB_CL>(
+                swcb,
+                swcb_cnt,
+                cl_buckets,
+                pshard,
+                C::from_parsed(pk, click_id_key, ts_ms, click_window_start_ms, cid),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_clicks_and_dedup<E: DedupEmit, C: ClickEmit>(
     dedup_slots: &[Mutex<Option<Vec<Vec<ParsedEvent>>>>],
     ev_worker_ext: &[Vec<ExtEvent>],
     ev_worker_arenas: &[LongArena],
-    window_start_ms: i64,
-    window_start_sec: i64,
-    n_dedup_workers: usize,
+    click_src: &CsvSource,
+    cl_chunks: &[crate::csv::ChunkTask],
+    est_cl_cap: usize,
     est_p_cap: usize,
-) -> (Vec<Vec<Vec<E>>>, Vec<usize>) {
-    const SWCB_DEDUP: usize = 4;
+    lookups: &Lookups,
+    link_map: &LinkMap,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    window_start_sec: i64,
+    click_window_start_ms: i64,
+    ncpu: usize,
+) -> io::Result<ClicksDedupOut<E, C>> {
+    const SWCB_CL: usize = 4;
+    const SWCB_DEDUP: usize = 8;
     const RING: usize = 16;
 
-    let mut dedup_worker_outs: Vec<Vec<Vec<E>>> = (0..n_dedup_workers).map(|_| Vec::new()).collect();
+    let n_workers = ncpu.clamp(1, 63);
+    let lm_empty = link_map.is_empty();
+    let next_cl = AtomicUsize::new(0);
     let next_d_shard = AtomicUsize::new(0);
 
+    let mut cl_worker_shards: Vec<Vec<Vec<C>>> = (0..n_workers).map(|_| Vec::new()).collect();
+    let mut cl_worker_arenas: Vec<LongArena> = (0..n_workers).map(|_| LongArena::default()).collect();
+    let mut dedup_worker_outs: Vec<Vec<Vec<E>>> = (0..n_workers).map(|_| Vec::new()).collect();
+    let mut worker_errs: Vec<Option<io::Error>> = (0..n_workers).map(|_| None).collect();
+
     std::thread::scope(|scope| {
-        for out_slot in &mut dedup_worker_outs {
-            let next_ref = &next_d_shard;
+        for (wid, (((cl_buckets_slot, cl_arena_out), ev_out_slot), err_out)) in cl_worker_shards
+            .iter_mut()
+            .zip(cl_worker_arenas.iter_mut())
+            .zip(dedup_worker_outs.iter_mut())
+            .zip(worker_errs.iter_mut())
+            .enumerate()
+        {
+            let next_cl_ref = &next_cl;
+            let next_d_ref = &next_d_shard;
             scope.spawn(move || {
+                // Phase A: Parse clicks into cl_buckets[P_PERSON], then drop click scratch.
+                let mut buf = Vec::new();
+                if !cl_chunks.is_empty() {
+                    let first = next_cl_ref.fetch_add(1, Ordering::Relaxed);
+                    if first < cl_chunks.len() {
+                        let mut dcache = DateCache::new();
+                        let mut cl_buckets: Vec<Vec<C>> =
+                            (0..P_PERSON).map(|_| Vec::with_capacity(est_cl_cap)).collect();
+                        let tmpl = C::from_parsed(
+                            CompactKey64::EMPTY,
+                            CompactKey64::EMPTY,
+                            0,
+                            0,
+                            0,
+                        );
+                        let mut cl_swcb = vec![tmpl; P_PERSON * SWCB_CL];
+                        let mut cl_swcb_cnt = [0u8; P_PERSON];
+                        let mut pending_cl = [tmpl; 64];
+                        let mut pending_uh = [0u64; 64];
+                        let mut hit_idxs = [0u8; 64];
+                        let mut n_pending = 0usize;
+
+                        let mut cidx = first;
+                        while let Some(&task) = cl_chunks.get(cidx) {
+                            if let Err(e) = click_src.for_each_chunk_l1_batch::<4>(
+                                task,
+                                &mut buf,
+                                |padded, lines| {
+                                    process_cl_batch::<C, SWCB_CL>(
+                                        padded,
+                                        lines,
+                                        &mut dcache,
+                                        lookups,
+                                        link_map,
+                                        lm_empty,
+                                        wid,
+                                        click_window_start_ms,
+                                        window_end_ms,
+                                        cl_arena_out,
+                                        &mut cl_buckets,
+                                        &mut cl_swcb,
+                                        &mut cl_swcb_cnt,
+                                        &mut pending_cl,
+                                        &mut pending_uh,
+                                        &mut n_pending,
+                                        &mut hit_idxs,
+                                    );
+                                },
+                            ) {
+                                *err_out = Some(e);
+                                return;
+                            }
+                            cidx = next_cl_ref.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if n_pending > 0 {
+                            flush_cl_pending::<C, SWCB_CL>(
+                                n_pending,
+                                &pending_cl,
+                                &pending_uh,
+                                &mut hit_idxs,
+                                link_map,
+                                &mut cl_swcb,
+                                &mut cl_swcb_cnt,
+                                &mut cl_buckets,
+                            );
+                        }
+                        for ps in 0..P_PERSON {
+                            let cnt = cl_swcb_cnt[ps] as usize;
+                            if cnt > 0 {
+                                let base = ps * SWCB_CL;
+                                cl_buckets[ps].extend_from_slice(&cl_swcb[base..base + cnt]);
+                            }
+                        }
+                        sfence_if_nt();
+                        *cl_buckets_slot = cl_buckets;
+                    }
+                }
+                drop(buf);
+
+                // Phase B (ZERO barrier): immediately pull dedup shards & emit into person_out.
                 let mut person_out: Vec<Vec<E>> = Vec::new();
                 let mut swcb: Vec<E> = Vec::new();
                 let mut swcb_cnt = [0u8; P_PERSON];
@@ -922,9 +1216,12 @@ fn run_events_dedup<E: DedupEmit>(
                 let mut long_table: Option<HashTable<u32>> = None;
                 let mut ring_u32 = [DedupProbeU32 { tag12: 0, slot: 0 }; RING];
                 let mut ring_wide = [0usize; RING];
+                let mut pending_ev = [E::empty_tmpl(); 64];
+                let mut pending_uh = [0u64; 64];
+                let mut hit_idxs = [0u8; 64];
 
                 loop {
-                    let ds = next_ref.fetch_add(1, Ordering::Relaxed);
+                    let ds = next_d_ref.fetch_add(1, Ordering::Relaxed);
                     if ds >= P_DEDUP {
                         break;
                     }
@@ -1222,39 +1519,119 @@ fn run_events_dedup<E: DedupEmit>(
                         }
                     }
 
-                    for batch in shard_vecs {
-                        let blen = batch.len();
-                        for ridx in 0..blen {
-                            #[cfg(target_arch = "x86_64")]
-                            if ridx + 16 < blen {
-                                let ev_ahead = unsafe { *batch.get_unchecked(ridx + 16) };
-                                if (ev_ahead.meta & (3u64 << META_TAG_SHIFT)) == META_VALID_EXT {
-                                    let payload = ev_ahead.meta & !(3u64 << META_TAG_SHIFT);
-                                    let e_wid = (payload >> 40) as usize;
-                                    let e_idx = (payload & META_EXT_IDX_MASK) as usize;
-                                    unsafe {
-                                        std::arch::x86_64::_mm_prefetch(
-                                            ev_worker_ext.get_unchecked(e_wid).as_ptr().add(e_idx)
-                                                as *const i8,
-                                            std::arch::x86_64::_MM_HINT_T0,
+                    if lm_empty {
+                        for batch in shard_vecs {
+                            let blen = batch.len();
+                            for ridx in 0..blen {
+                                #[cfg(target_arch = "x86_64")]
+                                if ridx + 16 < blen {
+                                    let ev_ahead = unsafe { *batch.get_unchecked(ridx + 16) };
+                                    if (ev_ahead.meta & (3u64 << META_TAG_SHIFT)) == META_VALID_EXT {
+                                        let payload = ev_ahead.meta & !(3u64 << META_TAG_SHIFT);
+                                        let e_wid = (payload >> 40) as usize;
+                                        let e_idx = (payload & META_EXT_IDX_MASK) as usize;
+                                        unsafe {
+                                            std::arch::x86_64::_mm_prefetch(
+                                                ev_worker_ext.get_unchecked(e_wid).as_ptr().add(e_idx)
+                                                    as *const i8,
+                                                std::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                    }
+                                }
+                                let ev = unsafe { *batch.get_unchecked(ridx) };
+                                let tag = ev.meta & (3u64 << META_TAG_SHIFT);
+                                if tag < META_INVALID {
+                                    let ph = hash_raw_key(ev.person_key, ev_worker_arenas);
+                                    let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+                                    let item = E::from_winner(&ev, window_start_ms, ev_worker_ext);
+                                    swcb_push_nt::<E, SWCB_DEDUP>(
+                                        &mut swcb,
+                                        &mut swcb_cnt,
+                                        &mut person_out,
+                                        pshard,
+                                        item,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let mut n_pending = 0usize;
+                        for batch in shard_vecs {
+                            let blen = batch.len();
+                            for ridx in 0..blen {
+                                #[cfg(target_arch = "x86_64")]
+                                if ridx + 16 < blen {
+                                    let ev_ahead = unsafe { *batch.get_unchecked(ridx + 16) };
+                                    if (ev_ahead.meta & (3u64 << META_TAG_SHIFT)) == META_VALID_EXT {
+                                        let payload = ev_ahead.meta & !(3u64 << META_TAG_SHIFT);
+                                        let e_wid = (payload >> 40) as usize;
+                                        let e_idx = (payload & META_EXT_IDX_MASK) as usize;
+                                        unsafe {
+                                            std::arch::x86_64::_mm_prefetch(
+                                                ev_worker_ext.get_unchecked(e_wid).as_ptr().add(e_idx)
+                                                    as *const i8,
+                                                std::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                    }
+                                }
+                                let ev = unsafe { *batch.get_unchecked(ridx) };
+                                let tag = ev.meta & (3u64 << META_TAG_SHIFT);
+                                if tag < META_INVALID {
+                                    let mut item =
+                                        E::from_winner(&ev, window_start_ms, ev_worker_ext);
+                                    if !ev.person_key.is_ref() {
+                                        let uh = mix64(ev.person_key.0);
+                                        link_map.prefetch_bloom(uh);
+                                        pending_ev[n_pending] = item;
+                                        pending_uh[n_pending] = uh;
+                                        n_pending += 1;
+                                        if n_pending == 64 {
+                                            flush_dedup_pending::<E, SWCB_DEDUP>(
+                                                64,
+                                                &pending_ev,
+                                                &pending_uh,
+                                                &mut hit_idxs,
+                                                link_map,
+                                                &mut swcb,
+                                                &mut swcb_cnt,
+                                                &mut person_out,
+                                            );
+                                            n_pending = 0;
+                                        }
+                                    } else {
+                                        let uid = LongArena::resolve_in(ev_worker_arenas, ev.person_key);
+                                        let pk = link_map.resolve_long(uid).unwrap_or(ev.person_key);
+                                        let ph = if !pk.is_ref() {
+                                            mix64(pk.0)
+                                        } else {
+                                            hash_bytes_fast(uid)
+                                        };
+                                        item.set_person_key(pk);
+                                        let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+                                        swcb_push_nt::<E, SWCB_DEDUP>(
+                                            &mut swcb,
+                                            &mut swcb_cnt,
+                                            &mut person_out,
+                                            pshard,
+                                            item,
                                         );
                                     }
                                 }
                             }
-                            let ev = unsafe { *batch.get_unchecked(ridx) };
-                            let tag = ev.meta & (3u64 << META_TAG_SHIFT);
-                            if tag < META_INVALID {
-                                let ph = hash_raw_key(ev.person_key, ev_worker_arenas);
-                                let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-                                let item = E::from_winner(&ev, window_start_ms, ev_worker_ext);
-                                swcb_push_nt::<E, SWCB_DEDUP>(
-                                    &mut swcb,
-                                    &mut swcb_cnt,
-                                    &mut person_out,
-                                    pshard,
-                                    item,
-                                );
-                            }
+                        }
+                        if n_pending > 0 {
+                            flush_dedup_pending::<E, SWCB_DEDUP>(
+                                n_pending,
+                                &pending_ev,
+                                &pending_uh,
+                                &mut hit_idxs,
+                                link_map,
+                                &mut swcb,
+                                &mut swcb_cnt,
+                                &mut person_out,
+                            );
                         }
                     }
                 }
@@ -1268,25 +1645,49 @@ fn run_events_dedup<E: DedupEmit>(
                         }
                     }
                     sfence_if_nt();
-                    *out_slot = person_out;
+                    *ev_out_slot = person_out;
                 }
             });
         }
     });
 
-    let mut batches: Vec<Vec<Vec<E>>> = (0..P_PERSON)
-        .map(|_| Vec::with_capacity(n_dedup_workers))
+    for e in worker_errs.into_iter().flatten() {
+        return Err(e);
+    }
+
+    let mut person_event_batches: Vec<Vec<Vec<E>>> = (0..P_PERSON)
+        .map(|_| Vec::with_capacity(n_workers))
         .collect();
-    let mut counts = vec![0usize; P_PERSON];
+    let mut person_event_counts = vec![0usize; P_PERSON];
     for mut wouts in dedup_worker_outs {
         for (ps, v) in wouts.drain(..).enumerate() {
             if !v.is_empty() {
-                counts[ps] += v.len();
-                batches[ps].push(v);
+                person_event_counts[ps] += v.len();
+                person_event_batches[ps].push(v);
             }
         }
     }
-    (batches, counts)
+
+    let mut person_click_batches: Vec<Vec<Vec<C>>> = (0..P_PERSON)
+        .map(|_| Vec::with_capacity(n_workers))
+        .collect();
+    let mut person_click_counts = vec![0usize; P_PERSON];
+    for mut worker_vecs in cl_worker_shards {
+        for (ps, v) in worker_vecs.drain(..).enumerate() {
+            if !v.is_empty() {
+                person_click_counts[ps] += v.len();
+                person_click_batches[ps].push(v);
+            }
+        }
+    }
+
+    Ok(ClicksDedupOut {
+        person_event_batches,
+        person_event_counts,
+        person_click_batches,
+        person_click_counts,
+        cl_worker_arenas,
+    })
 }
 
 impl ClickEmit for PersonClick16 {
@@ -1336,94 +1737,22 @@ impl ClickEmit for PersonClickWide {
     }
 }
 
-struct ParsedPoolOutput<C> {
+struct EvParseOutput {
     dedup_inputs: Vec<Vec<Vec<ParsedEvent>>>,
     ev_worker_arenas: Vec<LongArena>,
     ev_worker_ext: Vec<Vec<ExtEvent>>,
-    person_click_batches: Vec<Vec<Vec<C>>>,
-    person_click_counts: Vec<usize>,
-    cl_worker_arenas: Vec<LongArena>,
 }
 
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn flush_ev_pending<const SWCB_EV: usize>(
-    n_pending: usize,
-    pending_ev: &[ParsedEvent; 64],
-    pending_uh: &[u64; 64],
-    pending_ds: &[u8; 64],
-    hit_idxs: &mut [u8; 64],
-    link_map: &LinkMap,
-    swcb: &mut [ParsedEvent],
-    swcb_cnt: &mut [u8; P_DEDUP],
-    ev_buckets: &mut [Vec<ParsedEvent>],
-) {
-    let mut n_hits = 0usize;
-    for j in 0..n_pending {
-        let uh = pending_uh[j];
-        if link_map.bloom_may_contain(uh) {
-            link_map.prefetch_slot(uh);
-            hit_idxs[n_hits] = j as u8;
-            n_hits += 1;
-        } else {
-            swcb_push_nt::<ParsedEvent, SWCB_EV>(
-                swcb,
-                swcb_cnt,
-                ev_buckets,
-                pending_ds[j] as usize,
-                pending_ev[j],
-            );
-        }
-    }
-    for k in 0..n_hits {
-        let j = hit_idxs[k] as usize;
-        let mut ev = pending_ev[j];
-        ev.person_key = link_map.probe_inline_with_hash(ev.person_key, pending_uh[j]);
-        swcb_push_nt::<ParsedEvent, SWCB_EV>(
-            swcb,
-            swcb_cnt,
-            ev_buckets,
-            pending_ds[j] as usize,
-            ev,
-        );
-    }
-}
-
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn flush_cl_pending<C: ClickEmit, const SWCB_CL: usize>(
-    n_pending: usize,
-    pending_cl: &[C; 64],
-    pending_uh: &[u64; 64],
-    hit_idxs: &mut [u8; 64],
-    link_map: &LinkMap,
-    swcb: &mut [C],
-    swcb_cnt: &mut [u8; P_PERSON],
-    cl_buckets: &mut [Vec<C>],
-) {
-    let mut n_hits = 0usize;
-    for j in 0..n_pending {
-        let uh = pending_uh[j];
-        if link_map.bloom_may_contain(uh) {
-            link_map.prefetch_slot(uh);
-            hit_idxs[n_hits] = j as u8;
-            n_hits += 1;
-        } else {
-            let pshard = ((uh >> 52) as usize) & (P_PERSON - 1);
-            swcb_push_nt::<C, SWCB_CL>(swcb, swcb_cnt, cl_buckets, pshard, pending_cl[j]);
-        }
-    }
-    for k in 0..n_hits {
-        let j = hit_idxs[k] as usize;
-        let mut pc = pending_cl[j];
-        let uk = pc.person_key();
-        let uh = pending_uh[j];
-        let pk = link_map.probe_inline_with_hash(uk, uh);
-        let ph = if pk.0 == uk.0 { uh } else { mix64(pk.0) };
-        pc.set_person_key(pk);
-        let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-        swcb_push_nt::<C, SWCB_CL>(swcb, swcb_cnt, cl_buckets, pshard, pc);
-    }
+struct EvWorkerState {
+    wid: usize,
+    buf: Vec<u8>,
+    dcache: DateCache,
+    ev_buckets: Vec<Vec<ParsedEvent>>,
+    swcb: Vec<ParsedEvent>,
+    swcb_cnt: [u8; P_DEDUP],
+    ev_arena: LongArena,
+    ext: Vec<ExtEvent>,
+    err: Option<io::Error>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1433,8 +1762,6 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
     lines: &[LineBounds<7>],
     dcache: &mut DateCache,
     lookups: &Lookups,
-    link_map: &LinkMap,
-    lm_empty: bool,
     wid: usize,
     window_start_ms: i64,
     window_end_ms: i64,
@@ -1444,11 +1771,6 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
     ev_buckets: &mut [Vec<ParsedEvent>],
     swcb: &mut [ParsedEvent],
     swcb_cnt: &mut [u8; P_DEDUP],
-    pending_ev: &mut [ParsedEvent; 64],
-    pending_uh: &mut [u64; 64],
-    pending_ds: &mut [u8; 64],
-    n_pending: &mut usize,
-    hit_idxs: &mut [u8; 64],
 ) {
     const VIEW_U32: u32 = u32::from_ne_bytes(*b"view");
     const CART_U32: u32 = u32::from_ne_bytes(*b"cart");
@@ -1461,8 +1783,9 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
             continue;
         }
         let (ing_s, ing_e) = lb.span(3);
-        let ingest_ts = unsafe { padded.get_unchecked(ing_s..ing_e) };
-        let Some((ingest_sec, _, _, _)) = dcache.parse_f1_sec_with_date(ingest_ts) else {
+        let Some((ingest_sec, hint_hi, hint_lo, hint_day_sec)) =
+            dcache.parse_f1_sec_padded_with_hint(padded, ing_s, ing_e - ing_s)
+        else {
             continue;
         };
         let ingest_ms = ingest_sec * MS_SECOND;
@@ -1511,7 +1834,14 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
                 }
             }
             if need_ts {
-                if let Some(t) = dcache.parse_ts_ms_padded_dc(padded, ts_s, ts_e - ts_s) {
+                if let Some(t) = dcache.parse_ts_ms_padded_hint(
+                    padded,
+                    ts_s,
+                    ts_e - ts_s,
+                    hint_hi,
+                    hint_lo,
+                    hint_day_sec,
+                ) {
                     let in_late = if COMPACT {
                         (ingest_ms - t) <= MS_DAY
                     } else {
@@ -1570,390 +1900,140 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
             META_VALID_EXT | ((wid as u64) << 40) | ext_idx
         };
 
-        if let Some(uk) = CompactKey64::encode_raw_inline_padded(padded, u_s, u_len) {
-            if lm_empty {
-                swcb_push_nt::<ParsedEvent, SWCB_EV>(
-                    swcb,
-                    swcb_cnt,
-                    ev_buckets,
-                    d_shard,
-                    ParsedEvent {
-                        ev_key,
-                        person_key: uk,
-                        meta,
-                    },
-                );
-            } else {
-                let uh = mix64(uk.0);
-                link_map.prefetch_bloom(uh);
-                let p_idx = *n_pending;
-                pending_ev[p_idx] = ParsedEvent {
-                    ev_key,
-                    person_key: uk,
-                    meta,
-                };
-                pending_uh[p_idx] = uh;
-                pending_ds[p_idx] = d_shard as u8;
-                *n_pending = p_idx + 1;
-                if p_idx + 1 == 64 {
-                    flush_ev_pending::<SWCB_EV>(
-                        64,
-                        pending_ev,
-                        pending_uh,
-                        pending_ds,
-                        hit_idxs,
-                        link_map,
-                        swcb,
-                        swcb_cnt,
-                        ev_buckets,
-                    );
-                    *n_pending = 0;
-                }
-            }
-        } else {
-            let uid = unsafe { padded.get_unchecked(u_s..u_s + u_len) };
-            let person_key = link_map
-                .resolve_long(uid)
-                .unwrap_or_else(|| ev_arena_out.push_ref(wid, uid));
-            swcb_push_nt::<ParsedEvent, SWCB_EV>(
-                swcb,
-                swcb_cnt,
-                ev_buckets,
-                d_shard,
-                ParsedEvent {
-                    ev_key,
-                    person_key,
-                    meta,
-                },
-            );
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn process_cl_batch<C: ClickEmit, const SWCB_CL: usize>(
-    padded: &[u8],
-    lines: &[LineBounds<4>],
-    dcache: &mut DateCache,
-    lookups: &Lookups,
-    link_map: &LinkMap,
-    lm_empty: bool,
-    wid: usize,
-    click_window_start_ms: i64,
-    window_end_ms: i64,
-    cl_arena_out: &mut LongArena,
-    cl_buckets: &mut [Vec<C>],
-    swcb: &mut [C],
-    swcb_cnt: &mut [u8; P_PERSON],
-    pending_cl: &mut [C; 64],
-    pending_uh: &mut [u64; 64],
-    n_pending: &mut usize,
-    hit_idxs: &mut [u8; 64],
-) {
-    for lb in lines {
-        let (cl_s, cl_e) = lb.span(0);
-        let cl_len = cl_e - cl_s;
-        let (u_s, u_e) = lb.span(1);
-        let u_len = u_e - u_s;
-        if cl_len == 0 || u_len == 0 {
-            continue;
-        }
-        let (c_s, c_e) = lb.span(2);
-        let c_len = c_e - c_s;
-        let Some(cid) = lookups.get_campaign_padded(padded, c_s, c_len) else {
-            continue;
-        };
-        let (ts_s, ts_e) = lb.span(3);
-        let Some(ts_ms) = dcache.parse_ts_ms_padded_dc(padded, ts_s, ts_e - ts_s) else {
-            continue;
-        };
-        if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
-            continue;
-        }
-        let click_id_key = CompactKey64::encode_raw_inline_padded(padded, cl_s, cl_len)
-            .unwrap_or_else(|| {
-                let click_id = unsafe { padded.get_unchecked(cl_s..cl_e) };
-                cl_arena_out.push_ref(wid, click_id)
+        let person_key =
+            CompactKey64::encode_raw_inline_padded(padded, u_s, u_len).unwrap_or_else(|| {
+                let uid = unsafe { padded.get_unchecked(u_s..u_e) };
+                ev_arena_out.push_ref(wid, uid)
             });
-
-        if let Some(uk) = CompactKey64::encode_raw_inline_padded(padded, u_s, u_len) {
-            let uh = mix64(uk.0);
-            if lm_empty {
-                let pshard = ((uh >> 52) as usize) & (P_PERSON - 1);
-                swcb_push_nt::<C, SWCB_CL>(
-                    swcb,
-                    swcb_cnt,
-                    cl_buckets,
-                    pshard,
-                    C::from_parsed(uk, click_id_key, ts_ms, click_window_start_ms, cid),
-                );
-            } else {
-                link_map.prefetch_bloom(uh);
-                let p_idx = *n_pending;
-                pending_cl[p_idx] =
-                    C::from_parsed(uk, click_id_key, ts_ms, click_window_start_ms, cid);
-                pending_uh[p_idx] = uh;
-                *n_pending = p_idx + 1;
-                if p_idx + 1 == 64 {
-                    flush_cl_pending::<C, SWCB_CL>(
-                        64,
-                        pending_cl,
-                        pending_uh,
-                        hit_idxs,
-                        link_map,
-                        swcb,
-                        swcb_cnt,
-                        cl_buckets,
-                    );
-                    *n_pending = 0;
-                }
-            }
-        } else {
-            let uid = unsafe { padded.get_unchecked(u_s..u_e) };
-            let (pk, ph) = if let Some(pk) = link_map.resolve_long(uid) {
-                (pk, mix64(pk.0))
-            } else {
-                (cl_arena_out.push_ref(wid, uid), hash_bytes_fast(uid))
-            };
-            let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-            swcb_push_nt::<C, SWCB_CL>(
-                swcb,
-                swcb_cnt,
-                cl_buckets,
-                pshard,
-                C::from_parsed(pk, click_id_key, ts_ms, click_window_start_ms, cid),
-            );
-        }
+        swcb_push_nt::<ParsedEvent, SWCB_EV>(
+            swcb,
+            swcb_cnt,
+            ev_buckets,
+            d_shard,
+            ParsedEvent {
+                ev_key,
+                person_key,
+                meta,
+            },
+        );
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
+fn run_parse_events_par<const COMPACT: bool>(
     event_src: &CsvSource,
     ev_chunks: &[crate::csv::ChunkTask],
     est_ev_cap: usize,
-    click_src: &CsvSource,
-    cl_chunks: &[crate::csv::ChunkTask],
-    est_cl_cap: usize,
     lookups: &Lookups,
-    link_map: &LinkMap,
     window_start_ms: i64,
     window_end_ms: i64,
     window_start_sec: i64,
-    click_window_start_ms: i64,
-    n_workers: usize,
-) -> io::Result<ParsedPoolOutput<C>> {
+    ncpu: usize,
+) -> io::Result<EvParseOutput> {
     const SWCB_EV: usize = 4;
-    const SWCB_CL: usize = 4;
 
-    let mut ev_worker_shards: Vec<Vec<Vec<ParsedEvent>>> =
-        (0..n_workers).map(|_| Vec::new()).collect();
-    let mut ev_worker_arenas: Vec<LongArena> = (0..n_workers).map(|_| LongArena::default()).collect();
-    let mut ev_worker_ext: Vec<Vec<ExtEvent>> = (0..n_workers).map(|_| Vec::new()).collect();
-    let mut cl_worker_shards: Vec<Vec<Vec<C>>> = (0..n_workers).map(|_| Vec::new()).collect();
-    let mut cl_worker_arenas: Vec<LongArena> = (0..n_workers).map(|_| LongArena::default()).collect();
-    let mut worker_errs: Vec<Option<io::Error>> = (0..n_workers).map(|_| None).collect();
-
-    if !ev_chunks.is_empty() || !cl_chunks.is_empty() {
-        let next_ev = AtomicUsize::new(0);
-        let next_cl = AtomicUsize::new(0);
-        let lm_empty = link_map.is_empty();
-
-        std::thread::scope(|scope| {
-            for (
-                wid,
-                (((((ev_buckets_slot, ev_arena_out), ext_out), cl_buckets_slot), cl_arena_out), err_out),
-            ) in ev_worker_shards
-                .iter_mut()
-                .zip(ev_worker_arenas.iter_mut())
-                .zip(ev_worker_ext.iter_mut())
-                .zip(cl_worker_shards.iter_mut())
-                .zip(cl_worker_arenas.iter_mut())
-                .zip(worker_errs.iter_mut())
-                .enumerate()
-            {
-                let next_ev_ref = &next_ev;
-                let next_cl_ref = &next_cl;
-                scope.spawn(move || {
-                    let mut dcache = DateCache::new();
-                    let mut buf = Vec::new();
-                    let mut hit_idxs = [0u8; 64];
-                    let mut pending_uh = [0u64; 64];
-
-                    // Events phase
-                    if !ev_chunks.is_empty() {
-                        let first = next_ev_ref.fetch_add(1, Ordering::Relaxed);
-                        if first < ev_chunks.len() {
-                            let mut ev_buckets: Vec<Vec<ParsedEvent>> =
-                                (0..P_DEDUP).map(|_| Vec::with_capacity(est_ev_cap)).collect();
-                            let mut swcb = vec![
-                                ParsedEvent {
-                                    ev_key: CompactKey64::EMPTY,
-                                    person_key: CompactKey64::EMPTY,
-                                    meta: 0,
-                                };
-                                P_DEDUP * SWCB_EV
-                            ];
-                            let mut swcb_cnt = [0u8; P_DEDUP];
-                            let mut pending_ev = [ParsedEvent {
-                                ev_key: CompactKey64::EMPTY,
-                                person_key: CompactKey64::EMPTY,
-                                meta: 0,
-                            }; 64];
-                            let mut pending_ds = [0u8; 64];
-                            let mut ev_batch: Vec<LineBounds<7>> = Vec::new();
-
-                            let mut cidx = first;
-                            while let Some(&task) = ev_chunks.get(cidx) {
-                                let mut n_pending = 0usize;
-                                if let Err(e) = event_src.for_each_chunk_batch::<7>(
-                                    task,
-                                    &mut buf,
-                                    &mut ev_batch,
-                                    |padded, lines| {
-                                        process_ev_batch::<SWCB_EV, COMPACT>(
-                                            padded,
-                                            lines,
-                                            &mut dcache,
-                                            lookups,
-                                            link_map,
-                                            lm_empty,
-                                            wid,
-                                            window_start_ms,
-                                            window_end_ms,
-                                            window_start_sec,
-                                            ev_arena_out,
-                                            ext_out,
-                                            &mut ev_buckets,
-                                            &mut swcb,
-                                            &mut swcb_cnt,
-                                            &mut pending_ev,
-                                            &mut pending_uh,
-                                            &mut pending_ds,
-                                            &mut n_pending,
-                                            &mut hit_idxs,
-                                        );
-                                    },
-                                ) {
-                                    *err_out = Some(e);
-                                    return;
-                                }
-                                if n_pending > 0 {
-                                    flush_ev_pending::<SWCB_EV>(
-                                        n_pending,
-                                        &pending_ev,
-                                        &pending_uh,
-                                        &pending_ds,
-                                        &mut hit_idxs,
-                                        link_map,
-                                        &mut swcb,
-                                        &mut swcb_cnt,
-                                        &mut ev_buckets,
-                                    );
-                                }
-                                cidx = next_ev_ref.fetch_add(1, Ordering::Relaxed);
-                            }
-
-                            for ds in 0..P_DEDUP {
-                                let cnt = swcb_cnt[ds] as usize;
-                                if cnt > 0 {
-                                    let base = ds * SWCB_EV;
-                                    ev_buckets[ds].extend_from_slice(&swcb[base..base + cnt]);
-                                }
-                            }
-                            sfence_if_nt();
-                            *ev_buckets_slot = ev_buckets;
-                        }
-                    }
-
-                    // Clicks phase immediately in same worker pool (no barrier)
-                    if !cl_chunks.is_empty() {
-                        let first = next_cl_ref.fetch_add(1, Ordering::Relaxed);
-                        if first < cl_chunks.len() {
-                            let mut cl_buckets: Vec<Vec<C>> =
-                                (0..P_PERSON).map(|_| Vec::with_capacity(est_cl_cap)).collect();
-                            let tmpl = C::from_parsed(
-                                CompactKey64::EMPTY,
-                                CompactKey64::EMPTY,
-                                0,
-                                0,
-                                0,
-                            );
-                            let mut swcb = vec![tmpl; P_PERSON * SWCB_CL];
-                            let mut swcb_cnt = [0u8; P_PERSON];
-                            let mut pending_cl = [tmpl; 64];
-                            let mut cl_batch: Vec<LineBounds<4>> = Vec::new();
-
-                            let mut cidx = first;
-                            while let Some(&task) = cl_chunks.get(cidx) {
-                                let mut n_pending = 0usize;
-                                if let Err(e) = click_src.for_each_chunk_batch::<4>(
-                                    task,
-                                    &mut buf,
-                                    &mut cl_batch,
-                                    |padded, lines| {
-                                        process_cl_batch::<C, SWCB_CL>(
-                                            padded,
-                                            lines,
-                                            &mut dcache,
-                                            lookups,
-                                            link_map,
-                                            lm_empty,
-                                            wid,
-                                            click_window_start_ms,
-                                            window_end_ms,
-                                            cl_arena_out,
-                                            &mut cl_buckets,
-                                            &mut swcb,
-                                            &mut swcb_cnt,
-                                            &mut pending_cl,
-                                            &mut pending_uh,
-                                            &mut n_pending,
-                                            &mut hit_idxs,
-                                        );
-                                    },
-                                ) {
-                                    *err_out = Some(e);
-                                    return;
-                                }
-                                if n_pending > 0 {
-                                    flush_cl_pending::<C, SWCB_CL>(
-                                        n_pending,
-                                        &pending_cl,
-                                        &pending_uh,
-                                        &mut hit_idxs,
-                                        link_map,
-                                        &mut swcb,
-                                        &mut swcb_cnt,
-                                        &mut cl_buckets,
-                                    );
-                                }
-                                cidx = next_cl_ref.fetch_add(1, Ordering::Relaxed);
-                            }
-
-                            for ps in 0..P_PERSON {
-                                let cnt = swcb_cnt[ps] as usize;
-                                if cnt > 0 {
-                                    let base = ps * SWCB_CL;
-                                    cl_buckets[ps].extend_from_slice(&swcb[base..base + cnt]);
-                                }
-                            }
-                            sfence_if_nt();
-                            *cl_buckets_slot = cl_buckets;
-                        }
-                    }
-                });
-            }
+    if ev_chunks.is_empty() {
+        return Ok(EvParseOutput {
+            dedup_inputs: (0..P_DEDUP).map(|_| Vec::new()).collect(),
+            ev_worker_arenas: Vec::new(),
+            ev_worker_ext: Vec::new(),
         });
     }
 
-    for e in worker_errs.into_iter().flatten() {
-        return Err(e);
+    let n_slots = ncpu.clamp(1, 63).min(ev_chunks.len());
+    let states: Vec<Mutex<EvWorkerState>> = (0..n_slots)
+        .map(|wid| {
+            Mutex::new(EvWorkerState {
+                wid,
+                buf: Vec::new(),
+                dcache: DateCache::new(),
+                ev_buckets: Vec::new(),
+                swcb: Vec::new(),
+                swcb_cnt: [0u8; P_DEDUP],
+                ev_arena: LongArena::default(),
+                ext: Vec::new(),
+                err: None,
+            })
+        })
+        .collect();
+
+    ev_chunks.par_iter().for_each(|&task| {
+        let slot_idx = rayon::current_thread_index().unwrap_or(0) % n_slots;
+        let mut st_guard = states[slot_idx].lock().unwrap();
+        let st = &mut *st_guard;
+        if st.err.is_some() {
+            return;
+        }
+        if st.ev_buckets.is_empty() {
+            st.ev_buckets = (0..P_DEDUP)
+                .map(|_| Vec::with_capacity(est_ev_cap))
+                .collect();
+            st.swcb = vec![
+                ParsedEvent {
+                    ev_key: CompactKey64::EMPTY,
+                    person_key: CompactKey64::EMPTY,
+                    meta: 0,
+                };
+                P_DEDUP * SWCB_EV
+            ];
+        }
+        let wid = st.wid;
+        let res = {
+            let buf = &mut st.buf;
+            let dcache = &mut st.dcache;
+            let ev_arena = &mut st.ev_arena;
+            let ext = &mut st.ext;
+            let ev_buckets = &mut st.ev_buckets;
+            let swcb = &mut st.swcb;
+            let swcb_cnt = &mut st.swcb_cnt;
+            event_src.for_each_chunk_l1_batch::<7>(task, buf, |padded, lines| {
+                process_ev_batch::<SWCB_EV, COMPACT>(
+                    padded,
+                    lines,
+                    dcache,
+                    lookups,
+                    wid,
+                    window_start_ms,
+                    window_end_ms,
+                    window_start_sec,
+                    ev_arena,
+                    ext,
+                    ev_buckets,
+                    swcb,
+                    swcb_cnt,
+                );
+            })
+        };
+        if let Err(e) = res {
+            st.err = Some(e);
+        }
+    });
+
+    let mut ev_worker_shards: Vec<Vec<Vec<ParsedEvent>>> = Vec::with_capacity(n_slots);
+    let mut ev_worker_arenas: Vec<LongArena> = Vec::with_capacity(n_slots);
+    let mut ev_worker_ext: Vec<Vec<ExtEvent>> = Vec::with_capacity(n_slots);
+    for m in states {
+        let mut st = m.into_inner().unwrap();
+        if let Some(e) = st.err {
+            return Err(e);
+        }
+        if !st.ev_buckets.is_empty() {
+            for ds in 0..P_DEDUP {
+                let cnt = st.swcb_cnt[ds] as usize;
+                if cnt > 0 {
+                    let base = ds * SWCB_EV;
+                    st.ev_buckets[ds].extend_from_slice(&st.swcb[base..base + cnt]);
+                }
+            }
+        }
+        ev_worker_shards.push(st.ev_buckets);
+        ev_worker_arenas.push(st.ev_arena);
+        ev_worker_ext.push(st.ext);
     }
+    sfence_if_nt();
 
     let mut dedup_inputs: Vec<Vec<Vec<ParsedEvent>>> =
-        (0..P_DEDUP).map(|_| Vec::with_capacity(n_workers)).collect();
+        (0..P_DEDUP).map(|_| Vec::with_capacity(n_slots)).collect();
     for mut worker_vecs in ev_worker_shards {
         for (d_shard, v) in worker_vecs.drain(..).enumerate() {
             if !v.is_empty() {
@@ -1962,27 +2042,29 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
         }
     }
 
-    let mut person_click_batches: Vec<Vec<Vec<C>>> = (0..P_PERSON)
-        .map(|_| Vec::with_capacity(n_workers))
-        .collect();
-    let mut person_click_counts = vec![0usize; P_PERSON];
-    for mut worker_vecs in cl_worker_shards {
-        for (ps, v) in worker_vecs.drain(..).enumerate() {
-            if !v.is_empty() {
-                person_click_counts[ps] += v.len();
-                person_click_batches[ps].push(v);
-            }
-        }
-    }
-
-    Ok(ParsedPoolOutput {
+    Ok(EvParseOutput {
         dedup_inputs,
         ev_worker_arenas,
         ev_worker_ext,
-        person_click_batches,
-        person_click_counts,
-        cl_worker_arenas,
     })
+}
+
+#[inline(always)]
+fn radix_pass_u64(src: &[u64], dst: &mut [u64], counts: &mut [u32], shift: u32, mask: usize) {
+    let mut acc = 0u32;
+    for c in counts.iter_mut() {
+        let v = *c;
+        *c = acc;
+        acc += v;
+    }
+    for &x in src {
+        let b = ((x >> shift) as usize) & mask;
+        unsafe {
+            let pos = *counts.get_unchecked(b) as usize;
+            *counts.get_unchecked_mut(b) = (pos + 1) as u32;
+            *dst.get_unchecked_mut(pos) = x;
+        }
+    }
 }
 
 fn sort_u64_radix(slice: &mut [u64], scratch: &mut Vec<u64>) {
@@ -1992,62 +2074,39 @@ fn sort_u64_radix(slice: &mut [u64], scratch: &mut Vec<u64>) {
     }
     let tmp = &mut scratch[..n];
 
-    let mut c0 = [0u32; 256];
-    let mut c1 = [0u32; 256];
-    let mut c2 = [0u32; 256];
-    let mut c3 = [0u32; 256];
+    let mut c0 = [0u32; 2048];
+    let mut c1 = [0u32; 2048];
+    let mut c2 = [0u32; 1024];
     for &x in slice.iter() {
         let k = (x >> 32) as usize;
-        c0[k & 0xFF] += 1;
-        c1[(k >> 8) & 0xFF] += 1;
-        c2[(k >> 16) & 0xFF] += 1;
-        c3[(k >> 24) & 0xFF] += 1;
+        c0[k & 0x7FF] += 1;
+        c1[(k >> 11) & 0x7FF] += 1;
+        c2[(k >> 22) & 0x3FF] += 1;
     }
 
-    let k0_first = ((slice[0] >> 32) as usize) & 0xFF;
-    let k1_first = ((slice[0] >> 40) as usize) & 0xFF;
-    let k2_first = ((slice[0] >> 48) as usize) & 0xFF;
-    let k3_first = ((slice[0] >> 56) as usize) & 0xFF;
-    let skips = [
-        c0[k0_first] as usize == n,
-        c1[k1_first] as usize == n,
-        c2[k2_first] as usize == n,
-        c3[k3_first] as usize == n,
-    ];
-    let mut hist = [c0, c1, c2, c3];
-    let shifts = [32u32, 40u32, 48u32, 56u32];
+    let k0 = (slice[0] >> 32) as usize;
+    let skip0 = c0[k0 & 0x7FF] as usize == n;
+    let skip1 = c1[(k0 >> 11) & 0x7FF] as usize == n;
+    let skip2 = c2[(k0 >> 22) & 0x3FF] as usize == n;
 
     let mut in_tmp = false;
-    for pass in 0..4 {
-        if skips[pass] {
-            continue;
-        }
-        let counts = &mut hist[pass];
-        let mut acc = 0u32;
-        for c in counts.iter_mut() {
-            let v = *c;
-            *c = acc;
-            acc += v;
-        }
-        let shift = shifts[pass];
+    if !skip0 {
+        radix_pass_u64(slice, tmp, &mut c0, 32, 0x7FF);
+        in_tmp = true;
+    }
+    if !skip1 {
         if in_tmp {
-            for &x in tmp.iter() {
-                let b = ((x >> shift) as usize) & 0xFF;
-                let pos = counts[b] as usize;
-                counts[b] += 1;
-                unsafe {
-                    *slice.get_unchecked_mut(pos) = x;
-                }
-            }
+            radix_pass_u64(tmp, slice, &mut c1, 43, 0x7FF);
         } else {
-            for &x in slice.iter() {
-                let b = ((x >> shift) as usize) & 0xFF;
-                let pos = counts[b] as usize;
-                counts[b] += 1;
-                unsafe {
-                    *tmp.get_unchecked_mut(pos) = x;
-                }
-            }
+            radix_pass_u64(slice, tmp, &mut c1, 43, 0x7FF);
+        }
+        in_tmp = !in_tmp;
+    }
+    if !skip2 {
+        if in_tmp {
+            radix_pass_u64(tmp, slice, &mut c2, 54, 0x3FF);
+        } else {
+            radix_pass_u64(slice, tmp, &mut c2, 54, 0x3FF);
         }
         in_tmp = !in_tmp;
     }
@@ -2072,10 +2131,38 @@ impl Stage5Event for PersonEvent16 {
 
     #[inline(always)]
     fn sort_grouped(slice: &mut [u64], scratch: &mut Vec<u64>) {
-        if slice.len() < 384 {
-            if slice.len() > 1 {
-                slice.sort_unstable();
+        let n = slice.len();
+        if n <= 1 {
+            return;
+        }
+        if n == 2 {
+            if slice[0] > slice[1] {
+                slice.swap(0, 1);
             }
+            return;
+        }
+        if n <= 24 {
+            for i in 1..n {
+                let key = unsafe { *slice.get_unchecked(i) };
+                let mut j = i;
+                while j > 0 {
+                    let prev = unsafe { *slice.get_unchecked(j - 1) };
+                    if prev <= key {
+                        break;
+                    }
+                    unsafe {
+                        *slice.get_unchecked_mut(j) = prev;
+                    }
+                    j -= 1;
+                }
+                unsafe {
+                    *slice.get_unchecked_mut(j) = key;
+                }
+            }
+            return;
+        }
+        if n < 1536 {
+            slice.sort_unstable();
         } else {
             sort_u64_radix(slice, scratch);
         }
@@ -2266,6 +2353,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
     let num_cats = lookups.categories.len();
     let organic_camp = lookups.organic_camp_id;
     let total_events: usize = person_event_counts.iter().sum();
+    let ud_batch_rows = (total_events / (8 * n_out_workers).max(1)).clamp(4096, USER_DAILY_BATCH_ROWS);
 
     let mut worker_accs: Vec<CampDailyAcc> = (0..n_out_workers)
         .map(|_| CampDailyAcc::new(num_camps, min_day, max_day, total_events))
@@ -2288,7 +2376,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
             scope.spawn(move || {
                 let mut writer = match UserDailyWriter::create(
                     &ud_path,
-                    USER_DAILY_BATCH_ROWS,
+                    ud_batch_rows,
                     &lookups.categories,
                     Compression::UNCOMPRESSED,
                 ) {
@@ -2302,6 +2390,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                 // Hoisted per-worker reusable buffers (zero per-shard malloc/free).
                 let mut p_slots: Vec<PersonSlot> = Vec::new();
                 let mut persons: Vec<CompactKey64> = Vec::new();
+                let mut ev_counts: Vec<u32> = Vec::new();
                 let mut long_p_table: HashTable<u32> = HashTable::new();
                 let mut ev_pids: Vec<u32> = Vec::new();
                 let mut ev_offsets: Vec<u32> = Vec::new();
@@ -2341,16 +2430,19 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     }
 
                     // 1. Intern unique person_keys in flat L2-resident table (lazy long_p_table for Tag 11).
-                    let mut p_cap = (ev_total / 12).max(256).next_power_of_two();
+                    let mut p_cap = (ev_total / 6).max(256).next_power_of_two();
                     let mut p_mask = p_cap - 1;
                     let mut p_thresh = p_cap * 6 / 10;
                     p_slots.clear();
                     p_slots.resize(p_cap, PersonSlot::EMPTY);
                     persons.clear();
+                    ev_counts.clear();
                     long_p_table.clear();
                     let mut has_long_p = false;
                     ev_pids.clear();
                     ev_pids.reserve(ev_total);
+                    let ev_pids_ptr = ev_pids.as_mut_ptr();
+                    let mut ev_pid_pos = 0usize;
 
                     for batch in &evs_batches {
                         let blen = batch.len();
@@ -2413,11 +2505,15 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                 loop {
                                     let s = unsafe { *p_slots.get_unchecked(pos) };
                                     if s.key == pk.0 {
+                                        unsafe {
+                                            *ev_counts.get_unchecked_mut(s.pid as usize) += 1;
+                                        }
                                         break s.pid;
                                     }
                                     if s.key == 0 {
                                         let id = persons.len() as u32;
                                         persons.push(pk);
+                                        ev_counts.push(1);
                                         unsafe {
                                             *p_slots.get_unchecked_mut(pos) =
                                                 PersonSlot { key: pk.0, pid: id };
@@ -2435,31 +2531,42 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                     |&id| LongArena::resolve_in(ev_arenas, persons[id as usize]) == pb,
                                     |&id| hash_bytes_fast(LongArena::resolve_in(ev_arenas, persons[id as usize])),
                                 ) {
-                                    hashbrown::hash_table::Entry::Occupied(occ) => *occ.get(),
+                                    hashbrown::hash_table::Entry::Occupied(occ) => {
+                                        let id = *occ.get();
+                                        unsafe {
+                                            *ev_counts.get_unchecked_mut(id as usize) += 1;
+                                        }
+                                        id
+                                    }
                                     hashbrown::hash_table::Entry::Vacant(vac) => {
                                         let id = persons.len() as u32;
                                         persons.push(pk);
+                                        ev_counts.push(1);
                                         vac.insert(id);
                                         id
                                     }
                                 }
                             };
-                            ev_pids.push(pid);
+                            unsafe {
+                                ev_pids_ptr.add(ev_pid_pos).write(pid);
+                            }
+                            ev_pid_pos += 1;
                         }
+                    }
+                    debug_assert_eq!(ev_pid_pos, ev_total);
+                    unsafe {
+                        ev_pids.set_len(ev_total);
                     }
 
                     let num_p = persons.len();
+                    debug_assert_eq!(ev_counts.len(), num_p);
                     ev_offsets.clear();
                     ev_offsets.resize(num_p + 1, 0);
-                    for &pid in &ev_pids {
+                    for i in 0..num_p {
                         unsafe {
-                            *ev_offsets.get_unchecked_mut(pid as usize + 1) += 1;
-                        }
-                    }
-                    for i in 1..=num_p {
-                        unsafe {
-                            let prev = *ev_offsets.get_unchecked(i - 1);
-                            *ev_offsets.get_unchecked_mut(i) += prev;
+                            let cur = *ev_offsets.get_unchecked(i);
+                            let cnt = *ev_counts.get_unchecked(i);
+                            *ev_offsets.get_unchecked_mut(i + 1) = cur + cnt;
                         }
                     }
                     ev_fill.clear();
@@ -2485,36 +2592,22 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     }
 
                     // 2. Group matching clicks into CSR by pid (skip clicks for event-less persons).
-                    cl_counts.clear();
-                    cl_counts.resize(num_p, 0);
-                    cl_pids.clear();
-                    cl_pids.reserve(cl_total);
-                    for batch in &cls_batches {
-                        let blen = batch.len();
-                        let pre = blen.min(RING);
-                        for i in 0..pre {
-                            let ck = unsafe { batch.get_unchecked(i).person_key() };
-                            if !ck.is_ref() {
-                                let h = mix64(ck.0);
-                                let npos = (h as usize) & p_mask;
-                                #[cfg(target_arch = "x86_64")]
-                                unsafe {
-                                    std::arch::x86_64::_mm_prefetch(
-                                        p_slots.as_ptr().add(npos) as *const i8,
-                                        std::arch::x86_64::_MM_HINT_T0,
-                                    );
-                                }
-                                ring_h[i] = h;
-                            }
-                        }
-                        for (ridx, c) in batch.iter().enumerate() {
-                            let h = ring_h[ridx & (RING - 1)];
-                            if ridx + RING < blen {
-                                let ck_ahead =
-                                    unsafe { batch.get_unchecked(ridx + RING).person_key() };
-                                if !ck_ahead.is_ref() {
-                                    let nh = mix64(ck_ahead.0);
-                                    let npos = (nh as usize) & p_mask;
+                    let mut total_matched_cl = 0usize;
+                    if cl_total > 0 {
+                        cl_counts.clear();
+                        cl_counts.resize(num_p, 0);
+                        cl_pids.clear();
+                        cl_pids.reserve(cl_total);
+                        let cl_pids_ptr = cl_pids.as_mut_ptr();
+                        let mut cl_pid_pos = 0usize;
+                        for batch in &cls_batches {
+                            let blen = batch.len();
+                            let pre = blen.min(RING);
+                            for i in 0..pre {
+                                let ck = unsafe { batch.get_unchecked(i).person_key() };
+                                if !ck.is_ref() {
+                                    let h = mix64(ck.0);
+                                    let npos = (h as usize) & p_mask;
                                     #[cfg(target_arch = "x86_64")]
                                     unsafe {
                                         std::arch::x86_64::_mm_prefetch(
@@ -2522,76 +2615,104 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                             std::arch::x86_64::_MM_HINT_T0,
                                         );
                                     }
-                                    ring_h[ridx & (RING - 1)] = nh;
+                                    ring_h[i] = h;
                                 }
                             }
-                            let ck = c.person_key();
-                            let pid = if !ck.is_ref() {
-                                let mut pos = (h as usize) & p_mask;
-                                loop {
-                                    let s = unsafe { *p_slots.get_unchecked(pos) };
-                                    if s.key == ck.0 {
-                                        break s.pid;
+                            for (ridx, c) in batch.iter().enumerate() {
+                                let h = ring_h[ridx & (RING - 1)];
+                                if ridx + RING < blen {
+                                    let ck_ahead =
+                                        unsafe { batch.get_unchecked(ridx + RING).person_key() };
+                                    if !ck_ahead.is_ref() {
+                                        let nh = mix64(ck_ahead.0);
+                                        let npos = (nh as usize) & p_mask;
+                                        #[cfg(target_arch = "x86_64")]
+                                        unsafe {
+                                            std::arch::x86_64::_mm_prefetch(
+                                                p_slots.as_ptr().add(npos) as *const i8,
+                                                std::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                        ring_h[ridx & (RING - 1)] = nh;
                                     }
-                                    if s.key == 0 {
-                                        break u32::MAX;
+                                }
+                                let ck = c.person_key();
+                                let pid = if !ck.is_ref() {
+                                    let mut pos = (h as usize) & p_mask;
+                                    loop {
+                                        let s = unsafe { *p_slots.get_unchecked(pos) };
+                                        if s.key == ck.0 {
+                                            break s.pid;
+                                        }
+                                        if s.key == 0 {
+                                            break u32::MAX;
+                                        }
+                                        pos = (pos + 1) & p_mask;
                                     }
-                                    pos = (pos + 1) & p_mask;
-                                }
-                            } else if has_long_p {
-                                let cb = LongArena::resolve_in(cl_arenas, ck);
-                                let ch = hash_bytes_fast(cb);
-                                long_p_table
-                                    .find(ch, |&id| {
-                                        LongArena::resolve_in(ev_arenas, persons[id as usize]) == cb
-                                    })
-                                    .copied()
-                                    .unwrap_or(u32::MAX)
-                            } else {
-                                u32::MAX
-                            };
-                            if pid != u32::MAX {
-                                unsafe {
-                                    *cl_counts.get_unchecked_mut(pid as usize) += 1;
-                                }
-                            }
-                            cl_pids.push(pid);
-                        }
-                    }
-
-                    cl_offsets.clear();
-                    cl_offsets.resize(num_p + 1, 0);
-                    for i in 0..num_p {
-                        unsafe {
-                            let cur = *cl_offsets.get_unchecked(i);
-                            let cnt = *cl_counts.get_unchecked(i);
-                            *cl_offsets.get_unchecked_mut(i + 1) = cur + cnt;
-                        }
-                    }
-                    let total_matched_cl = cl_offsets[num_p] as usize;
-                    if total_matched_cl > 0 {
-                        cl_fill.clear();
-                        cl_fill.extend_from_slice(&cl_offsets[..num_p]);
-                        grouped_clicks.clear();
-                        grouped_clicks.reserve(total_matched_cl);
-                        debug_assert!(grouped_clicks.capacity() >= total_matched_cl);
-                        let cl_ptr = grouped_clicks.as_mut_ptr();
-                        let mut cpid_idx = 0usize;
-                        for batch in cls_batches {
-                            for c in batch {
-                                let pid = unsafe { *cl_pids.get_unchecked(cpid_idx) };
-                                cpid_idx += 1;
+                                } else if has_long_p {
+                                    let cb = LongArena::resolve_in(cl_arenas, ck);
+                                    let ch = hash_bytes_fast(cb);
+                                    long_p_table
+                                        .find(ch, |&id| {
+                                            LongArena::resolve_in(ev_arenas, persons[id as usize]) == cb
+                                        })
+                                        .copied()
+                                        .unwrap_or(u32::MAX)
+                                } else {
+                                    u32::MAX
+                                };
                                 if pid != u32::MAX {
-                                    let pos = unsafe { *cl_fill.get_unchecked(pid as usize) } as usize;
+                                    total_matched_cl += 1;
                                     unsafe {
-                                        *cl_fill.get_unchecked_mut(pid as usize) = (pos + 1) as u32;
-                                        std::ptr::write(cl_ptr.add(pos), c.to_grouped());
+                                        *cl_counts.get_unchecked_mut(pid as usize) += 1;
+                                    }
+                                }
+                                unsafe {
+                                    cl_pids_ptr.add(cl_pid_pos).write(pid);
+                                }
+                                cl_pid_pos += 1;
+                            }
+                        }
+                        debug_assert_eq!(cl_pid_pos, cl_total);
+                        unsafe {
+                            cl_pids.set_len(cl_total);
+                        }
+
+                        if total_matched_cl > 0 {
+                            cl_offsets.clear();
+                            cl_offsets.resize(num_p + 1, 0);
+                            for i in 0..num_p {
+                                unsafe {
+                                    let cur = *cl_offsets.get_unchecked(i);
+                                    let cnt = *cl_counts.get_unchecked(i);
+                                    *cl_offsets.get_unchecked_mut(i + 1) = cur + cnt;
+                                }
+                            }
+                            cl_fill.clear();
+                            cl_fill.extend_from_slice(&cl_offsets[..num_p]);
+                            grouped_clicks.clear();
+                            grouped_clicks.reserve(total_matched_cl);
+                            debug_assert!(grouped_clicks.capacity() >= total_matched_cl);
+                            let cl_ptr = grouped_clicks.as_mut_ptr();
+                            let mut cpid_idx = 0usize;
+                            for batch in cls_batches {
+                                for c in batch {
+                                    let pid = unsafe { *cl_pids.get_unchecked(cpid_idx) };
+                                    cpid_idx += 1;
+                                    if pid != u32::MAX {
+                                        let pos =
+                                            unsafe { *cl_fill.get_unchecked(pid as usize) } as usize;
+                                        unsafe {
+                                            *cl_fill.get_unchecked_mut(pid as usize) =
+                                                (pos + 1) as u32;
+                                            std::ptr::write(cl_ptr.add(pos), c.to_grouped());
+                                        }
                                     }
                                 }
                             }
-                        }
-                        unsafe {
-                            grouped_clicks.set_len(total_matched_cl);
+                            unsafe {
+                                grouped_clicks.set_len(total_matched_cl);
+                            }
                         }
                     }
 
@@ -2691,6 +2812,12 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                         }
 
                         // Credit + Assists
+                        if total_matched_cl == 0 {
+                            for s in &sessions {
+                                acc.add_credit(organic_camp, s.day, s.has_purchase, s.revenue_cents);
+                            }
+                            continue;
+                        }
                         let c_lo = cl_offsets[pid] as usize;
                         let c_hi = cl_offsets[pid + 1] as usize;
                         if c_lo == c_hi {
@@ -2959,7 +3086,18 @@ fn read_vm_hwm_kb() -> isize {
     -1
 }
 
+#[cfg(test)]
 pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool) -> io::Result<()> {
+    run_pipeline_with_exit(data_dir, out_dir, ncpu, profile, false)
+}
+
+pub fn run_pipeline_with_exit(
+    data_dir: &Path,
+    out_dir: &Path,
+    ncpu: usize,
+    profile: bool,
+    fast_exit: bool,
+) -> io::Result<()> {
     let t0 = Instant::now();
 
     let manifest_bytes = fs::read(data_dir.join("manifest.json"))?;
@@ -2977,13 +3115,8 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     let ws_rem = window_start_ms.rem_euclid(MS_DAY) as u64;
 
     let t_startup = Instant::now();
-    let link_paths = list_csv_files(&data_dir.join("links"))?;
-    let (lookups_res, links_res) =
-        rayon::join(|| load_lookups(data_dir), || build_link_map(&link_paths, ncpu));
-    let lookups = lookups_res?;
-    let mut link_map = links_res?;
-    let t_links = Instant::now();
-    let t_lookups = t_startup;
+    let lookups = load_lookups(data_dir)?;
+    let t_lookups = Instant::now();
 
     let window_span_ms = window_end_ms.saturating_sub(window_start_ms);
     let click_span_ms = window_end_ms.saturating_sub(click_window_start_ms);
@@ -2994,124 +3127,131 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
         && click_span_ms <= (u32::MAX as i64)
         && lookups.categories.len() <= 256;
 
-    // Unified Stage 3a + Stage 4: parse events & clicks in one work-stealing pool
+    // Overlap LinkMap build with raw events parse (events_parse needs no LinkMap).
+    let link_paths = list_csv_files(&data_dir.join("links"))?;
     let event_paths = list_csv_files(&data_dir.join("events"))?;
-    let click_paths = list_csv_files(&data_dir.join("clicks"))?;
     let event_src = CsvSource::open(&event_paths)?;
-    let click_src = CsvSource::open(&click_paths)?;
     let ev_chunks = event_src.chunks(CHUNK_BYTES);
-    let cl_chunks = click_src.chunks(CHUNK_BYTES);
-    let total_chunks = ev_chunks.len() + cl_chunks.len();
-    let n_ev_workers = ncpu.clamp(1, 63).min(total_chunks.max(1));
+    let n_ev_workers = ncpu.clamp(1, 63).min(ev_chunks.len().max(1));
     let est_ev_total = event_src.total_bytes() / 68;
-    let ev_active_workers = n_ev_workers.min(ev_chunks.len().max(1));
-    let raw_ev_cap = est_ev_total / (ev_active_workers * P_DEDUP);
+    let raw_ev_cap = est_ev_total / (n_ev_workers * P_DEDUP);
     let est_ev_cap = if raw_ev_cap >= 64 { raw_ev_cap + 16 } else { 0 };
-    let cl_active_workers = n_ev_workers.min(cl_chunks.len().max(1));
-    let raw_cl_cap = (click_src.total_bytes() / 42) / (cl_active_workers * P_PERSON);
-    let est_cl_cap = if raw_cl_cap >= 64 { raw_cl_cap + 16 } else { 0 };
 
-    let (
-        dedup_inputs,
-        ev_worker_arenas,
-        ev_worker_ext,
-        person_click_batches_16,
-        person_click_batches_wide,
-        person_click_counts,
-        cl_worker_arenas,
-    ) = if compact_mode {
-        let out = run_parse_events_and_clicks::<PersonClick16, true>(
-            &event_src,
-            &ev_chunks,
-            est_ev_cap,
-            &click_src,
-            &cl_chunks,
-            est_cl_cap,
-            &lookups,
-            &link_map,
-            window_start_ms,
-            window_end_ms,
-            window_start_sec,
-            click_window_start_ms,
-            n_ev_workers,
-        )?;
-        (
-            out.dedup_inputs,
-            out.ev_worker_arenas,
-            out.ev_worker_ext,
-            out.person_click_batches,
-            Vec::new(),
-            out.person_click_counts,
-            out.cl_worker_arenas,
-        )
-    } else {
-        let out = run_parse_events_and_clicks::<PersonClickWide, false>(
-            &event_src,
-            &ev_chunks,
-            est_ev_cap,
-            &click_src,
-            &cl_chunks,
-            est_cl_cap,
-            &lookups,
-            &link_map,
-            window_start_ms,
-            window_end_ms,
-            window_start_sec,
-            click_window_start_ms,
-            n_ev_workers,
-        )?;
-        (
-            out.dedup_inputs,
-            out.ev_worker_arenas,
-            out.ev_worker_ext,
-            Vec::new(),
-            out.person_click_batches,
-            out.person_click_counts,
-            out.cl_worker_arenas,
-        )
-    };
+    let (links_res, ev_res) = rayon::join(
+        || build_link_map(&link_paths, ncpu),
+        || {
+            if compact_mode {
+                run_parse_events_par::<true>(
+                    &event_src,
+                    &ev_chunks,
+                    est_ev_cap,
+                    &lookups,
+                    window_start_ms,
+                    window_end_ms,
+                    window_start_sec,
+                    ncpu,
+                )
+            } else {
+                run_parse_events_par::<false>(
+                    &event_src,
+                    &ev_chunks,
+                    est_ev_cap,
+                    &lookups,
+                    window_start_ms,
+                    window_end_ms,
+                    window_start_sec,
+                    ncpu,
+                )
+            }
+        },
+    );
     drop(event_src);
-    drop(click_src);
-    link_map.drop_lookup_tables();
+    let mut link_map = links_res?;
+    let ev_out = ev_res?;
+    let t_links = t_lookups;
     let t_events_parse = Instant::now();
 
     let dedup_slots: Vec<Mutex<Option<Vec<Vec<ParsedEvent>>>>> =
-        dedup_inputs.into_iter().map(|v| Mutex::new(Some(v))).collect();
+        ev_out.dedup_inputs.into_iter().map(|v| Mutex::new(Some(v))).collect();
+    let ev_worker_arenas = ev_out.ev_worker_arenas;
+    let ev_worker_ext = ev_out.ev_worker_ext;
 
-    // Stage 3b: L2-resident prefetched in-place dedup -> persistent worker P_PERSON scatter.
-    let n_dedup_workers = ncpu.clamp(1, 63).min(P_DEDUP);
-    let raw_p_cap = est_ev_total / (n_dedup_workers * P_PERSON);
+    // Unified clicks parse + events dedup (with LinkMap resolution) in one std::thread::scope.
+    let click_paths = list_csv_files(&data_dir.join("clicks"))?;
+    let click_src = CsvSource::open(&click_paths)?;
+    let cl_chunks = click_src.chunks(CHUNK_BYTES);
+    let n_pool_workers = ncpu.clamp(1, 63);
+    let cl_active = n_pool_workers.min(cl_chunks.len().max(1));
+    let raw_cl_cap = (click_src.total_bytes() / 42) / (cl_active * P_PERSON);
+    let est_cl_cap = if raw_cl_cap >= 64 { raw_cl_cap + 16 } else { 0 };
+    let raw_p_cap = est_ev_total / (n_pool_workers * P_PERSON);
     let est_p_cap = if raw_p_cap >= 64 { raw_p_cap + 16 } else { 0 };
 
     let (
         person_event_batches_16,
         person_event_batches_wide,
         person_event_counts,
+        person_click_batches_16,
+        person_click_batches_wide,
+        person_click_counts,
+        cl_worker_arenas,
     ) = if compact_mode {
-        let (b, c) = run_events_dedup::<PersonEvent16>(
+        let out = run_clicks_and_dedup::<PersonEvent16, PersonClick16>(
             &dedup_slots,
             &ev_worker_ext,
             &ev_worker_arenas,
-            window_start_ms,
-            window_start_sec,
-            n_dedup_workers,
+            &click_src,
+            &cl_chunks,
+            est_cl_cap,
             est_p_cap,
-        );
-        (b, Vec::new(), c)
+            &lookups,
+            &link_map,
+            window_start_ms,
+            window_end_ms,
+            window_start_sec,
+            click_window_start_ms,
+            ncpu,
+        )?;
+        (
+            out.person_event_batches,
+            Vec::new(),
+            out.person_event_counts,
+            out.person_click_batches,
+            Vec::new(),
+            out.person_click_counts,
+            out.cl_worker_arenas,
+        )
     } else {
-        let (b, c) = run_events_dedup::<PersonEventWide>(
+        let out = run_clicks_and_dedup::<PersonEventWide, PersonClickWide>(
             &dedup_slots,
             &ev_worker_ext,
             &ev_worker_arenas,
-            window_start_ms,
-            window_start_sec,
-            n_dedup_workers,
+            &click_src,
+            &cl_chunks,
+            est_cl_cap,
             est_p_cap,
-        );
-        (Vec::new(), b, c)
+            &lookups,
+            &link_map,
+            window_start_ms,
+            window_end_ms,
+            window_start_sec,
+            click_window_start_ms,
+            ncpu,
+        )?;
+        (
+            Vec::new(),
+            out.person_event_batches,
+            out.person_event_counts,
+            Vec::new(),
+            out.person_click_batches,
+            out.person_click_counts,
+            out.cl_worker_arenas,
+        )
     };
+    drop(click_src);
     drop(dedup_slots);
     drop(ev_worker_ext);
+    link_map.drop_lookup_tables();
     let t_events_dedup = Instant::now();
     let t_clicks = t_events_dedup;
 
@@ -3237,6 +3377,13 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             (t_done - t0).as_secs_f64(),
             vm_hwm
         );
+    }
+
+    if fast_exit {
+        use std::io::Write;
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        std::process::exit(0);
     }
 
     Ok(())
@@ -3605,23 +3752,53 @@ mod tests {
             seed
         };
         let mut scratch = Vec::new();
-        for &n in &[256usize, 384, 500, 5000] {
-            for mode in [0u8, 1, 2] {
+        for &n in &[256usize, 384, 500, 1536, 2048, 5000] {
+            for mode in [0u8, 1, 2, 3] {
                 let mut v = Vec::with_capacity(n);
-                for _ in 0..n {
+                for idx in 0..n {
                     let ts_rel = match mode {
                         0 => 123_456_789,
                         1 => next_u64() % 200_000,
-                        _ => next_u64() % 1_209_600_000,
+                        2 => next_u64() % 1_209_600_000,
+                        _ => match idx {
+                            0 => 0,
+                            1 => u32::MAX as u64,
+                            2 => (1u64 << 22) - 1,
+                            3 => 1u64 << 22,
+                            _ => next_u64() & (u32::MAX as u64),
+                        },
                     };
                     let low = next_u64() & 0xFFFF_FFFF;
                     v.push((ts_rel << 32) | low);
                 }
                 let mut expected: Vec<u32> = v.iter().map(|x| (x >> 32) as u32).collect();
                 expected.sort_unstable();
+                let mut v2 = v.clone();
                 sort_u64_radix(&mut v, &mut scratch);
                 let got: Vec<u32> = v.iter().map(|x| (x >> 32) as u32).collect();
                 assert_eq!(got, expected, "radix mismatch n={n} mode={mode}");
+
+                <PersonEvent16 as Stage5Event>::sort_grouped(&mut v2, &mut scratch);
+                let got2: Vec<u32> = v2.iter().map(|x| (x >> 32) as u32).collect();
+                assert_eq!(got2, expected, "sort_grouped mismatch n={n} mode={mode}");
+            }
+        }
+        for &n in &[0usize, 1, 2, 3, 5, 16, 24, 25, 100, 255, 1024] {
+            for mode in [0u8, 2, 3] {
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let ts_rel = match mode {
+                        0 => 42,
+                        2 => next_u64() % 1_209_600_000,
+                        _ => next_u64() & (u32::MAX as u64),
+                    };
+                    let low = next_u64() & 0xFFFF_FFFF;
+                    v.push((ts_rel << 32) | low);
+                }
+                let mut expected = v.clone();
+                expected.sort_unstable();
+                <PersonEvent16 as Stage5Event>::sort_grouped(&mut v, &mut scratch);
+                assert_eq!(v, expected, "small sort_grouped mismatch n={n} mode={mode}");
             }
         }
     }

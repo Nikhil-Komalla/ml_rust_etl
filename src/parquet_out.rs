@@ -1,26 +1,8 @@
 use std::fs::{self, File};
-use std::io::{self, BufWriter, IoSlice, Write};
+use std::io::{self, IoSlice, Write};
 use std::path::Path;
-use std::sync::Arc;
 
 use parquet::basic::Compression;
-use parquet::column::writer::ColumnWriter;
-use parquet::data_type::ByteArray;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::parser::parse_message_type;
-
-const CAMPAIGN_DAILY_SCHEMA: &str = "
-message campaign_daily {
-    REQUIRED BINARY campaign_id (UTF8);
-    REQUIRED BINARY channel (UTF8);
-    REQUIRED INT32 day (DATE);
-    REQUIRED INT64 sessions;
-    REQUIRED INT64 purchasing_sessions;
-    REQUIRED INT64 revenue_cents;
-    REQUIRED INT64 assisted_sessions;
-}
-";
 
 pub fn clean_parquet_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
@@ -164,7 +146,7 @@ fn write_all_slices(file: &mut File, slices: &[&[u8]]) -> io::Result<()> {
     if total == 0 {
         return Ok(());
     }
-    const MAX_IOV: usize = 16;
+    const MAX_IOV: usize = 20;
     debug_assert!(slices.len() <= MAX_IOV);
     let mut iov = [IoSlice::new(&[]); MAX_IOV];
     let n_slices = slices.len();
@@ -262,6 +244,7 @@ pub struct UserDailyWriter {
     sessions: Vec<i32>,
     events: Vec<i32>,
     revenues: Vec<i64>,
+    rg_len: usize,
     cat_def_bits: Vec<u8>,
     cat_def_rle: Vec<u8>,
     cat_plain: Vec<u8>,
@@ -300,7 +283,8 @@ impl UserDailyWriter {
             sessions: Vec::with_capacity(cap),
             events: Vec::with_capacity(cap),
             revenues: Vec::with_capacity(cap),
-            cat_def_bits: Vec::with_capacity((cap + 7) >> 3),
+            rg_len: 0,
+            cat_def_bits: vec![0u8; (cap + 7) >> 3],
             cat_def_rle: Vec::with_capacity(((cap + 7) >> 3) + 64),
             cat_plain: Vec::with_capacity(cap * 12),
             cat_encoded,
@@ -308,6 +292,12 @@ impl UserDailyWriter {
             total_rows: 0,
             batch_rows,
         })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_plain_buf(buf: &mut Vec<u8>, additional: usize) {
+        buf.reserve(additional);
     }
 
     #[inline(always)]
@@ -320,13 +310,15 @@ impl UserDailyWriter {
         revenue: i64,
         top_cat_id: Option<u32>,
     ) -> io::Result<()> {
-        let rg_idx = self.days.len();
+        let rg_idx = self.rg_len;
         let uid_len = user_id.len();
         let cur_uid_len = self.uid_plain.len();
-        self.uid_plain.reserve(4 + uid_len);
+        if cur_uid_len + 4 + uid_len > self.uid_plain.capacity() {
+            Self::grow_plain_buf(&mut self.uid_plain, 4 + uid_len);
+        }
         unsafe {
             let dst = self.uid_plain.as_mut_ptr().add(cur_uid_len);
-            std::ptr::copy_nonoverlapping((uid_len as u32).to_le_bytes().as_ptr(), dst, 4);
+            std::ptr::write_unaligned(dst as *mut u32, (uid_len as u32).to_le());
             std::ptr::copy_nonoverlapping(user_id.as_ptr(), dst.add(4), uid_len);
             self.uid_plain.set_len(cur_uid_len + 4 + uid_len);
 
@@ -335,38 +327,48 @@ impl UserDailyWriter {
             debug_assert!(rg_idx < self.events.capacity());
             debug_assert!(rg_idx < self.revenues.capacity());
             std::ptr::write(self.days.as_mut_ptr().add(rg_idx), day);
-            self.days.set_len(rg_idx + 1);
             std::ptr::write(self.sessions.as_mut_ptr().add(rg_idx), sessions as i32);
-            self.sessions.set_len(rg_idx + 1);
             std::ptr::write(self.events.as_mut_ptr().add(rg_idx), events as i32);
-            self.events.set_len(rg_idx + 1);
             std::ptr::write(self.revenues.as_mut_ptr().add(rg_idx), revenue);
-            self.revenues.set_len(rg_idx + 1);
         }
 
         let byte_idx = rg_idx >> 3;
-        if byte_idx == self.cat_def_bits.len() {
-            self.cat_def_bits.push(0);
-        }
+        debug_assert!(byte_idx < self.cat_def_bits.len());
         if let Some(cid) = top_cat_id {
+            let enc = unsafe { self.cat_encoded.get_unchecked(cid as usize) };
+            let cur_clen = self.cat_plain.len();
+            if cur_clen + enc.len() > self.cat_plain.capacity() {
+                Self::grow_plain_buf(&mut self.cat_plain, enc.len());
+            }
             unsafe {
                 *self.cat_def_bits.get_unchecked_mut(byte_idx) |= 1u8 << (rg_idx & 7);
+                std::ptr::copy_nonoverlapping(
+                    enc.as_ptr(),
+                    self.cat_plain.as_mut_ptr().add(cur_clen),
+                    enc.len(),
+                );
+                self.cat_plain.set_len(cur_clen + enc.len());
             }
-            let enc = unsafe { self.cat_encoded.get_unchecked(cid as usize) };
-            self.cat_plain.extend_from_slice(enc);
         }
 
+        self.rg_len = rg_idx + 1;
         self.total_rows += 1;
-        if self.days.len() >= self.batch_rows {
+        if self.rg_len >= self.batch_rows {
             self.flush_row_group()?;
         }
         Ok(())
     }
 
     pub fn flush_row_group(&mut self) -> io::Result<()> {
-        let n = self.days.len();
+        let n = self.rg_len;
         if n == 0 {
             return Ok(());
+        }
+        unsafe {
+            self.days.set_len(n);
+            self.sessions.set_len(n);
+            self.events.set_len(n);
+            self.revenues.set_len(n);
         }
         let n_i32 = n as i32;
         let n_i64 = n as i64;
@@ -465,7 +467,8 @@ impl UserDailyWriter {
         self.sessions.clear();
         self.events.clear();
         self.revenues.clear();
-        self.cat_def_bits.clear();
+        self.rg_len = 0;
+        self.cat_def_bits[..(n + 7) >> 3].fill(0);
         self.cat_plain.clear();
         Ok(())
     }
@@ -599,91 +602,205 @@ pub struct CampaignRow<'a> {
 pub fn write_campaign_daily(
     path: &Path,
     rows: &[CampaignRow<'_>],
-    compression: Compression,
+    _compression: Compression,
 ) -> io::Result<()> {
-    let schema = Arc::new(
-        parse_message_type(CAMPAIGN_DAILY_SCHEMA)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
-    );
-    let props = Arc::new(
-        WriterProperties::builder()
-            .set_compression(compression)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .build(),
-    );
-    let file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
-    let mut writer = SerializedFileWriter::new(file, schema, props)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut file = File::create(path)?;
+    let n = rows.len();
+    let n_i32 = n as i32;
+    let n_i64 = n as i64;
 
-    if !rows.is_empty() {
-        let mut camp_ids = Vec::with_capacity(rows.len());
-        let mut channels = Vec::with_capacity(rows.len());
-        let mut days = Vec::with_capacity(rows.len());
-        let mut sessions = Vec::with_capacity(rows.len());
-        let mut purch = Vec::with_capacity(rows.len());
-        let mut rev = Vec::with_capacity(rows.len());
-        let mut assists = Vec::with_capacity(rows.len());
-        for r in rows {
-            camp_ids.push(ByteArray::from(r.campaign_id));
-            channels.push(ByteArray::from(r.channel));
-            days.push(r.day);
-            sessions.push(r.sessions);
-            purch.push(r.purchasing_sessions);
-            rev.push(r.revenue_cents);
-            assists.push(r.assisted_sessions);
-        }
+    let mut camp_plain = Vec::with_capacity(n * 20);
+    let mut chan_plain = Vec::with_capacity(n * 12);
+    let mut days = Vec::with_capacity(n);
+    let mut sessions = Vec::with_capacity(n);
+    let mut purch = Vec::with_capacity(n);
+    let mut rev = Vec::with_capacity(n);
+    let mut assists = Vec::with_capacity(n);
 
-        let mut rg = writer
-            .next_row_group()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let mut col_idx = 0usize;
-        while let Some(mut col) = rg
-            .next_column()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-        {
-            match (col_idx, col.untyped()) {
-                (0, ColumnWriter::ByteArrayColumnWriter(w)) => {
-                    w.write_batch(&camp_ids, None, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-                (1, ColumnWriter::ByteArrayColumnWriter(w)) => {
-                    w.write_batch(&channels, None, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-                (2, ColumnWriter::Int32ColumnWriter(w)) => {
-                    w.write_batch(&days, None, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-                (3, ColumnWriter::Int64ColumnWriter(w)) => {
-                    w.write_batch(&sessions, None, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-                (4, ColumnWriter::Int64ColumnWriter(w)) => {
-                    w.write_batch(&purch, None, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-                (5, ColumnWriter::Int64ColumnWriter(w)) => {
-                    w.write_batch(&rev, None, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-                (6, ColumnWriter::Int64ColumnWriter(w)) => {
-                    w.write_batch(&assists, None, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-                _ => unreachable!("unexpected campaign_daily column index {col_idx}"),
-            }
-            col.close()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            col_idx += 1;
-        }
-        rg.close()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    for r in rows {
+        camp_plain.extend_from_slice(&(r.campaign_id.len() as u32).to_le_bytes());
+        camp_plain.extend_from_slice(r.campaign_id);
+        chan_plain.extend_from_slice(&(r.channel.len() as u32).to_le_bytes());
+        chan_plain.extend_from_slice(r.channel);
+        days.push(r.day);
+        sessions.push(r.sessions);
+        purch.push(r.purchasing_sessions);
+        rev.push(r.revenue_cents);
+        assists.push(r.assisted_sessions);
     }
 
-    writer
-        .close()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(())
+    let d_bytes = i32_as_le_bytes(&days);
+    let s_bytes = i64_as_le_bytes(&sessions);
+    let p_bytes = i64_as_le_bytes(&purch);
+    let r_bytes = i64_as_le_bytes(&rev);
+    let a_bytes = i64_as_le_bytes(&assists);
+
+    let data_slices: [&[u8]; 7] = [
+        &camp_plain,
+        &chan_plain,
+        d_bytes,
+        s_bytes,
+        p_bytes,
+        r_bytes,
+        a_bytes,
+    ];
+    let names: [&'static [u8]; 7] = [
+        b"campaign_id",
+        b"channel",
+        b"day",
+        b"sessions",
+        b"purchasing_sessions",
+        b"revenue_cents",
+        b"assisted_sessions",
+    ];
+    let pq_types = [
+        PQ_TYPE_BYTE_ARRAY,
+        PQ_TYPE_BYTE_ARRAY,
+        PQ_TYPE_INT32,
+        PQ_TYPE_INT64,
+        PQ_TYPE_INT64,
+        PQ_TYPE_INT64,
+        PQ_TYPE_INT64,
+    ];
+
+    let mut hdr_bufs: [Vec<u8>; 7] = std::array::from_fn(|_| Vec::with_capacity(32));
+    if n > 0 {
+        let mut tmp_tb = ThriftBuf::new(32);
+        for (i, d) in data_slices.iter().enumerate() {
+            write_data_page_header(&mut tmp_tb, n_i32, d.len() as i32);
+            hdr_bufs[i].extend_from_slice(&tmp_tb.0);
+        }
+    }
+
+    let mut tb = ThriftBuf::new(1024);
+    let mut fm_last = 0u8;
+    tb.field_i32(&mut fm_last, 1, 1);
+
+    // schema (field 2, LIST<STRUCT>)
+    tb.field(&mut fm_last, 2, CT_LIST);
+    tb.list_hdr(CT_STRUCT, 8);
+    write_schema_elem(&mut tb, None, None, b"campaign_daily", Some(7), None, None);
+    write_schema_elem(
+        &mut tb,
+        Some(PQ_TYPE_BYTE_ARRAY),
+        Some(PQ_REP_REQUIRED),
+        b"campaign_id",
+        None,
+        Some(PQ_CT_UTF8),
+        Some(1),
+    );
+    write_schema_elem(
+        &mut tb,
+        Some(PQ_TYPE_BYTE_ARRAY),
+        Some(PQ_REP_REQUIRED),
+        b"channel",
+        None,
+        Some(PQ_CT_UTF8),
+        Some(1),
+    );
+    write_schema_elem(
+        &mut tb,
+        Some(PQ_TYPE_INT32),
+        Some(PQ_REP_REQUIRED),
+        b"day",
+        None,
+        Some(PQ_CT_DATE),
+        Some(6),
+    );
+    for col_name in [
+        b"sessions".as_slice(),
+        b"purchasing_sessions".as_slice(),
+        b"revenue_cents".as_slice(),
+        b"assisted_sessions".as_slice(),
+    ] {
+        write_schema_elem(
+            &mut tb,
+            Some(PQ_TYPE_INT64),
+            Some(PQ_REP_REQUIRED),
+            col_name,
+            None,
+            None,
+            None,
+        );
+    }
+
+    // num_rows (field 3, I64)
+    tb.field_i64(&mut fm_last, 3, n_i64);
+
+    // row_groups (field 4, LIST<STRUCT>)
+    tb.field(&mut fm_last, 4, CT_LIST);
+    if n == 0 {
+        tb.list_hdr(CT_STRUCT, 0);
+    } else {
+        tb.list_hdr(CT_STRUCT, 1);
+        let mut rg_last = 0u8;
+        tb.field(&mut rg_last, 1, CT_LIST);
+        tb.list_hdr(CT_STRUCT, 7);
+        let mut off = 4i64;
+        let mut total_rg_bytes = 0i64;
+        for i in 0..7 {
+            let chunk_bytes = (hdr_bufs[i].len() as i64) + (data_slices[i].len() as i64);
+            let mut cc_last = 0u8;
+            tb.field_i64(&mut cc_last, 2, off);
+            tb.field(&mut cc_last, 3, CT_STRUCT);
+            let mut cm_last = 0u8;
+            tb.field_i32(&mut cm_last, 1, pq_types[i]);
+            tb.field(&mut cm_last, 2, CT_LIST);
+            tb.list_hdr(CT_I32, 2);
+            tb.i32_zigzag(PQ_ENC_PLAIN);
+            tb.i32_zigzag(PQ_ENC_RLE);
+            tb.field(&mut cm_last, 3, CT_LIST);
+            tb.list_hdr(CT_BINARY, 1);
+            tb.uvarint(names[i].len() as u64);
+            tb.0.extend_from_slice(names[i]);
+            tb.field_i32(&mut cm_last, 4, PQ_CODEC_UNCOMPRESSED);
+            tb.field_i64(&mut cm_last, 5, n_i64);
+            tb.field_i64(&mut cm_last, 6, chunk_bytes);
+            tb.field_i64(&mut cm_last, 7, chunk_bytes);
+            tb.field_i64(&mut cm_last, 9, off);
+            tb.stop(); // ColumnMetaData
+            tb.stop(); // ColumnChunk
+            off += chunk_bytes;
+            total_rg_bytes += chunk_bytes;
+        }
+        tb.field_i64(&mut rg_last, 2, total_rg_bytes);
+        tb.field_i64(&mut rg_last, 3, n_i64);
+        tb.field_i64(&mut rg_last, 5, 4);
+        tb.field_i64(&mut rg_last, 6, total_rg_bytes);
+        tb.stop(); // RowGroup
+    }
+
+    // created_by (field 6, STRING)
+    tb.field_str(&mut fm_last, 6, b"shopping-sessions");
+    tb.stop(); // FileMetaData
+
+    let footer_len = (tb.0.len() as u32).to_le_bytes();
+    if n == 0 {
+        let slices: [&[u8]; 4] = [b"PAR1", &tb.0, &footer_len, b"PAR1"];
+        write_all_slices(&mut file, &slices)
+    } else {
+        let slices: [&[u8]; 18] = [
+            b"PAR1",
+            &hdr_bufs[0],
+            data_slices[0],
+            &hdr_bufs[1],
+            data_slices[1],
+            &hdr_bufs[2],
+            data_slices[2],
+            &hdr_bufs[3],
+            data_slices[3],
+            &hdr_bufs[4],
+            data_slices[4],
+            &hdr_bufs[5],
+            data_slices[5],
+            &hdr_bufs[6],
+            data_slices[6],
+            &tb.0,
+            &footer_len,
+            b"PAR1",
+        ];
+        write_all_slices(&mut file, &slices)
+    }
 }
 
 #[cfg(test)]
@@ -778,6 +895,83 @@ mod tests {
         check_case("c2000_all_null", 2000, 300, 1, false);
         check_case("c2000_all_nonnull", 2000, 300, 2, false);
         check_case("c2000_mixed_wide", 2000, 350, 0, true);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_direct_campaign_daily_writer_roundtrip() {
+        let dir = std::env::temp_dir().join("ss_test_direct_camp_pq_v1");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        for n in [0usize, 1, 100] {
+            let p = dir.join(format!("camp_{n}.parquet"));
+            let mut backing: Vec<(String, String, i32, i64, i64, i64, i64)> = Vec::with_capacity(n);
+            for i in 0..n {
+                backing.push((
+                    format!("camp_{i}"),
+                    if i % 2 == 0 {
+                        "email".to_string()
+                    } else {
+                        "paid_search".to_string()
+                    },
+                    20_100 + (i as i32 % 10),
+                    (i as i64) + 1,
+                    (i as i64) % 4,
+                    if i == 0 {
+                        -500_i64
+                    } else if i == 1 {
+                        5_000_000_000_i64
+                    } else {
+                        (i as i64) * 250
+                    },
+                    (i as i64) * 2,
+                ));
+            }
+            let rows: Vec<CampaignRow<'_>> = backing
+                .iter()
+                .map(|r| CampaignRow {
+                    campaign_id: r.0.as_bytes(),
+                    channel: r.1.as_bytes(),
+                    day: r.2,
+                    sessions: r.3,
+                    purchasing_sessions: r.4,
+                    revenue_cents: r.5,
+                    assisted_sessions: r.6,
+                })
+                .collect();
+
+            write_campaign_daily(&p, &rows, Compression::UNCOMPRESSED).unwrap();
+
+            let rdr = SerializedFileReader::new(File::open(&p).unwrap()).unwrap();
+            assert_eq!(rdr.metadata().file_metadata().num_rows(), n as i64);
+            let schema_fields = rdr
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .root_schema()
+                .get_fields();
+            assert_eq!(schema_fields.len(), 7);
+            let mut got = Vec::with_capacity(n);
+            for r in rdr.get_row_iter(None).unwrap() {
+                let r = r.unwrap();
+                let day_val = match r.get_column_iter().nth(2).unwrap().1 {
+                    Field::Date(d) => *d,
+                    other => panic!("expected Date, got {other:?}"),
+                };
+                got.push((
+                    r.get_string(0).unwrap().clone(),
+                    r.get_string(1).unwrap().clone(),
+                    day_val,
+                    r.get_long(3).unwrap(),
+                    r.get_long(4).unwrap(),
+                    r.get_long(5).unwrap(),
+                    r.get_long(6).unwrap(),
+                ));
+            }
+            assert_eq!(got, backing, "campaign_daily mismatch for n={n}");
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

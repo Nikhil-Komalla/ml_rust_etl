@@ -32,7 +32,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = pool.install(|| pipeline::run_pipeline(&data_dir, &out_dir, ncpu, profile));
+    let result =
+        pool.install(|| pipeline::run_pipeline_with_exit(&data_dir, &out_dir, ncpu, profile, true));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
