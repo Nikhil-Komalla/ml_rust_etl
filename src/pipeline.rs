@@ -10,8 +10,8 @@ use parquet::basic::Compression;
 use rayon::prelude::*;
 
 use crate::csv::{
-    for_each_line_fields, is_valid_utf8, list_csv_files, parse_csv_line, FileSet, OverflowSpan,
-    SliceRef, CHUNK_BYTES, FILE_IDX_OVERFLOW,
+    fast_hash_bytes, for_each_line_fields, is_valid_utf8, list_csv_files, parse_csv_line,
+    FileSet, InlineKey16, OverflowSpan, SliceRef, CHUNK_BYTES, FILE_IDX_ARENA, FILE_IDX_OVERFLOW,
 };
 use crate::links::{build_link_map, LinkMap};
 use crate::parse::{
@@ -20,27 +20,26 @@ use crate::parse::{
 use crate::parquet_out::{clean_parquet_dir, write_campaign_daily, CampaignRow, UserDailyWriter};
 
 const P_DEDUP: usize = 64;
-const P_PERSON: usize = 128;
+const P_PERSON: usize = 64;
+const DUPLICATE_DEAD: u32 = u32::MAX - 1;
 const INVALID_EVENT: u32 = u32::MAX;
 const USER_DAILY_BATCH_ROWS: usize = 131_072;
 
 #[derive(Clone, Copy)]
 struct ParsedEvent {
-    ev_hash: u64,
-    ev_ref: SliceRef,
+    ev_key: InlineKey16,
     ingest_ts_ms: i64,
     ts_ms: i64,
-    person_ref: SliceRef,
+    uid_key: InlineKey16,
     price_or_invalid: u32,
     cat_id: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<ParsedEvent>() == 48);
+const _: () = assert!(std::mem::size_of::<ParsedEvent>() == 56);
 
 #[derive(Clone, Copy)]
 struct PersonEvent {
-    person_ref: SliceRef,
-    person_hash: u64,
+    person_key: InlineKey16,
     ts_ms: i64,
     price_cents: u32,
     cat_id: u32,
@@ -50,14 +49,14 @@ const _: () = assert!(std::mem::size_of::<PersonEvent>() == 32);
 
 #[derive(Clone, Copy)]
 struct PersonClick {
-    person_ref: SliceRef,
+    person_key: InlineKey16,
     click_id_ref: SliceRef,
     ts_ms: i64,
     camp_id: u32,
     _pad: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<PersonClick>() == 32);
+const _: () = assert!(std::mem::size_of::<PersonClick>() == 40);
 
 #[derive(Clone, Copy)]
 struct CompactEvent {
@@ -450,6 +449,73 @@ fn resolve_click_slice<'a>(
 }
 
 #[inline(always)]
+fn resolve_inline_event<'a>(
+    k: &'a InlineKey16,
+    files: &'a FileSet,
+    ev_overflow: &'a [Vec<OverflowSpan>],
+    link_map: &'a LinkMap,
+) -> &'a [u8] {
+    if k.is_inline() {
+        k.inline_slice()
+    } else {
+        resolve_event_slice(k.slice_ref(), files, ev_overflow, link_map)
+    }
+}
+
+#[inline(always)]
+fn inline_keys_equal_event(
+    a: &InlineKey16,
+    b: &InlineKey16,
+    files: &FileSet,
+    ev_overflow: &[Vec<OverflowSpan>],
+    link_map: &LinkMap,
+) -> bool {
+    if a.is_inline() && b.is_inline() {
+        a == b
+    } else if a.is_inline() != b.is_inline() {
+        false
+    } else {
+        resolve_event_slice(a.slice_ref(), files, ev_overflow, link_map)
+            == resolve_event_slice(b.slice_ref(), files, ev_overflow, link_map)
+    }
+}
+
+#[inline(always)]
+fn inline_keys_equal_cross(
+    cl_key: &InlineKey16,
+    ev_key: &InlineKey16,
+    cl_files: &FileSet,
+    cl_ov: &[Vec<OverflowSpan>],
+    ev_files: &FileSet,
+    ev_ov: &[Vec<OverflowSpan>],
+    link_map: &LinkMap,
+) -> bool {
+    if cl_key.is_inline() && ev_key.is_inline() {
+        cl_key == ev_key
+    } else if cl_key.is_inline() != ev_key.is_inline() {
+        false
+    } else {
+        resolve_click_slice(cl_key.slice_ref(), cl_files, cl_ov, link_map)
+            == resolve_event_slice(ev_key.slice_ref(), ev_files, ev_ov, link_map)
+    }
+}
+
+#[inline(always)]
+fn ev_key_hash(
+    k: &InlineKey16,
+    files: &FileSet,
+    ev_overflow: &[Vec<OverflowSpan>],
+    link_map: &LinkMap,
+    hb: &DefaultHashBuilder,
+) -> u64 {
+    if k.is_inline() {
+        k.hash_inline()
+    } else {
+        hb.hash_one(resolve_event_slice(k.slice_ref(), files, ev_overflow, link_map))
+    }
+}
+
+#[inline(always)]
 fn pack_canon_overflow(idx: u32) -> SliceRef {
     SliceRef {
         file_idx: FILE_IDX_OVERFLOW,
@@ -499,13 +565,13 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     let t_links = Instant::now();
     let t_lookups = t_startup;
 
-    // Stage 3: Events parse (parallel) -> 64-shard dedup before validation -> 128-shard scatter
+    // Stage 3: Events parse (parallel) -> P_DEDUP-shard dedup before validation -> P_PERSON-shard scatter
     let event_paths = list_csv_files(&data_dir.join("events"))?;
     let event_files = FileSet::open(&event_paths)?;
     let ev_chunks = event_files.chunks(CHUNK_BYTES);
     let n_ev_workers = ncpu.clamp(1, 63).min(ev_chunks.len().max(1));
     let total_ev_bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
-    let est_ev_cap = (total_ev_bytes / 90) / (n_ev_workers * P_DEDUP) + 64;
+    let est_ev_cap = (total_ev_bytes / 105) / (n_ev_workers * P_DEDUP);
     let mut ev_worker_shards: Vec<Vec<Vec<ParsedEvent>>> = (0..n_ev_workers)
         .map(|_| (0..P_DEDUP).map(|_| Vec::with_capacity(est_ev_cap)).collect())
         .collect();
@@ -540,63 +606,70 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                             let Some(ingest_ms) = dcache.parse_f1_ms(ingest_ts) else {
                                 return;
                             };
-                            let ev_hash = hb_ref.hash_one(ev_id);
-                            let ev_ref = files_ref.make_ref(chunk.file_idx, ev_id, ov_out, wid);
+                            let (ev_key, ev_hash) = if ev_id.len() <= 15 {
+                                let k = InlineKey16::from_inline(ev_id);
+                                let h = k.hash_inline();
+                                (k, h)
+                            } else {
+                                let r = files_ref.make_ref(chunk.file_idx, ev_id, ov_out, wid);
+                                (InlineKey16::from_ref(r), fast_hash_bytes(ev_id, hb_ref))
+                            };
                             let d_shard = ((ev_hash >> 28) as usize) & (P_DEDUP - 1);
 
                             let mut valid = true;
                             let mut ts_ms = 0i64;
                             let mut price_val = 0u32;
                             let mut cat_id = 0u32;
-                            let mut uid_ref = SliceRef {
-                                file_idx: 0,
-                                len: 0,
-                                off: 0,
-                            };
+                            let mut uid_key = InlineKey16::zero();
 
                             if uid.is_empty() || pid.is_empty() || !is_valid_utf8(uid) {
                                 valid = false;
                             } else if let Some(t) = dcache.parse_ts_ms(ts) {
-                            if t < window_start_ms
-                                || t >= window_end_ms
-                                || (ingest_ms as i128 - t as i128) > MS_DAY as i128
-                            {
-                                valid = false;
-                            } else {
-                                ts_ms = t;
-                                match etype {
-                                    b"view" | b"cart" => {
-                                        price_val = 0;
-                                        cat_id = 0;
-                                    }
-                                    b"purchase" => {
-                                        if let Some(p) = parse_price_cents(price) {
-                                            price_val = p;
-                                            cat_id = lookups_ref.get_product_cat(pid, hb_ref);
-                                        } else {
-                                            valid = false;
+                                if t < window_start_ms
+                                    || t >= window_end_ms
+                                    || (ingest_ms as i128 - t as i128) > MS_DAY as i128
+                                {
+                                    valid = false;
+                                } else {
+                                    ts_ms = t;
+                                    match etype {
+                                        b"view" | b"cart" => {
+                                            price_val = 0;
+                                            cat_id = 0;
                                         }
+                                        b"purchase" => {
+                                            if let Some(p) = parse_price_cents(price) {
+                                                price_val = p;
+                                                cat_id = lookups_ref.get_product_cat(pid, hb_ref);
+                                            } else {
+                                                valid = false;
+                                            }
+                                        }
+                                        _ => valid = false,
                                     }
-                                    _ => valid = false,
+                                    if valid {
+                                        uid_key = if uid.len() <= 15 {
+                                            InlineKey16::from_inline(uid)
+                                        } else {
+                                            InlineKey16::from_ref(
+                                                files_ref.make_ref(chunk.file_idx, uid, ov_out, wid),
+                                            )
+                                        };
+                                    }
                                 }
-                                if valid {
-                                    uid_ref = files_ref.make_ref(chunk.file_idx, uid, ov_out, wid);
-                                }
+                            } else {
+                                valid = false;
                             }
-                        } else {
-                            valid = false;
-                        }
 
-                        buckets[d_shard].push(ParsedEvent {
-                            ev_hash,
-                            ev_ref,
-                            ingest_ts_ms: ingest_ms,
-                            ts_ms,
-                            person_ref: uid_ref,
-                            price_or_invalid: if valid { price_val } else { INVALID_EVENT },
-                            cat_id,
+                            buckets[d_shard].push(ParsedEvent {
+                                ev_key,
+                                ingest_ts_ms: ingest_ms,
+                                ts_ms,
+                                uid_key,
+                                price_or_invalid: if valid { price_val } else { INVALID_EVENT },
+                                cat_id,
+                            });
                         });
-                    });
                     }
                 });
             }
@@ -614,85 +687,119 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
         }
     }
 
-    // Stage 3b: Deduplicate each shard & scatter valid surviving events into P_PERSON shards.
+    // Stage 3b: In-place dedup per shard & scatter valid surviving events into P_PERSON shards.
     let dedup_results: Vec<Vec<Vec<PersonEvent>>> = dedup_inputs
         .into_par_iter()
-        .map(|shard_vecs| {
+        .map(|mut shard_vecs| {
             let total: usize = shard_vecs.iter().map(Vec::len).sum();
-            let p_cap = total / P_PERSON + 16;
+            let p_cap = if total >= P_PERSON * 64 {
+                total / P_PERSON
+            } else {
+                0
+            };
             let mut person_out: Vec<Vec<PersonEvent>> =
                 (0..P_PERSON).map(|_| Vec::with_capacity(p_cap)).collect();
             if total == 0 {
                 return person_out;
             }
-            let mut winners: Vec<ParsedEvent> = Vec::with_capacity(total);
             let mut table: HashTable<u32> = HashTable::with_capacity(total);
-            for batch in &shard_vecs {
-                for ev in batch {
-                    let ev_bytes =
-                        resolve_event_slice(ev.ev_ref, &event_files, &ev_worker_overflow, &link_map);
+            for widx in 0..shard_vecs.len() {
+                let batch_len = shard_vecs[widx].len();
+                let wbase = (widx as u32) << 26;
+                for ridx in 0..batch_len {
+                    let ev = shard_vecs[widx][ridx];
+                    let eh = ev_key_hash(
+                        &ev.ev_key,
+                        &event_files,
+                        &ev_worker_overflow,
+                        &link_map,
+                        &hash_builder,
+                    );
                     match table.entry(
-                        ev.ev_hash,
-                        |&w_idx| {
-                            let existing = &winners[w_idx as usize];
-                            existing.ev_hash == ev.ev_hash
-                                && resolve_event_slice(
-                                    existing.ev_ref,
-                                    &event_files,
-                                    &ev_worker_overflow,
-                                    &link_map,
-                                ) == ev_bytes
+                        eh,
+                        |&packed| {
+                            let pw = (packed >> 26) as usize;
+                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                            inline_keys_equal_event(
+                                &shard_vecs[pw][pr].ev_key,
+                                &ev.ev_key,
+                                &event_files,
+                                &ev_worker_overflow,
+                                &link_map,
+                            )
                         },
-                        |&w_idx| winners[w_idx as usize].ev_hash,
+                        |&packed| {
+                            let pw = (packed >> 26) as usize;
+                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                            ev_key_hash(
+                                &shard_vecs[pw][pr].ev_key,
+                                &event_files,
+                                &ev_worker_overflow,
+                                &link_map,
+                                &hash_builder,
+                            )
+                        },
                     ) {
                         hashbrown::hash_table::Entry::Occupied(occ) => {
-                            let w_idx = *occ.get() as usize;
-                            if ev.ingest_ts_ms < winners[w_idx].ingest_ts_ms {
-                                winners[w_idx] = *ev;
+                            let packed = *occ.get();
+                            let pw = (packed >> 26) as usize;
+                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                            if ev.ingest_ts_ms < shard_vecs[pw][pr].ingest_ts_ms {
+                                shard_vecs[pw][pr] = ev;
                             }
+                            shard_vecs[widx][ridx].price_or_invalid = DUPLICATE_DEAD;
                         }
                         hashbrown::hash_table::Entry::Vacant(vac) => {
-                            let idx = winners.len() as u32;
-                            winners.push(*ev);
-                            vac.insert(idx);
+                            vac.insert(wbase | (ridx as u32));
                         }
                     }
                 }
             }
             drop(table);
-            drop(shard_vecs);
 
-            for ev in winners {
-                if ev.price_or_invalid != INVALID_EVENT {
-                    let raw_uid = resolve_event_slice(
-                        ev.person_ref,
-                        &event_files,
-                        &ev_worker_overflow,
-                        &link_map,
-                    );
-                    let uh = hash_builder.hash_one(raw_uid);
-                    let (person_ref, ph) = if !link_map.is_empty() {
-                        if let Some((canon_ref, ch)) = link_map.resolve(raw_uid, uh) {
-                            let pref = if canon_ref.file_idx == FILE_IDX_OVERFLOW {
-                                pack_canon_overflow(canon_ref.off)
-                            } else {
-                                canon_ref
-                            };
-                            (pref, ch)
+            for batch in shard_vecs {
+                for ev in batch {
+                    if ev.price_or_invalid < DUPLICATE_DEAD {
+                        let (uh, raw_uid) = if ev.uid_key.is_inline() {
+                            (ev.uid_key.hash_inline(), ev.uid_key.inline_slice())
                         } else {
-                            (ev.person_ref, uh)
-                        }
-                    } else {
-                        (ev.person_ref, uh)
-                    };
-                    let pshard = ((ph >> 28) as usize) & (P_PERSON - 1);
-                    person_out[pshard].push(PersonEvent {
-                        person_ref,
-                        person_hash: ph,
-                        ts_ms: ev.ts_ms,
-                        price_cents: ev.price_or_invalid,
-                        cat_id: ev.cat_id,
-                    });
+                            let rb = resolve_event_slice(
+                                ev.uid_key.slice_ref(),
+                                &event_files,
+                                &ev_worker_overflow,
+                                &link_map,
+                            );
+                            (fast_hash_bytes(rb, &hash_builder), rb)
+                        };
+                        let (person_key, ph) = if !link_map.is_empty() {
+                            if let Some((canon_ref, ch)) = link_map.resolve(raw_uid, uh) {
+                                let pkey = if canon_ref.file_idx == FILE_IDX_ARENA
+                                    && canon_ref.len <= 15
+                                {
+                                    let off = canon_ref.off as usize;
+                                    InlineKey16::from_inline(
+                                        &link_map.canon_arena[off..off + canon_ref.len as usize],
+                                    )
+                                } else if canon_ref.file_idx == FILE_IDX_OVERFLOW {
+                                    InlineKey16::from_ref(pack_canon_overflow(canon_ref.off))
+                                } else {
+                                    InlineKey16::from_ref(canon_ref)
+                                };
+                                (pkey, ch)
+                            } else {
+                                (ev.uid_key, uh)
+                            }
+                        } else {
+                            (ev.uid_key, uh)
+                        };
+                        let pshard = ((ph >> 28) as usize) & (P_PERSON - 1);
+                        person_out[pshard].push(PersonEvent {
+                            person_key,
+                            ts_ms: ev.ts_ms,
+                            price_cents: ev.price_or_invalid,
+                            cat_id: ev.cat_id,
+                        });
+                    }
                 }
             }
             person_out
@@ -712,13 +819,13 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     }
     let t_events_dedup = Instant::now();
 
-    // Stage 4: Clicks parse + validate + direct 128-shard person scatter
+    // Stage 4: Clicks parse + validate + direct P_PERSON-shard scatter
     let click_paths = list_csv_files(&data_dir.join("clicks"))?;
     let click_files = FileSet::open(&click_paths)?;
     let cl_chunks = click_files.chunks(CHUNK_BYTES);
     let n_cl_workers = ncpu.clamp(1, 63).min(cl_chunks.len().max(1));
     let total_cl_bytes: usize = cl_chunks.iter().map(|c| c.end - c.start).sum();
-    let est_cl_cap = (total_cl_bytes / 65) / (n_cl_workers * P_PERSON) + 32;
+    let est_cl_cap = (total_cl_bytes / 75) / (n_cl_workers * P_PERSON);
     let mut cl_worker_shards: Vec<Vec<Vec<PersonClick>>> = (0..n_cl_workers)
         .map(|_| (0..P_PERSON).map(|_| Vec::with_capacity(est_cl_cap)).collect())
         .collect();
@@ -761,34 +868,49 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                             let Some(ts_ms) = dcache.parse_ts_ms(ts) else {
                                 return;
                             };
-                        if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
-                            return;
-                        }
-                        let uh = hb_ref.hash_one(uid);
-                        let (person_ref, person_hash) = if !lm_ref.is_empty() {
-                            if let Some((canon_ref, ch)) = lm_ref.resolve(uid, uh) {
-                                let pref = if canon_ref.file_idx == FILE_IDX_OVERFLOW {
-                                    pack_canon_overflow(canon_ref.off)
-                                } else {
-                                    canon_ref
-                                };
-                                (pref, ch)
-                            } else {
-                                (files_ref.make_ref(chunk.file_idx, uid, ov_out, wid), uh)
+                            if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
+                                return;
                             }
-                        } else {
-                            (files_ref.make_ref(chunk.file_idx, uid, ov_out, wid), uh)
-                        };
-                        let click_id_ref = files_ref.make_ref(chunk.file_idx, click_id, ov_out, wid);
-                        let pshard = ((person_hash >> 28) as usize) & (P_PERSON - 1);
-                        buckets[pshard].push(PersonClick {
-                            person_ref,
-                            click_id_ref,
-                            ts_ms,
-                            camp_id: cid,
-                            _pad: 0,
+                            let (uid_key, uh) = if uid.len() <= 15 {
+                                let k = InlineKey16::from_inline(uid);
+                                let h = k.hash_inline();
+                                (k, h)
+                            } else {
+                                let r = files_ref.make_ref(chunk.file_idx, uid, ov_out, wid);
+                                (InlineKey16::from_ref(r), fast_hash_bytes(uid, hb_ref))
+                            };
+                            let (person_key, person_hash) = if !lm_ref.is_empty() {
+                                if let Some((canon_ref, ch)) = lm_ref.resolve(uid, uh) {
+                                    let pkey = if canon_ref.file_idx == FILE_IDX_ARENA
+                                        && canon_ref.len <= 15
+                                    {
+                                        let off = canon_ref.off as usize;
+                                        InlineKey16::from_inline(
+                                            &lm_ref.canon_arena[off..off + canon_ref.len as usize],
+                                        )
+                                    } else if canon_ref.file_idx == FILE_IDX_OVERFLOW {
+                                        InlineKey16::from_ref(pack_canon_overflow(canon_ref.off))
+                                    } else {
+                                        InlineKey16::from_ref(canon_ref)
+                                    };
+                                    (pkey, ch)
+                                } else {
+                                    (uid_key, uh)
+                                }
+                            } else {
+                                (uid_key, uh)
+                            };
+                            let click_id_ref =
+                                files_ref.make_ref(chunk.file_idx, click_id, ov_out, wid);
+                            let pshard = ((person_hash >> 28) as usize) & (P_PERSON - 1);
+                            buckets[pshard].push(PersonClick {
+                                person_key,
+                                click_id_ref,
+                                ts_ms,
+                                camp_id: cid,
+                                _pad: 0,
+                            });
                         });
-                    });
                     }
                 });
             }
@@ -906,29 +1028,39 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
 
                     // 1. Intern unique person_ids from events
                     let p_cap = ev_total / 4 + 16;
-                    let mut persons: Vec<SliceRef> = Vec::with_capacity(p_cap);
+                    let mut persons: Vec<InlineKey16> = Vec::with_capacity(p_cap);
                     let mut p_hashes: Vec<u64> = Vec::with_capacity(p_cap);
                     let mut p_table: HashTable<u32> = HashTable::with_capacity(p_cap);
                     let mut ev_pids: Vec<u32> = Vec::with_capacity(ev_total);
 
                     for batch in &evs_batches {
                         for ev in batch {
-                            let pb = resolve_event_slice(ev.person_ref, ev_files_ref, ev_ov_ref, lm_ref);
-                            let pid = match p_table.find(ev.person_hash, |&id| {
-                                p_hashes[id as usize] == ev.person_hash
-                                    && resolve_event_slice(
-                                        persons[id as usize],
+                            let ph = if ev.person_key.is_inline() {
+                                ev.person_key.hash_inline()
+                            } else {
+                                hash_builder.hash_one(resolve_event_slice(
+                                    ev.person_key.slice_ref(),
+                                    ev_files_ref,
+                                    ev_ov_ref,
+                                    lm_ref,
+                                ))
+                            };
+                            let pid = match p_table.find(ph, |&id| {
+                                p_hashes[id as usize] == ph
+                                    && inline_keys_equal_event(
+                                        &persons[id as usize],
+                                        &ev.person_key,
                                         ev_files_ref,
                                         ev_ov_ref,
                                         lm_ref,
-                                    ) == pb
+                                    )
                             }) {
                                 Some(&id) => id,
                                 None => {
                                     let id = persons.len() as u32;
-                                    persons.push(ev.person_ref);
-                                    p_hashes.push(ev.person_hash);
-                                    p_table.insert_unique(ev.person_hash, id, |&idx| p_hashes[idx as usize]);
+                                    persons.push(ev.person_key);
+                                    p_hashes.push(ph);
+                                    p_table.insert_unique(ph, id, |&idx| p_hashes[idx as usize]);
                                     id
                                 }
                             };
@@ -975,17 +1107,28 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                     let mut cl_pids: Vec<u32> = Vec::with_capacity(cl_total);
                     for batch in &cls_batches {
                         for c in batch {
-                            let pb = resolve_click_slice(c.person_ref, cl_files_ref, cl_ov_ref, lm_ref);
-                            let ph = hash_builder.hash_one(pb);
+                            let ph = if c.person_key.is_inline() {
+                                c.person_key.hash_inline()
+                            } else {
+                                hash_builder.hash_one(resolve_click_slice(
+                                    c.person_key.slice_ref(),
+                                    cl_files_ref,
+                                    cl_ov_ref,
+                                    lm_ref,
+                                ))
+                            };
                             let pid = p_table
                                 .find(ph, |&id| {
                                     p_hashes[id as usize] == ph
-                                        && resolve_event_slice(
-                                            persons[id as usize],
+                                        && inline_keys_equal_cross(
+                                            &c.person_key,
+                                            &persons[id as usize],
+                                            cl_files_ref,
+                                            cl_ov_ref,
                                             ev_files_ref,
                                             ev_ov_ref,
                                             lm_ref,
-                                        ) == pb
+                                        )
                                 })
                                 .copied()
                                 .unwrap_or(u32::MAX);
@@ -1045,7 +1188,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                         evs.sort_unstable_by_key(|e| e.ts_ms);
 
                         let person_bytes =
-                            resolve_event_slice(persons[pid], ev_files_ref, ev_ov_ref, lm_ref);
+                            resolve_inline_event(&persons[pid], ev_files_ref, ev_ov_ref, lm_ref);
 
                         sessions.clear();
                         let mut sess_start = evs[0].ts_ms;

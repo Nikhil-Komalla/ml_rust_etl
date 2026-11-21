@@ -1,4 +1,3 @@
-use std::hash::BuildHasher;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,8 +6,8 @@ use hashbrown::{DefaultHashBuilder, HashTable};
 use rayon::prelude::*;
 
 use crate::csv::{
-    for_each_line_fields, is_valid_utf8, FileSet, OverflowSpan, SliceRef, CHUNK_BYTES,
-    FILE_IDX_ARENA, FILE_IDX_OVERFLOW,
+    fast_hash_bytes, for_each_line_fields, is_valid_utf8, FileSet, OverflowSpan, SliceRef,
+    CHUNK_BYTES, FILE_IDX_ARENA, FILE_IDX_OVERFLOW,
 };
 
 const LINK_SHARDS: usize = 32;
@@ -152,8 +151,8 @@ pub fn build_link_map(
                         }
                         let ra = files_ref.make_ref(chunk.file_idx, a, ov_out, wid);
                         let rb = files_ref.make_ref(chunk.file_idx, b, ov_out, wid);
-                        let ha = hash_builder.hash_one(a);
-                        let hb = hash_builder.hash_one(b);
+                        let ha = fast_hash_bytes(a, hash_builder);
+                        let hb = fast_hash_bytes(b, hash_builder);
                         edges_out.push(RawEdge {
                             a: ra,
                             b: rb,
@@ -401,15 +400,15 @@ mod tests {
 
         let hb = DefaultHashBuilder::default();
         let lm = build_link_map(&[p], &hb, 4).unwrap();
-        let h500 = hb.hash_one(b"id_500");
+        let h500 = fast_hash_bytes(b"id_500", &hb);
         let (sref, ch) = lm.resolve(b"id_500", h500).unwrap();
         let resolved = &lm.canon_arena[sref.off as usize..sref.off as usize + sref.len as usize];
         assert_eq!(resolved, b"!root");
-        assert_eq!(ch, hb.hash_one(b"!root"));
+        assert_eq!(ch, fast_hash_bytes(b"!root", &hb));
 
-        let hroot = hb.hash_one(b"!root");
+        let hroot = fast_hash_bytes(b"!root", &hb);
         assert!(lm.resolve(b"!root", hroot).is_none());
-        let hu1 = hb.hash_one(b"u1");
+        let hu1 = fast_hash_bytes(b"u1", &hb);
         assert!(lm.resolve(b"u1", hu1).is_none());
 
         let _ = fs::remove_dir_all(&dir);
