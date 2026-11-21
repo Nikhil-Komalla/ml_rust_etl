@@ -769,7 +769,7 @@ def main() -> None:
                 row_number() OVER (PARTITION BY person_id, day ORDER BY session_start)::BIGINT AS rk
             FROM sessions
         ),
-        interval_day_overlaps AS (
+        interval_day_overlaps AS MATERIALIZED (
             SELECT
                 iv.person_id,
                 iv.campaign_id,
