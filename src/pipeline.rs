@@ -9,8 +9,8 @@ use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 use rayon::prelude::*;
 
 use crate::csv::{
-    for_each_line_fields, is_valid_utf8, list_csv_files, FileSet, OverflowSpan, SliceRef,
-    CHUNK_BYTES, FILE_IDX_OVERFLOW,
+    for_each_line_fields, is_valid_utf8, list_csv_files, parse_csv_line, FileSet, OverflowSpan,
+    SliceRef, CHUNK_BYTES, FILE_IDX_OVERFLOW,
 };
 use crate::links::{build_link_map, LinkMap};
 use crate::parse::{
@@ -202,85 +202,216 @@ impl CampDailyAcc {
     }
 }
 
+struct ProdEntry {
+    off: usize,
+    len: usize,
+    cat_id: u32,
+    hash: u64,
+}
+
+struct CampEntry {
+    cid_off: usize,
+    cid_len: usize,
+    ch_off: usize,
+    ch_len: usize,
+    camp_id: u32,
+    hash: u64,
+}
+
 struct Lookups {
-    prod_map: HashMap<Box<[u8]>, u32, DefaultHashBuilder>,
+    prod_buf: Vec<u8>,
+    prod_entries: Vec<ProdEntry>,
+    prod_table: HashTable<u32>,
     categories: Vec<Box<[u8]>>,
     unknown_cat_id: u32,
-    camp_map: HashMap<Box<[u8]>, u32, DefaultHashBuilder>,
-    camp_names: Vec<Box<[u8]>>,
-    camp_channels: Vec<Box<[u8]>>,
+    camp_buf: Vec<u8>,
+    camp_entries: Vec<CampEntry>,
+    camp_table: HashTable<u32>,
     organic_camp_id: u32,
+}
+
+impl Lookups {
+    #[inline(always)]
+    fn get_product_cat(&self, pid: &[u8], hash_builder: &DefaultHashBuilder) -> u32 {
+        let h = hash_builder.hash_one(pid);
+        match self.prod_table.find(h, |&idx| {
+            let e = &self.prod_entries[idx as usize];
+            e.hash == h && &self.prod_buf[e.off..e.off + e.len] == pid
+        }) {
+            Some(&idx) => self.prod_entries[idx as usize].cat_id,
+            None => self.unknown_cat_id,
+        }
+    }
+
+    #[inline(always)]
+    fn get_campaign(&self, cid: &[u8], hash_builder: &DefaultHashBuilder) -> Option<u32> {
+        let h = hash_builder.hash_one(cid);
+        self.camp_table
+            .find(h, |&idx| {
+                let e = &self.camp_entries[idx as usize];
+                e.hash == h && &self.camp_buf[e.cid_off..e.cid_off + e.cid_len] == cid
+            })
+            .map(|&idx| self.camp_entries[idx as usize].camp_id)
+    }
+
+    #[inline(always)]
+    fn camp_name(&self, cid: usize) -> &[u8] {
+        let e = &self.camp_entries[cid];
+        &self.camp_buf[e.cid_off..e.cid_off + e.cid_len]
+    }
+
+    #[inline(always)]
+    fn camp_channel(&self, cid: usize) -> &[u8] {
+        let e = &self.camp_entries[cid];
+        &self.camp_buf[e.ch_off..e.ch_off + e.ch_len]
+    }
+}
+
+#[inline(always)]
+fn scan_buf_skip_header<const K: usize>(buf: &[u8], mut f: impl FnMut([&[u8]; K])) {
+    let Some(hdr_end) = memchr::memchr(b'\n', buf) else {
+        return;
+    };
+    for_each_line_fields::<K>(&buf[hdr_end + 1..], |fields| f(fields));
+    let _ = parse_csv_line::<K>; // keep import clean if needed
 }
 
 fn load_lookups(data_dir: &Path, hash_builder: &DefaultHashBuilder) -> io::Result<Lookups> {
     let prod_path = data_dir.join("products.csv");
-    let mut raw_prods: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
-    let mut raw_cats: Vec<Box<[u8]>> = vec![b"unknown".to_vec().into_boxed_slice()];
-    if prod_path.is_file() {
-        let pfiles = FileSet::open(&[prod_path])?;
-        for ch in pfiles.chunks(usize::MAX / 2) {
-            let slice = &pfiles.file_bytes(ch.file_idx)[ch.start..ch.end];
-            for_each_line_fields::<2>(slice, |[pid, cat]| {
-                if !pid.is_empty() && !cat.is_empty() && is_valid_utf8(pid) && is_valid_utf8(cat) {
-                    raw_prods.push((
-                        pid.to_vec().into_boxed_slice(),
-                        cat.to_vec().into_boxed_slice(),
-                    ));
-                    raw_cats.push(cat.to_vec().into_boxed_slice());
-                }
-            });
-        }
-    }
-    raw_cats.sort_unstable();
-    raw_cats.dedup();
-    let mut cat_to_id: HashMap<Box<[u8]>, u32, DefaultHashBuilder> =
-        HashMap::with_capacity_and_hasher(raw_cats.len(), hash_builder.clone());
-    for (i, c) in raw_cats.iter().enumerate() {
-        cat_to_id.insert(c.clone(), i as u32);
-    }
-    let unknown_cat_id = *cat_to_id.get(b"unknown".as_slice()).unwrap();
+    let prod_buf = if prod_path.is_file() {
+        fs::read(&prod_path)?
+    } else {
+        Vec::new()
+    };
+    let prod_base = prod_buf.as_ptr() as usize;
 
-    let mut prod_map: HashMap<Box<[u8]>, u32, DefaultHashBuilder> =
-        HashMap::with_capacity_and_hasher(raw_prods.len(), hash_builder.clone());
-    for (pid, cat) in raw_prods {
-        let cid = *cat_to_id.get(cat.as_ref()).unwrap();
-        prod_map.insert(pid, cid);
+    let mut raw_cats: Vec<(usize, usize, u64)> = Vec::with_capacity(64);
+    let mut cat_table: HashTable<u32> = HashTable::with_capacity(64);
+    let mut prod_entries: Vec<ProdEntry> = Vec::with_capacity(prod_buf.len() / 16 + 16);
+    let mut prod_table: HashTable<u32> = HashTable::with_capacity(prod_buf.len() / 16 + 16);
+
+    scan_buf_skip_header::<2>(&prod_buf, |[pid, cat]| {
+        if pid.is_empty() || cat.is_empty() || !is_valid_utf8(pid) || !is_valid_utf8(cat) {
+            return;
+        }
+        let ch = hash_builder.hash_one(cat);
+        let tmp_cat = match cat_table.find(ch, |&idx| {
+            let &(coff, clen, c_h) = &raw_cats[idx as usize];
+            c_h == ch && &prod_buf[coff..coff + clen] == cat
+        }) {
+            Some(&idx) => idx,
+            None => {
+                let idx = raw_cats.len() as u32;
+                let coff = cat.as_ptr() as usize - prod_base;
+                raw_cats.push((coff, cat.len(), ch));
+                cat_table.insert_unique(ch, idx, |&i| raw_cats[i as usize].2);
+                idx
+            }
+        };
+
+        let ph = hash_builder.hash_one(pid);
+        let poff = pid.as_ptr() as usize - prod_base;
+        match prod_table.entry(
+            ph,
+            |&idx| {
+                let e = &prod_entries[idx as usize];
+                e.hash == ph && &prod_buf[e.off..e.off + e.len] == pid
+            },
+            |&idx| prod_entries[idx as usize].hash,
+        ) {
+            hashbrown::hash_table::Entry::Occupied(occ) => {
+                prod_entries[*occ.get() as usize].cat_id = tmp_cat;
+            }
+            hashbrown::hash_table::Entry::Vacant(vac) => {
+                let idx = prod_entries.len() as u32;
+                prod_entries.push(ProdEntry {
+                    off: poff,
+                    len: pid.len(),
+                    cat_id: tmp_cat,
+                    hash: ph,
+                });
+                vac.insert(idx);
+            }
+        }
+    });
+
+    // Sort unique categories (+ "unknown") byte-wise ascending so tie-breaks compare cat_id integer!
+    let mut cat_slices: Vec<(Vec<u8>, Option<u32>)> = raw_cats
+        .iter()
+        .enumerate()
+        .map(|(i, &(off, len, _))| (prod_buf[off..off + len].to_vec(), Some(i as u32)))
+        .collect();
+    if !cat_slices.iter().any(|(b, _)| b.as_slice() == b"unknown") {
+        cat_slices.push((b"unknown".to_vec(), None));
+    }
+    cat_slices.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut remap = vec![0u32; raw_cats.len()];
+    let mut categories: Vec<Box<[u8]>> = Vec::with_capacity(cat_slices.len());
+    let mut unknown_cat_id = 0u32;
+    for (sorted_id, (bytes, maybe_tmp)) in cat_slices.into_iter().enumerate() {
+        if bytes.as_slice() == b"unknown" {
+            unknown_cat_id = sorted_id as u32;
+        }
+        if let Some(tmp_id) = maybe_tmp {
+            remap[tmp_id as usize] = sorted_id as u32;
+        }
+        categories.push(bytes.into_boxed_slice());
+    }
+    for e in &mut prod_entries {
+        e.cat_id = remap[e.cat_id as usize];
     }
 
     let camp_path = data_dir.join("campaigns.csv");
-    let mut camp_map: HashMap<Box<[u8]>, u32, DefaultHashBuilder> =
-        HashMap::with_hasher(hash_builder.clone());
-    let mut camp_names: Vec<Box<[u8]>> = Vec::new();
-    let mut camp_channels: Vec<Box<[u8]>> = Vec::new();
-    if camp_path.is_file() {
-        let cfiles = FileSet::open(&[camp_path])?;
-        for ch in cfiles.chunks(usize::MAX / 2) {
-            let slice = &cfiles.file_bytes(ch.file_idx)[ch.start..ch.end];
-            for_each_line_fields::<2>(slice, |[cid, ch_name]| {
-                if !cid.is_empty()
-                    && !ch_name.is_empty()
-                    && is_valid_utf8(cid)
-                    && is_valid_utf8(ch_name)
-                {
-                    let id = camp_names.len() as u32;
-                    camp_names.push(cid.to_vec().into_boxed_slice());
-                    camp_channels.push(ch_name.to_vec().into_boxed_slice());
-                    camp_map.insert(cid.to_vec().into_boxed_slice(), id);
-                }
-            });
+    let mut camp_buf = if camp_path.is_file() {
+        fs::read(&camp_path)?
+    } else {
+        Vec::new()
+    };
+    let camp_base = camp_buf.as_ptr() as usize;
+    let mut camp_entries: Vec<CampEntry> = Vec::with_capacity(camp_buf.len() / 16 + 16);
+    let mut camp_table: HashTable<u32> = HashTable::with_capacity(camp_buf.len() / 16 + 16);
+
+    scan_buf_skip_header::<2>(&camp_buf, |[cid, ch_name]| {
+        if cid.is_empty() || ch_name.is_empty() || !is_valid_utf8(cid) || !is_valid_utf8(ch_name) {
+            return;
         }
-    }
-    let organic_camp_id = camp_names.len() as u32;
-    camp_names.push(b"organic".to_vec().into_boxed_slice());
-    camp_channels.push(b"organic".to_vec().into_boxed_slice());
+        let h = hash_builder.hash_one(cid);
+        let cid_off = cid.as_ptr() as usize - camp_base;
+        let ch_off = ch_name.as_ptr() as usize - camp_base;
+        let idx = camp_entries.len() as u32;
+        camp_entries.push(CampEntry {
+            cid_off,
+            cid_len: cid.len(),
+            ch_off,
+            ch_len: ch_name.len(),
+            camp_id: idx,
+            hash: h,
+        });
+        camp_table.insert_unique(h, idx, |&i| camp_entries[i as usize].hash);
+    });
+
+    let organic_camp_id = camp_entries.len() as u32;
+    let org_off = camp_buf.len();
+    camp_buf.extend_from_slice(b"organic");
+    camp_entries.push(CampEntry {
+        cid_off: org_off,
+        cid_len: 7,
+        ch_off: org_off,
+        ch_len: 7,
+        camp_id: organic_camp_id,
+        hash: 0,
+    });
 
     Ok(Lookups {
-        prod_map,
-        categories: raw_cats,
+        prod_buf,
+        prod_entries,
+        prod_table,
+        categories,
         unknown_cat_id,
-        camp_map,
-        camp_names,
-        camp_channels,
+        camp_buf,
+        camp_entries,
+        camp_table,
         organic_camp_id,
     })
 }
@@ -357,20 +488,25 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     let max_day = (window_end_ms - 1).div_euclid(MS_DAY) as i32;
 
     let t_startup = Instant::now();
-    let lookups = load_lookups(data_dir, &hash_builder)?;
-    let t_lookups = Instant::now();
-
     let link_paths = list_csv_files(&data_dir.join("links"))?;
-    let link_map = build_link_map(&link_paths, &hash_builder, ncpu)?;
+    let (lookups_res, links_res) = rayon::join(
+        || load_lookups(data_dir, &hash_builder),
+        || build_link_map(&link_paths, &hash_builder, ncpu),
+    );
+    let lookups = lookups_res?;
+    let link_map = links_res?;
     let t_links = Instant::now();
+    let t_lookups = t_startup;
 
     // Stage 3: Events parse (parallel) -> 64-shard dedup before validation -> 128-shard scatter
     let event_paths = list_csv_files(&data_dir.join("events"))?;
     let event_files = FileSet::open(&event_paths)?;
     let ev_chunks = event_files.chunks(CHUNK_BYTES);
     let n_ev_workers = ncpu.clamp(1, 63).min(ev_chunks.len().max(1));
+    let total_ev_bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
+    let est_ev_cap = (total_ev_bytes / 90) / (n_ev_workers * P_DEDUP) + 64;
     let mut ev_worker_shards: Vec<Vec<Vec<ParsedEvent>>> = (0..n_ev_workers)
-        .map(|_| (0..P_DEDUP).map(|_| Vec::new()).collect())
+        .map(|_| (0..P_DEDUP).map(|_| Vec::with_capacity(est_ev_cap)).collect())
         .collect();
     let mut ev_worker_overflow: Vec<Vec<OverflowSpan>> =
         (0..n_ev_workers).map(|_| Vec::new()).collect();
@@ -387,7 +523,6 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                 let chunks_ref = &ev_chunks;
                 let next_ref = &next_chunk;
                 let lookups_ref = &lookups;
-                let lm_ref = &link_map;
                 let hb_ref = &hash_builder;
                 scope.spawn(move || loop {
                     let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -404,13 +539,13 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                         };
                         let ev_hash = hb_ref.hash_one(ev_id);
                         let ev_ref = files_ref.make_ref(chunk.file_idx, ev_id, ov_out, wid);
-                        let d_shard = (ev_hash >> 58) as usize;
+                        let d_shard = ((ev_hash >> 28) as usize) & (P_DEDUP - 1);
 
                         let mut valid = true;
                         let mut ts_ms = 0i64;
                         let mut price_val = 0u32;
                         let mut cat_id = 0u32;
-                        let mut person_ref = SliceRef {
+                        let mut uid_ref = SliceRef {
                             file_idx: 0,
                             len: 0,
                             off: 0,
@@ -434,10 +569,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                     b"purchase" => {
                                         if let Some(p) = parse_price_cents(price) {
                                             price_val = p;
-                                            cat_id = *lookups_ref
-                                                .prod_map
-                                                .get(pid)
-                                                .unwrap_or(&lookups_ref.unknown_cat_id);
+                                            cat_id = lookups_ref.get_product_cat(pid, hb_ref);
                                         } else {
                                             valid = false;
                                         }
@@ -445,23 +577,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                     _ => valid = false,
                                 }
                                 if valid {
-                                    if !lm_ref.is_empty() {
-                                        let uh = hb_ref.hash_one(uid);
-                                        if let Some((canon_ref, _)) = lm_ref.resolve(uid, uh) {
-                                            person_ref = if canon_ref.file_idx == FILE_IDX_OVERFLOW
-                                            {
-                                                pack_canon_overflow(canon_ref.off)
-                                            } else {
-                                                canon_ref
-                                            };
-                                        } else {
-                                            person_ref =
-                                                files_ref.make_ref(chunk.file_idx, uid, ov_out, wid);
-                                        }
-                                    } else {
-                                        person_ref =
-                                            files_ref.make_ref(chunk.file_idx, uid, ov_out, wid);
-                                    }
+                                    uid_ref = files_ref.make_ref(chunk.file_idx, uid, ov_out, wid);
                                 }
                             }
                         } else {
@@ -473,7 +589,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                             ev_ref,
                             ingest_ts_ms: ingest_ms,
                             ts_ms,
-                            person_ref,
+                            person_ref: uid_ref,
                             price_or_invalid: if valid { price_val } else { INVALID_EVENT },
                             cat_id,
                         });
@@ -499,23 +615,22 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
         .into_par_iter()
         .map(|shard_vecs| {
             let total: usize = shard_vecs.iter().map(Vec::len).sum();
+            let p_cap = total / P_PERSON + 16;
             let mut person_out: Vec<Vec<PersonEvent>> =
-                (0..P_PERSON).map(|_| Vec::new()).collect();
+                (0..P_PERSON).map(|_| Vec::with_capacity(p_cap)).collect();
             if total == 0 {
                 return person_out;
             }
+            let mut winners: Vec<ParsedEvent> = Vec::with_capacity(total);
             let mut table: HashTable<u32> = HashTable::with_capacity(total);
-            for (widx, batch) in shard_vecs.iter().enumerate() {
-                let wbase = (widx as u32) << 26;
-                for (ridx, ev) in batch.iter().enumerate() {
+            for batch in &shard_vecs {
+                for ev in batch {
                     let ev_bytes =
                         resolve_event_slice(ev.ev_ref, &event_files, &ev_worker_overflow, &link_map);
                     match table.entry(
                         ev.ev_hash,
-                        |&packed| {
-                            let pw = (packed >> 26) as usize;
-                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                            let existing = &shard_vecs[pw][pr];
+                        |&w_idx| {
+                            let existing = &winners[w_idx as usize];
                             existing.ev_hash == ev.ev_hash
                                 && resolve_event_slice(
                                     existing.ev_ref,
@@ -524,42 +639,51 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                     &link_map,
                                 ) == ev_bytes
                         },
-                        |&packed| {
-                            let pw = (packed >> 26) as usize;
-                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                            shard_vecs[pw][pr].ev_hash
-                        },
+                        |&w_idx| winners[w_idx as usize].ev_hash,
                     ) {
-                        hashbrown::hash_table::Entry::Occupied(mut occ) => {
-                            let packed = *occ.get();
-                            let pw = (packed >> 26) as usize;
-                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                            if ev.ingest_ts_ms < shard_vecs[pw][pr].ingest_ts_ms {
-                                *occ.get_mut() = wbase | (ridx as u32);
+                        hashbrown::hash_table::Entry::Occupied(occ) => {
+                            let w_idx = *occ.get() as usize;
+                            if ev.ingest_ts_ms < winners[w_idx].ingest_ts_ms {
+                                winners[w_idx] = *ev;
                             }
                         }
                         hashbrown::hash_table::Entry::Vacant(vac) => {
-                            vac.insert(wbase | (ridx as u32));
+                            let idx = winners.len() as u32;
+                            winners.push(*ev);
+                            vac.insert(idx);
                         }
                     }
                 }
             }
+            drop(table);
+            drop(shard_vecs);
 
-            for &packed in &table {
-                let pw = (packed >> 26) as usize;
-                let pr = (packed & ((1 << 26) - 1)) as usize;
-                let ev = &shard_vecs[pw][pr];
+            for ev in winners {
                 if ev.price_or_invalid != INVALID_EVENT {
-                    let pbytes = resolve_event_slice(
+                    let raw_uid = resolve_event_slice(
                         ev.person_ref,
                         &event_files,
                         &ev_worker_overflow,
                         &link_map,
                     );
-                    let ph = hash_builder.hash_one(pbytes);
-                    let pshard = (ph as usize) & (P_PERSON - 1);
+                    let uh = hash_builder.hash_one(raw_uid);
+                    let (person_ref, ph) = if !link_map.is_empty() {
+                        if let Some((canon_ref, ch)) = link_map.resolve(raw_uid, uh) {
+                            let pref = if canon_ref.file_idx == FILE_IDX_OVERFLOW {
+                                pack_canon_overflow(canon_ref.off)
+                            } else {
+                                canon_ref
+                            };
+                            (pref, ch)
+                        } else {
+                            (ev.person_ref, uh)
+                        }
+                    } else {
+                        (ev.person_ref, uh)
+                    };
+                    let pshard = ((ph >> 28) as usize) & (P_PERSON - 1);
                     person_out[pshard].push(PersonEvent {
-                        person_ref: ev.person_ref,
+                        person_ref,
                         person_hash: ph,
                         ts_ms: ev.ts_ms,
                         price_cents: ev.price_or_invalid,
@@ -567,16 +691,19 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                     });
                 }
             }
-            drop(table);
-            drop(shard_vecs);
             person_out
         })
         .collect();
 
-    let mut person_events: Vec<Vec<PersonEvent>> = (0..P_PERSON).map(|_| Vec::new()).collect();
+    let mut person_event_batches: Vec<Vec<Vec<PersonEvent>>> =
+        (0..P_PERSON).map(|_| Vec::with_capacity(P_DEDUP)).collect();
+    let mut person_event_counts = vec![0usize; P_PERSON];
     for mut pvecs in dedup_results {
-        for (ps, mut v) in pvecs.drain(..).enumerate() {
-            person_events[ps].append(&mut v);
+        for (ps, v) in pvecs.drain(..).enumerate() {
+            if !v.is_empty() {
+                person_event_counts[ps] += v.len();
+                person_event_batches[ps].push(v);
+            }
         }
     }
     let t_events_dedup = Instant::now();
@@ -586,8 +713,10 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     let click_files = FileSet::open(&click_paths)?;
     let cl_chunks = click_files.chunks(CHUNK_BYTES);
     let n_cl_workers = ncpu.clamp(1, 63).min(cl_chunks.len().max(1));
+    let total_cl_bytes: usize = cl_chunks.iter().map(|c| c.end - c.start).sum();
+    let est_cl_cap = (total_cl_bytes / 65) / (n_cl_workers * P_PERSON) + 32;
     let mut cl_worker_shards: Vec<Vec<Vec<PersonClick>>> = (0..n_cl_workers)
-        .map(|_| (0..P_PERSON).map(|_| Vec::new()).collect())
+        .map(|_| (0..P_PERSON).map(|_| Vec::with_capacity(est_cl_cap)).collect())
         .collect();
     let mut cl_worker_overflow: Vec<Vec<OverflowSpan>> =
         (0..n_cl_workers).map(|_| Vec::new()).collect();
@@ -620,7 +749,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                         {
                             return;
                         }
-                        let Some(&cid) = lookups_ref.camp_map.get(camp_id) else {
+                        let Some(cid) = lookups_ref.get_campaign(camp_id, hb_ref) else {
                             return;
                         };
                         let Some(ts_ms) = parse_ts_ms(ts) else {
@@ -629,8 +758,8 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                         if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
                             return;
                         }
+                        let uh = hb_ref.hash_one(uid);
                         let (person_ref, person_hash) = if !lm_ref.is_empty() {
-                            let uh = hb_ref.hash_one(uid);
                             if let Some((canon_ref, ch)) = lm_ref.resolve(uid, uh) {
                                 let pref = if canon_ref.file_idx == FILE_IDX_OVERFLOW {
                                     pack_canon_overflow(canon_ref.off)
@@ -642,11 +771,10 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                 (files_ref.make_ref(chunk.file_idx, uid, ov_out, wid), uh)
                             }
                         } else {
-                            let uh = hb_ref.hash_one(uid);
                             (files_ref.make_ref(chunk.file_idx, uid, ov_out, wid), uh)
                         };
                         let click_id_ref = files_ref.make_ref(chunk.file_idx, click_id, ov_out, wid);
-                        let pshard = (person_hash as usize) & (P_PERSON - 1);
+                        let pshard = ((person_hash >> 28) as usize) & (P_PERSON - 1);
                         buckets[pshard].push(PersonClick {
                             person_ref,
                             click_id_ref,
@@ -660,10 +788,15 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
         });
     }
 
-    let mut person_clicks: Vec<Vec<PersonClick>> = (0..P_PERSON).map(|_| Vec::new()).collect();
+    let mut person_click_batches: Vec<Vec<Vec<PersonClick>>> =
+        (0..P_PERSON).map(|_| Vec::with_capacity(n_cl_workers)).collect();
+    let mut person_click_counts = vec![0usize; P_PERSON];
     for mut worker_vecs in cl_worker_shards {
-        for (ps, mut v) in worker_vecs.drain(..).enumerate() {
-            person_clicks[ps].append(&mut v);
+        for (ps, v) in worker_vecs.drain(..).enumerate() {
+            if !v.is_empty() {
+                person_click_counts[ps] += v.len();
+                person_click_batches[ps].push(v);
+            }
         }
     }
     let t_clicks = Instant::now();
@@ -677,26 +810,28 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     // Stage 5: LPT-scheduled parallel shard processing -> UserDaily Parquet + CampDailyAcc
     let mut shard_order: Vec<usize> = (0..P_PERSON).collect();
     shard_order.sort_unstable_by(|&a, &b| {
-        let wa = person_events[a].len() + person_clicks[a].len();
-        let wb = person_events[b].len() + person_clicks[b].len();
+        let wa = person_event_counts[a] + person_click_counts[a];
+        let wb = person_event_counts[b] + person_click_counts[b];
         wb.cmp(&wa)
     });
 
-    // Zip into movable per-shard packets wrapped in Option/Mutex-free indexed storage
-    let mut shard_data: Vec<(Vec<PersonEvent>, Vec<PersonClick>)> = person_events
-        .into_iter()
-        .zip(person_clicks.into_iter())
-        .collect();
-    // Wrap in std::sync::Mutex<Option<...>> only so workers can take() one shard at a time cleanly without unsafe.
-    let shard_slots: Vec<std::sync::Mutex<Option<(Vec<PersonEvent>, Vec<PersonClick>)>>> =
-        shard_data
-            .drain(..)
-            .map(|pair| std::sync::Mutex::new(Some(pair)))
+    let mut shard_data: Vec<(Vec<Vec<PersonEvent>>, Vec<Vec<PersonClick>>, usize, usize)> =
+        person_event_batches
+            .into_iter()
+            .zip(person_click_batches.into_iter())
+            .zip(person_event_counts.into_iter().zip(person_click_counts.into_iter()))
+            .map(|((eb, cb), (ec, cc))| (eb, cb, ec, cc))
             .collect();
+    let shard_slots: Vec<
+        std::sync::Mutex<Option<(Vec<Vec<PersonEvent>>, Vec<Vec<PersonClick>>, usize, usize)>>,
+    > = shard_data
+        .drain(..)
+        .map(|item| std::sync::Mutex::new(Some(item)))
+        .collect();
 
     let n_out_workers = ncpu.max(1).min(P_PERSON);
     let next_order = AtomicUsize::new(0);
-    let num_camps = lookups.camp_names.len();
+    let num_camps = lookups.camp_entries.len();
     let num_cats = lookups.categories.len();
     let organic_camp = lookups.organic_camp_id;
 
@@ -748,40 +883,45 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                     let Some(&shard_idx) = order_ref.get(ord_idx) else {
                         break;
                     };
-                    let Some((evs_in, cls_in)) = slots_ref[shard_idx].lock().unwrap().take() else {
+                    let Some((evs_batches, cls_batches, ev_total, cl_total)) =
+                        slots_ref[shard_idx].lock().unwrap().take()
+                    else {
                         break;
                     };
-                    if evs_in.is_empty() {
+                    if ev_total == 0 {
                         continue;
                     }
 
                     // 1. Intern unique person_ids from events
-                    let mut persons: Vec<SliceRef> = Vec::with_capacity(evs_in.len() / 4 + 16);
-                    let mut p_hashes: Vec<u64> = Vec::with_capacity(evs_in.len() / 4 + 16);
-                    let mut p_table: HashTable<u32> = HashTable::with_capacity(evs_in.len() / 4 + 16);
-                    let mut ev_pids: Vec<u32> = Vec::with_capacity(evs_in.len());
+                    let p_cap = ev_total / 4 + 16;
+                    let mut persons: Vec<SliceRef> = Vec::with_capacity(p_cap);
+                    let mut p_hashes: Vec<u64> = Vec::with_capacity(p_cap);
+                    let mut p_table: HashTable<u32> = HashTable::with_capacity(p_cap);
+                    let mut ev_pids: Vec<u32> = Vec::with_capacity(ev_total);
 
-                    for ev in &evs_in {
-                        let pb = resolve_event_slice(ev.person_ref, ev_files_ref, ev_ov_ref, lm_ref);
-                        let pid = match p_table.find(ev.person_hash, |&id| {
-                            p_hashes[id as usize] == ev.person_hash
-                                && resolve_event_slice(
-                                    persons[id as usize],
-                                    ev_files_ref,
-                                    ev_ov_ref,
-                                    lm_ref,
-                                ) == pb
-                        }) {
-                            Some(&id) => id,
-                            None => {
-                                let id = persons.len() as u32;
-                                persons.push(ev.person_ref);
-                                p_hashes.push(ev.person_hash);
-                                p_table.insert_unique(ev.person_hash, id, |&idx| p_hashes[idx as usize]);
-                                id
-                            }
-                        };
-                        ev_pids.push(pid);
+                    for batch in &evs_batches {
+                        for ev in batch {
+                            let pb = resolve_event_slice(ev.person_ref, ev_files_ref, ev_ov_ref, lm_ref);
+                            let pid = match p_table.find(ev.person_hash, |&id| {
+                                p_hashes[id as usize] == ev.person_hash
+                                    && resolve_event_slice(
+                                        persons[id as usize],
+                                        ev_files_ref,
+                                        ev_ov_ref,
+                                        lm_ref,
+                                    ) == pb
+                            }) {
+                                Some(&id) => id,
+                                None => {
+                                    let id = persons.len() as u32;
+                                    persons.push(ev.person_ref);
+                                    p_hashes.push(ev.person_hash);
+                                    p_table.insert_unique(ev.person_hash, id, |&idx| p_hashes[idx as usize]);
+                                    id
+                                }
+                            };
+                            ev_pids.push(pid);
+                        }
                     }
 
                     let num_p = persons.len();
@@ -799,43 +939,49 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                             price_cents: 0,
                             cat_id: 0,
                         };
-                        evs_in.len()
+                        ev_total
                     ];
-                    for (ev, &pid) in evs_in.iter().zip(ev_pids.iter()) {
-                        let pos = ev_fill[pid as usize] as usize;
-                        ev_fill[pid as usize] += 1;
-                        grouped_events[pos] = CompactEvent {
-                            ts_ms: ev.ts_ms,
-                            price_cents: ev.price_cents,
-                            cat_id: ev.cat_id,
-                        };
+                    let mut pid_idx = 0usize;
+                    for batch in evs_batches {
+                        for ev in batch {
+                            let pid = ev_pids[pid_idx] as usize;
+                            pid_idx += 1;
+                            let pos = ev_fill[pid] as usize;
+                            ev_fill[pid] += 1;
+                            grouped_events[pos] = CompactEvent {
+                                ts_ms: ev.ts_ms,
+                                price_cents: ev.price_cents,
+                                cat_id: ev.cat_id,
+                            };
+                        }
                     }
-                    drop(evs_in);
                     drop(ev_pids);
                     drop(ev_fill);
 
                     // 2. Group matching clicks into CSR by pid (skip clicks for event-less persons)
                     let mut cl_counts = vec![0u32; num_p];
-                    let mut cl_pids: Vec<u32> = Vec::with_capacity(cls_in.len());
-                    for c in &cls_in {
-                        let pb = resolve_click_slice(c.person_ref, cl_files_ref, cl_ov_ref, lm_ref);
-                        let ph = hash_builder.hash_one(pb);
-                        let pid = p_table
-                            .find(ph, |&id| {
-                                p_hashes[id as usize] == ph
-                                    && resolve_event_slice(
-                                        persons[id as usize],
-                                        ev_files_ref,
-                                        ev_ov_ref,
-                                        lm_ref,
-                                    ) == pb
-                            })
-                            .copied()
-                            .unwrap_or(u32::MAX);
-                        if pid != u32::MAX {
-                            cl_counts[pid as usize] += 1;
+                    let mut cl_pids: Vec<u32> = Vec::with_capacity(cl_total);
+                    for batch in &cls_batches {
+                        for c in batch {
+                            let pb = resolve_click_slice(c.person_ref, cl_files_ref, cl_ov_ref, lm_ref);
+                            let ph = hash_builder.hash_one(pb);
+                            let pid = p_table
+                                .find(ph, |&id| {
+                                    p_hashes[id as usize] == ph
+                                        && resolve_event_slice(
+                                            persons[id as usize],
+                                            ev_files_ref,
+                                            ev_ov_ref,
+                                            lm_ref,
+                                        ) == pb
+                                })
+                                .copied()
+                                .unwrap_or(u32::MAX);
+                            if pid != u32::MAX {
+                                cl_counts[pid as usize] += 1;
+                            }
+                            cl_pids.push(pid);
                         }
-                        cl_pids.push(pid);
                     }
                     let mut cl_offsets = vec![0u32; num_p + 1];
                     for i in 0..num_p {
@@ -856,19 +1002,23 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                         };
                         total_matched_cl
                     ];
-                    for (c, &pid) in cls_in.iter().zip(cl_pids.iter()) {
-                        if pid != u32::MAX {
-                            let pos = cl_fill[pid as usize] as usize;
-                            cl_fill[pid as usize] += 1;
-                            grouped_clicks[pos] = CompactClick {
-                                ts_ms: c.ts_ms,
-                                click_id_ref: c.click_id_ref,
-                                camp_id: c.camp_id,
-                                _pad: 0,
-                            };
+                    let mut cpid_idx = 0usize;
+                    for batch in cls_batches {
+                        for c in batch {
+                            let pid = cl_pids[cpid_idx];
+                            cpid_idx += 1;
+                            if pid != u32::MAX {
+                                let pos = cl_fill[pid as usize] as usize;
+                                cl_fill[pid as usize] += 1;
+                                grouped_clicks[pos] = CompactClick {
+                                    ts_ms: c.ts_ms,
+                                    click_id_ref: c.click_id_ref,
+                                    camp_id: c.camp_id,
+                                    _pad: 0,
+                                };
+                            }
                         }
                     }
-                    drop(cls_in);
                     drop(cl_pids);
                     drop(cl_counts);
                     drop(cl_fill);
@@ -1179,8 +1329,8 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             cells,
         } => {
             for c in 0..*num_camps {
-                let c_name = lookups.camp_names[c].as_ref();
-                let ch_name = lookups.camp_channels[c].as_ref();
+                let c_name = lookups.camp_name(c);
+                let ch_name = lookups.camp_channel(c);
                 let base = c * (*num_days);
                 for d_off in 0..*num_days {
                     let agg = &cells[base + d_off];
@@ -1202,8 +1352,8 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             for (&(c, day), agg) in map {
                 if agg.sessions > 0 || agg.assisted_sessions > 0 {
                     cd_rows.push(CampaignRow {
-                        campaign_id: lookups.camp_names[c as usize].as_ref(),
-                        channel: lookups.camp_channels[c as usize].as_ref(),
+                        campaign_id: lookups.camp_name(c as usize),
+                        channel: lookups.camp_channel(c as usize),
                         day,
                         sessions: agg.sessions,
                         purchasing_sessions: agg.purchasing_sessions,

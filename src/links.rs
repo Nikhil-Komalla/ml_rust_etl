@@ -95,7 +95,7 @@ impl LinkMap {
         if self.empty {
             return None;
         }
-        let shard = (raw_hash as usize) & (LINK_SHARDS - 1);
+        let shard = ((raw_hash >> 28) as usize) & (LINK_SHARDS - 1);
         self.shards[shard]
             .find(raw_hash, |e| self.entry_raw(e) == raw)
             .map(|e| (self.entry_canon_ref(e), e.canon_hash))
@@ -182,7 +182,7 @@ pub fn build_link_map(
             let ov_ref = &worker_overflow;
             for edges in &worker_edges {
                 for e in edges {
-                    if (e.ha & mask) == s as u64 {
+                    if (((e.ha >> 28) as usize) & mask as usize) == s {
                         let bytes = files_ref.resolve(e.a, &[], ov_ref);
                         if table
                             .find(e.ha, |&idx| {
@@ -198,7 +198,7 @@ pub fn build_link_map(
                             table.insert_unique(e.ha, idx, |&i| nodes[i as usize].hash);
                         }
                     }
-                    if (e.hb & mask) == s as u64 {
+                    if (((e.hb >> 28) as usize) & mask as usize) == s {
                         let bytes = files_ref.resolve(e.b, &[], ov_ref);
                         if table
                             .find(e.hb, |&idx| {
@@ -243,7 +243,7 @@ pub fn build_link_map(
             let mut out = Vec::with_capacity(edges.len());
             let mask = LINK_SHARDS - 1;
             for e in edges {
-                let sa = (e.ha as usize) & mask;
+                let sa = ((e.ha >> 28) as usize) & mask;
                 let ba = files.resolve(e.a, &[], &worker_overflow);
                 let la = *shard_tables[sa]
                     .find(e.ha, |&idx| {
@@ -252,7 +252,7 @@ pub fn build_link_map(
                     })
                     .unwrap();
 
-                let sb = (e.hb as usize) & mask;
+                let sb = ((e.hb >> 28) as usize) & mask;
                 let bb = files.resolve(e.b, &[], &worker_overflow);
                 let lb = *shard_tables[sb]
                     .find(e.hb, |&idx| {
@@ -355,7 +355,7 @@ pub fn build_link_map(
 
         let raw_hash = all_nodes[i].hash;
         let canon_hash = all_nodes[r].hash;
-        let shard = (raw_hash as usize) & (LINK_SHARDS - 1);
+        let shard = ((raw_hash >> 28) as usize) & (LINK_SHARDS - 1);
         shards[shard].insert_unique(
             raw_hash,
             LinkEntry {
