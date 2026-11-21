@@ -37,7 +37,10 @@ fn fast_range32(h: u64, cap: usize) -> usize {
 
 #[inline(always)]
 fn bloom_bits(h: u64) -> u64 {
-    (1u64 << ((h >> 12) & 63)) | (1u64 << ((h >> 18) & 63)) | (1u64 << ((h >> 24) & 63))
+    (1u64 << ((h >> 6) & 63))
+        | (1u64 << ((h >> 12) & 63))
+        | (1u64 << ((h >> 18) & 63))
+        | (1u64 << ((h >> 24) & 63))
 }
 
 #[inline(always)]
@@ -205,6 +208,74 @@ impl LinkMap {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NodeProbe {
+    key: u64,
+    shard: u16,
+    slot: u32,
+}
+
+impl NodeProbe {
+    const EMPTY: Self = Self {
+        key: 0,
+        shard: u16::MAX,
+        slot: 0,
+    };
+}
+
+#[inline(always)]
+fn prep_node_probe(k: CompactKey64, build_shards: &[(Vec<BuildSlot>, usize)]) -> NodeProbe {
+    if !k.is_ref() {
+        let h = mix64(k.0);
+        let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
+        let (ref slots, mask) = unsafe { build_shards.get_unchecked(s) };
+        let slot = (h as usize) & *mask;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                slots.as_ptr().add(slot) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        NodeProbe {
+            key: k.0,
+            shard: s as u16,
+            slot: slot as u32,
+        }
+    } else {
+        NodeProbe {
+            key: k.0,
+            shard: u16::MAX,
+            slot: 0,
+        }
+    }
+}
+
+#[inline(always)]
+fn resolve_node_probe(
+    p: NodeProbe,
+    build_shards: &[(Vec<BuildSlot>, usize)],
+    offsets: &[usize; LINK_SHARDS + 1],
+    worker_arenas: &[LongArena],
+    long_build_map: &HashMap<Box<[u8]>, u32>,
+) -> u32 {
+    if p.shard != u16::MAX {
+        let s = p.shard as usize;
+        let (ref slots, mask) = unsafe { build_shards.get_unchecked(s) };
+        let mut slot = p.slot as usize;
+        loop {
+            let cur = unsafe { *slots.get_unchecked(slot) };
+            if cur.key == p.key {
+                return (unsafe { *offsets.get_unchecked(s) } as u32) + cur.val;
+            }
+            slot = (slot + 1) & mask;
+        }
+    } else {
+        let bytes = LongArena::resolve_in(worker_arenas, CompactKey64(p.key));
+        *long_build_map.get(bytes).unwrap()
+    }
+}
+
 pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     if paths.is_empty() {
         return Ok(LinkMap::empty());
@@ -228,7 +299,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     let mut worker_arenas: Vec<LongArena> = (0..nworkers).map(|_| LongArena::default()).collect();
     let mut worker_errs: Vec<Option<io::Error>> = (0..nworkers).map(|_| None).collect();
 
-    std::thread::scope(|scope| {
+    rayon::scope(|scope| {
         for (wid, ((((edges_out, buckets_out), long_out), arena_out), err_out)) in worker_edges
             .iter_mut()
             .zip(worker_inline_buckets.iter_mut())
@@ -240,33 +311,48 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             let src_ref = &src;
             let chunks_ref = &chunks;
             let next_ref = &next_chunk;
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 let mut buf = Vec::new();
                 loop {
                     let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
                     let Some(&task) = chunks_ref.get(cidx) else {
                         break;
                     };
-                    if let Err(e) = src_ref.for_each_chunk_line::<2>(task, &mut buf, |[a, b]| {
-                        if a.is_empty() || b.is_empty() || a == b {
-                            return;
-                        }
-                        let ka = CompactKey64::encode_raw(a, wid, arena_out);
-                        let kb = CompactKey64::encode_raw(b, wid, arena_out);
-                        edges_out.push((ka, kb));
-                        if !ka.is_ref() {
-                            let s = ((mix64(ka.0) >> 52) as usize) & (LINK_SHARDS - 1);
-                            buckets_out[s].push(ka);
-                        } else {
-                            long_out.push(ka);
-                        }
-                        if !kb.is_ref() {
-                            let s = ((mix64(kb.0) >> 52) as usize) & (LINK_SHARDS - 1);
-                            buckets_out[s].push(kb);
-                        } else {
-                            long_out.push(kb);
-                        }
-                    }) {
+                    if let Err(e) =
+                        src_ref.for_each_chunk_spans::<2>(task, &mut buf, |padded, starts, ends| {
+                            let a_s = starts[0] as usize;
+                            let a_e = ends[0] as usize;
+                            let b_s = starts[1] as usize;
+                            let b_e = ends[1] as usize;
+                            if a_e <= a_s || b_e <= b_s {
+                                return;
+                            }
+                            let a = unsafe { padded.get_unchecked(a_s..a_e) };
+                            let b = unsafe { padded.get_unchecked(b_s..b_e) };
+                            if a == b {
+                                return;
+                            }
+                            let ka =
+                                CompactKey64::encode_raw_inline_padded(padded, a_s, a_e - a_s)
+                                    .unwrap_or_else(|| arena_out.push_ref(wid, a));
+                            let kb =
+                                CompactKey64::encode_raw_inline_padded(padded, b_s, b_e - b_s)
+                                    .unwrap_or_else(|| arena_out.push_ref(wid, b));
+                            edges_out.push((ka, kb));
+                            if !ka.is_ref() {
+                                let s = ((mix64(ka.0) >> 52) as usize) & (LINK_SHARDS - 1);
+                                buckets_out[s].push(ka);
+                            } else {
+                                long_out.push(ka);
+                            }
+                            if !kb.is_ref() {
+                                let s = ((mix64(kb.0) >> 52) as usize) & (LINK_SHARDS - 1);
+                                buckets_out[s].push(kb);
+                            } else {
+                                long_out.push(kb);
+                            }
+                        })
+                    {
                         *err_out = Some(e);
                         break;
                     }
@@ -296,15 +382,15 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
         }
     }
 
-    // Stage L2: shard-parallel interning with tight dynamic capacity (avoids huge 2*total buffers).
+    // Stage L2: shard-parallel interning sized to avoid resizes on 20M.
     let shard_results: Vec<(Vec<BuildSlot>, usize, Vec<CompactKey64>)> = shard_inputs
         .into_par_iter()
         .map(|batches| {
             let total: usize = batches.iter().map(Vec::len).sum();
-            let mut cap = (total / 2).max(8).next_power_of_two();
+            let mut cap = ((total * 10 / 9).max(16)).next_power_of_two();
             let mut mask = cap - 1;
             let mut slots = vec![BuildSlot { key: 0, val: 0 }; cap];
-            let mut nodes = Vec::with_capacity((total / 3).max(16));
+            let mut nodes = Vec::with_capacity((total / 2).max(16));
             for batch in batches {
                 for k in batch {
                     if (nodes.len() + 1) * 10 >= cap * 6 {
@@ -381,41 +467,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     }
     all_nodes.append(&mut long_nodes);
 
-    // Stage L3: map all edges to dense u32 pairs in parallel.
-    let resolved_batches: Vec<Vec<(u32, u32)>> = worker_edges
-        .par_iter()
-        .map(|edges| {
-            let mut out = Vec::with_capacity(edges.len());
-            let resolve_node = |k: CompactKey64| -> u32 {
-                if !k.is_ref() {
-                    let h = mix64(k.0);
-                    let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
-                    let (ref slots, mask) = build_shards[s];
-                    let mut slot = (h as usize) & mask;
-                    loop {
-                        let cur = slots[slot];
-                        if cur.key == k.0 {
-                            return (offsets[s] as u32) + cur.val;
-                        }
-                        slot = (slot + 1) & mask;
-                    }
-                } else {
-                    let bytes = LongArena::resolve_in(&worker_arenas, k);
-                    *long_build_map.get(bytes).unwrap()
-                }
-            };
-            for &(ka, kb) in edges {
-                out.push((resolve_node(ka), resolve_node(kb)));
-            }
-            out
-        })
-        .collect();
-
-    drop(worker_edges);
-    drop(build_shards);
-    drop(long_build_map);
-
-    // Stage L4: parallel lock-free DSU union-to-byte-wise-smallest root.
+    // Stage L3+L4 fused: prefetched ring-buffer lookup + parallel lock-free DSU union.
     let parent: Vec<AtomicU32> = (0..num_nodes as u32)
         .into_par_iter()
         .map(AtomicU32::new)
@@ -423,8 +475,29 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
 
     let all_nodes_ref = &all_nodes;
     let arenas_ref = &worker_arenas;
-    resolved_batches.into_par_iter().for_each(|batch| {
-        for (u0, v0) in batch {
+    worker_edges.into_par_iter().for_each(|edges| {
+        const RING: usize = 16;
+        let len = edges.len();
+        let mut ring = [(NodeProbe::EMPTY, NodeProbe::EMPTY); RING];
+        let pre = len.min(RING);
+        for i in 0..pre {
+            let (ka, kb) = edges[i];
+            ring[i] = (
+                prep_node_probe(ka, &build_shards),
+                prep_node_probe(kb, &build_shards),
+            );
+        }
+        for idx in 0..len {
+            let (pa, pb) = ring[idx & (RING - 1)];
+            if idx + RING < len {
+                let (ka, kb) = unsafe { *edges.get_unchecked(idx + RING) };
+                ring[idx & (RING - 1)] = (
+                    prep_node_probe(ka, &build_shards),
+                    prep_node_probe(kb, &build_shards),
+                );
+            }
+            let u0 = resolve_node_probe(pa, &build_shards, &offsets, arenas_ref, &long_build_map);
+            let v0 = resolve_node_probe(pb, &build_shards, &offsets, arenas_ref, &long_build_map);
             loop {
                 let u = atomic_find(&parent, u0);
                 let v = atomic_find(&parent, v0);
@@ -451,6 +524,9 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             }
         }
     });
+
+    drop(build_shards);
+    drop(long_build_map);
 
     // Flatten into static u32 vector in parallel.
     let flat_parent: Vec<u32> = (0..num_nodes)

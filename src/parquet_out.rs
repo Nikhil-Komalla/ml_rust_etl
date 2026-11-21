@@ -278,9 +278,10 @@ impl UserDailyWriter {
         categories: &[Box<[u8]>],
         _compression: Compression,
     ) -> io::Result<Self> {
+        let batch_rows = batch_rows.max(1);
         let mut file = File::create(path)?;
         file.write_all(b"PAR1")?;
-        let cap = batch_rows.min(131_072);
+        let cap = batch_rows;
         let cat_encoded = categories
             .iter()
             .map(|c| {
@@ -320,13 +321,28 @@ impl UserDailyWriter {
         top_cat_id: Option<u32>,
     ) -> io::Result<()> {
         let rg_idx = self.days.len();
-        self.uid_plain
-            .extend_from_slice(&(user_id.len() as u32).to_le_bytes());
-        self.uid_plain.extend_from_slice(user_id);
-        self.days.push(day);
-        self.sessions.push(sessions as i32);
-        self.events.push(events as i32);
-        self.revenues.push(revenue);
+        let uid_len = user_id.len();
+        let cur_uid_len = self.uid_plain.len();
+        self.uid_plain.reserve(4 + uid_len);
+        unsafe {
+            let dst = self.uid_plain.as_mut_ptr().add(cur_uid_len);
+            std::ptr::copy_nonoverlapping((uid_len as u32).to_le_bytes().as_ptr(), dst, 4);
+            std::ptr::copy_nonoverlapping(user_id.as_ptr(), dst.add(4), uid_len);
+            self.uid_plain.set_len(cur_uid_len + 4 + uid_len);
+
+            debug_assert!(rg_idx < self.days.capacity());
+            debug_assert!(rg_idx < self.sessions.capacity());
+            debug_assert!(rg_idx < self.events.capacity());
+            debug_assert!(rg_idx < self.revenues.capacity());
+            std::ptr::write(self.days.as_mut_ptr().add(rg_idx), day);
+            self.days.set_len(rg_idx + 1);
+            std::ptr::write(self.sessions.as_mut_ptr().add(rg_idx), sessions as i32);
+            self.sessions.set_len(rg_idx + 1);
+            std::ptr::write(self.events.as_mut_ptr().add(rg_idx), events as i32);
+            self.events.set_len(rg_idx + 1);
+            std::ptr::write(self.revenues.as_mut_ptr().add(rg_idx), revenue);
+            self.revenues.set_len(rg_idx + 1);
+        }
 
         let byte_idx = rg_idx >> 3;
         if byte_idx == self.cat_def_bits.len() {
