@@ -630,6 +630,387 @@ trait ClickEmit: Stage5Click {
     ) -> Self;
 }
 
+trait DedupEmit: Stage5Event {
+    fn empty_tmpl() -> Self;
+    fn from_winner(
+        ev: &ParsedEvent,
+        window_start_ms: i64,
+        ext_by_worker: &[Vec<ExtEvent>],
+    ) -> Self;
+}
+
+impl DedupEmit for PersonEvent16 {
+    #[inline(always)]
+    fn empty_tmpl() -> Self {
+        Self {
+            person_key: CompactKey64::EMPTY,
+            ts_rel_ms: 0,
+            price_cat: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn from_winner(
+        ev: &ParsedEvent,
+        window_start_ms: i64,
+        ext_by_worker: &[Vec<ExtEvent>],
+    ) -> Self {
+        let (ts_rel_ms, price_cat) = ev_payload_compact(ev, window_start_ms, ext_by_worker);
+        Self {
+            person_key: ev.person_key,
+            ts_rel_ms,
+            price_cat,
+        }
+    }
+}
+
+impl DedupEmit for PersonEventWide {
+    #[inline(always)]
+    fn empty_tmpl() -> Self {
+        Self {
+            person_key: CompactKey64::EMPTY,
+            ts_ms: 0,
+            price_cents: 0,
+            cat_id: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn from_winner(
+        ev: &ParsedEvent,
+        _window_start_ms: i64,
+        ext_by_worker: &[Vec<ExtEvent>],
+    ) -> Self {
+        let (ts_ms, price_cents, cat_id) = ev_payload_wide(ev, ext_by_worker);
+        Self {
+            person_key: ev.person_key,
+            ts_ms,
+            price_cents,
+            cat_id,
+        }
+    }
+}
+
+#[inline(always)]
+fn fast_range32(h: u64, cap: usize) -> usize {
+    (((h as u32 as u64).wrapping_mul(cap as u64)) >> 32) as usize
+}
+
+fn run_events_dedup<E: DedupEmit>(
+    dedup_slots: &[Mutex<Option<Vec<Vec<ParsedEvent>>>>],
+    ev_worker_ext: &[Vec<ExtEvent>],
+    ev_worker_arenas: &[LongArena],
+    window_start_ms: i64,
+    window_start_sec: i64,
+    n_dedup_workers: usize,
+    est_p_cap: usize,
+) -> (Vec<Vec<Vec<E>>>, Vec<usize>) {
+    const SWCB_DEDUP: usize = 8;
+
+    let mut dedup_worker_outs: Vec<Vec<Vec<E>>> = (0..n_dedup_workers).map(|_| Vec::new()).collect();
+    let next_d_shard = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for out_slot in &mut dedup_worker_outs {
+            let next_ref = &next_d_shard;
+            scope.spawn(move || {
+                let mut person_out: Vec<Vec<E>> = Vec::new();
+                let mut swcb: Vec<E> = Vec::new();
+                let mut swcb_cnt = [0u8; P_PERSON];
+
+                let mut dedup_u32: Vec<u32> = Vec::new();
+                let mut dedup_keys: Vec<u64> = Vec::new();
+                let mut dedup_idxs: Vec<u32> = Vec::new();
+                let mut long_table: Option<HashTable<u32>> = None;
+
+                loop {
+                    let ds = next_ref.fetch_add(1, Ordering::Relaxed);
+                    if ds >= P_DEDUP {
+                        break;
+                    }
+                    let Some(mut shard_vecs) = dedup_slots[ds].lock().unwrap().take() else {
+                        continue;
+                    };
+                    let total: usize = shard_vecs.iter().map(Vec::len).sum();
+                    if total == 0 {
+                        continue;
+                    }
+                    if person_out.is_empty() {
+                        person_out = (0..P_PERSON).map(|_| Vec::with_capacity(est_p_cap)).collect();
+                        swcb = vec![E::empty_tmpl(); P_PERSON * SWCB_DEDUP];
+                    }
+                    if let Some(lt) = &mut long_table {
+                        lt.clear();
+                    }
+
+                    let n_batches = shard_vecs.len();
+                    if total < 262_143 && n_batches <= 63 {
+                        let mut batch_starts = [0u32; 64];
+                        let mut acc_start = 0u32;
+                        for w in 0..n_batches {
+                            batch_starts[w] = acc_start;
+                            acc_start += shard_vecs[w].len() as u32;
+                        }
+                        let cap = ((total * 10 + 6) / 7).max(total + 1).max(16);
+                        dedup_u32.clear();
+                        dedup_u32.resize(cap, 0u32);
+
+                        for widx in 0..n_batches {
+                            let batch_len = shard_vecs[widx].len();
+                            let flat_base = batch_starts[widx];
+                            let wbase = (widx as u32) << 26;
+                            for ridx in 0..batch_len {
+                                #[cfg(target_arch = "x86_64")]
+                                if ridx + 16 < batch_len {
+                                    let k_ahead =
+                                        unsafe { shard_vecs[widx].get_unchecked(ridx + 16).ev_key };
+                                    let nslot = fast_range32(mix64(k_ahead.0), cap);
+                                    unsafe {
+                                        std::arch::x86_64::_mm_prefetch(
+                                            dedup_u32.as_ptr().add(nslot) as *const i8,
+                                            std::arch::x86_64::_MM_HINT_T0,
+                                        );
+                                    }
+                                }
+                                let ev = unsafe { *shard_vecs[widx].get_unchecked(ridx) };
+                                if !ev.ev_key.is_ref() {
+                                    let h = mix64(ev.ev_key.0);
+                                    let tag14_shifted = ((h >> 38) as u32) << 18;
+                                    let mut slot = fast_range32(h, cap);
+                                    loop {
+                                        let entry = unsafe { *dedup_u32.get_unchecked(slot) };
+                                        if entry == 0 {
+                                            unsafe {
+                                                *dedup_u32.get_unchecked_mut(slot) =
+                                                    tag14_shifted | (flat_base + ridx as u32 + 1);
+                                            }
+                                            break;
+                                        }
+                                        if (entry & 0xFFFC_0000) == tag14_shifted {
+                                            let prev_flat = (entry & 0x3_FFFF) - 1;
+                                            let mut pw = 0usize;
+                                            while pw + 1 < n_batches
+                                                && prev_flat >= batch_starts[pw + 1]
+                                            {
+                                                pw += 1;
+                                            }
+                                            let pr = (prev_flat - batch_starts[pw]) as usize;
+                                            if shard_vecs[pw][pr].ev_key.0 == ev.ev_key.0 {
+                                                let ev_ing =
+                                                    ev_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                                let cur_ing = ev_ingest_ts(
+                                                    &shard_vecs[pw][pr],
+                                                    window_start_sec,
+                                                    ev_worker_ext,
+                                                );
+                                                if ev_ing < cur_ing {
+                                                    shard_vecs[pw][pr] = ev;
+                                                }
+                                                shard_vecs[widx][ridx].meta = META_DEAD;
+                                                break;
+                                            }
+                                        }
+                                        slot += 1;
+                                        if slot == cap {
+                                            slot = 0;
+                                        }
+                                    }
+                                } else {
+                                    let lt = long_table.get_or_insert_with(HashTable::new);
+                                    let ev_bytes =
+                                        LongArena::resolve_in(ev_worker_arenas, ev.ev_key);
+                                    let eh = hash_bytes_fast(ev_bytes);
+                                    match lt.entry(
+                                        eh,
+                                        |&packed| {
+                                            let pw = (packed >> 26) as usize;
+                                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                                            LongArena::resolve_in(
+                                                ev_worker_arenas,
+                                                shard_vecs[pw][pr].ev_key,
+                                            ) == ev_bytes
+                                        },
+                                        |&packed| {
+                                            let pw = (packed >> 26) as usize;
+                                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                                            hash_bytes_fast(LongArena::resolve_in(
+                                                ev_worker_arenas,
+                                                shard_vecs[pw][pr].ev_key,
+                                            ))
+                                        },
+                                    ) {
+                                        hashbrown::hash_table::Entry::Occupied(occ) => {
+                                            let packed = *occ.get();
+                                            let pw = (packed >> 26) as usize;
+                                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                                            let ev_ing =
+                                                ev_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                            let cur_ing = ev_ingest_ts(
+                                                &shard_vecs[pw][pr],
+                                                window_start_sec,
+                                                ev_worker_ext,
+                                            );
+                                            if ev_ing < cur_ing {
+                                                shard_vecs[pw][pr] = ev;
+                                            }
+                                            shard_vecs[widx][ridx].meta = META_DEAD;
+                                        }
+                                        hashbrown::hash_table::Entry::Vacant(vac) => {
+                                            vac.insert(wbase | (ridx as u32));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let cap = (total * 10 / 6).max(16).next_power_of_two();
+                        let mask = cap - 1;
+                        dedup_keys.clear();
+                        dedup_keys.resize(cap, 0u64);
+                        dedup_idxs.resize(cap, 0u32);
+
+                        for widx in 0..n_batches {
+                            let batch_len = shard_vecs[widx].len();
+                            let wbase = (widx as u32) << 26;
+                            for ridx in 0..batch_len {
+                                #[cfg(target_arch = "x86_64")]
+                                if ridx + 16 < batch_len {
+                                    let k_ahead =
+                                        unsafe { shard_vecs[widx].get_unchecked(ridx + 16).ev_key };
+                                    let nslot = (mix64(k_ahead.0) as usize) & mask;
+                                    unsafe {
+                                        std::arch::x86_64::_mm_prefetch(
+                                            dedup_keys.as_ptr().add(nslot) as *const i8,
+                                            std::arch::x86_64::_MM_HINT_T0,
+                                        );
+                                    }
+                                }
+                                let ev = shard_vecs[widx][ridx];
+                                if !ev.ev_key.is_ref() {
+                                    let mut slot = (mix64(ev.ev_key.0) as usize) & mask;
+                                    loop {
+                                        let cur = dedup_keys[slot];
+                                        if cur == ev.ev_key.0 {
+                                            let packed = dedup_idxs[slot];
+                                            let pw = (packed >> 26) as usize;
+                                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                                            let ev_ing =
+                                                ev_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                            let cur_ing = ev_ingest_ts(
+                                                &shard_vecs[pw][pr],
+                                                window_start_sec,
+                                                ev_worker_ext,
+                                            );
+                                            if ev_ing < cur_ing {
+                                                shard_vecs[pw][pr] = ev;
+                                            }
+                                            shard_vecs[widx][ridx].meta = META_DEAD;
+                                            break;
+                                        }
+                                        if cur == 0 {
+                                            dedup_keys[slot] = ev.ev_key.0;
+                                            dedup_idxs[slot] = wbase | (ridx as u32);
+                                            break;
+                                        }
+                                        slot = (slot + 1) & mask;
+                                    }
+                                } else {
+                                    let lt = long_table.get_or_insert_with(HashTable::new);
+                                    let ev_bytes =
+                                        LongArena::resolve_in(ev_worker_arenas, ev.ev_key);
+                                    let eh = hash_bytes_fast(ev_bytes);
+                                    match lt.entry(
+                                        eh,
+                                        |&packed| {
+                                            let pw = (packed >> 26) as usize;
+                                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                                            LongArena::resolve_in(
+                                                ev_worker_arenas,
+                                                shard_vecs[pw][pr].ev_key,
+                                            ) == ev_bytes
+                                        },
+                                        |&packed| {
+                                            let pw = (packed >> 26) as usize;
+                                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                                            hash_bytes_fast(LongArena::resolve_in(
+                                                ev_worker_arenas,
+                                                shard_vecs[pw][pr].ev_key,
+                                            ))
+                                        },
+                                    ) {
+                                        hashbrown::hash_table::Entry::Occupied(occ) => {
+                                            let packed = *occ.get();
+                                            let pw = (packed >> 26) as usize;
+                                            let pr = (packed & ((1 << 26) - 1)) as usize;
+                                            let ev_ing =
+                                                ev_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                            let cur_ing = ev_ingest_ts(
+                                                &shard_vecs[pw][pr],
+                                                window_start_sec,
+                                                ev_worker_ext,
+                                            );
+                                            if ev_ing < cur_ing {
+                                                shard_vecs[pw][pr] = ev;
+                                            }
+                                            shard_vecs[widx][ridx].meta = META_DEAD;
+                                        }
+                                        hashbrown::hash_table::Entry::Vacant(vac) => {
+                                            vac.insert(wbase | (ridx as u32));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for batch in shard_vecs {
+                        for ev in batch {
+                            let tag = ev.meta & (3u64 << META_TAG_SHIFT);
+                            if tag < META_INVALID {
+                                let ph = hash_raw_key(ev.person_key, ev_worker_arenas);
+                                let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+                                let item = E::from_winner(&ev, window_start_ms, ev_worker_ext);
+                                swcb_push::<E, SWCB_DEDUP>(
+                                    &mut swcb,
+                                    &mut swcb_cnt,
+                                    &mut person_out,
+                                    pshard,
+                                    item,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !person_out.is_empty() {
+                    for ps in 0..P_PERSON {
+                        let cnt = swcb_cnt[ps] as usize;
+                        if cnt > 0 {
+                            let base = ps * SWCB_DEDUP;
+                            person_out[ps].extend_from_slice(&swcb[base..base + cnt]);
+                        }
+                    }
+                    *out_slot = person_out;
+                }
+            });
+        }
+    });
+
+    let mut batches: Vec<Vec<Vec<E>>> = (0..P_PERSON)
+        .map(|_| Vec::with_capacity(n_dedup_workers))
+        .collect();
+    let mut counts = vec![0usize; P_PERSON];
+    for mut wouts in dedup_worker_outs {
+        for (ps, v) in wouts.drain(..).enumerate() {
+            if !v.is_empty() {
+                counts[ps] += v.len();
+                batches[ps].push(v);
+            }
+        }
+    }
+    (batches, counts)
+}
+
 impl ClickEmit for PersonClick16 {
     #[inline(always)]
     fn set_person_key(&mut self, pk: CompactKey64) {
@@ -2103,311 +2484,34 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     let n_dedup_workers = ncpu.clamp(1, 63).min(P_DEDUP);
     let raw_p_cap = est_ev_total / (n_dedup_workers * P_PERSON);
     let est_p_cap = if raw_p_cap >= 64 { raw_p_cap + 16 } else { 0 };
-    let next_d_shard = AtomicUsize::new(0);
 
-    let mut person_event_batches_16: Vec<Vec<Vec<PersonEvent16>>> = Vec::new();
-    let mut person_event_batches_wide: Vec<Vec<Vec<PersonEventWide>>> = Vec::new();
-    let mut person_event_counts = vec![0usize; P_PERSON];
-
-    if compact_mode {
-        let mut dedup_worker_outs: Vec<Vec<Vec<PersonEvent16>>> = (0..n_dedup_workers)
-            .map(|_| (0..P_PERSON).map(|_| Vec::with_capacity(est_p_cap)).collect())
-            .collect();
-        std::thread::scope(|scope| {
-            for person_out in &mut dedup_worker_outs {
-                let slots_ref = &dedup_slots;
-                let next_ref = &next_d_shard;
-                let ext_ref = &ev_worker_ext;
-                let arenas_ref = &ev_worker_arenas;
-                scope.spawn(move || {
-                    let mut dedup_keys: Vec<u64> = Vec::new();
-                    let mut dedup_idxs: Vec<u32> = Vec::new();
-                    let mut long_table: Option<HashTable<u32>> = None;
-
-                    loop {
-                        let ds = next_ref.fetch_add(1, Ordering::Relaxed);
-                        if ds >= P_DEDUP {
-                            break;
-                        }
-                        let Some(mut shard_vecs) = slots_ref[ds].lock().unwrap().take() else {
-                            continue;
-                        };
-                        let total: usize = shard_vecs.iter().map(Vec::len).sum();
-                        if total == 0 {
-                            continue;
-                        }
-                        let cap = (total * 10 / 6).max(16).next_power_of_two();
-                        let mask = cap - 1;
-                        dedup_keys.clear();
-                        dedup_keys.resize(cap, 0u64);
-                        dedup_idxs.resize(cap, 0u32);
-                        if let Some(lt) = &mut long_table {
-                            lt.clear();
-                        }
-
-                        for widx in 0..shard_vecs.len() {
-                            let batch_len = shard_vecs[widx].len();
-                            let wbase = (widx as u32) << 26;
-                            for ridx in 0..batch_len {
-                                #[cfg(target_arch = "x86_64")]
-                                if ridx + 16 < batch_len {
-                                    let k_ahead = unsafe { shard_vecs[widx].get_unchecked(ridx + 16).ev_key };
-                                    let nslot = (mix64(k_ahead.0) as usize) & mask;
-                                    unsafe {
-                                        std::arch::x86_64::_mm_prefetch(
-                                            dedup_keys.as_ptr().add(nslot) as *const i8,
-                                            std::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    }
-                                }
-                                let ev = shard_vecs[widx][ridx];
-                                if !ev.ev_key.is_ref() {
-                                    let mut slot = (mix64(ev.ev_key.0) as usize) & mask;
-                                    loop {
-                                        let cur = dedup_keys[slot];
-                                        if cur == ev.ev_key.0 {
-                                            let packed = dedup_idxs[slot];
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            let ev_ing = ev_ingest_ts(&ev, window_start_sec, ext_ref);
-                                            let cur_ing = ev_ingest_ts(
-                                                &shard_vecs[pw][pr],
-                                                window_start_sec,
-                                                ext_ref,
-                                            );
-                                            if ev_ing < cur_ing {
-                                                shard_vecs[pw][pr] = ev;
-                                            }
-                                            shard_vecs[widx][ridx].meta = META_DEAD;
-                                            break;
-                                        }
-                                        if cur == 0 {
-                                            dedup_keys[slot] = ev.ev_key.0;
-                                            dedup_idxs[slot] = wbase | (ridx as u32);
-                                            break;
-                                        }
-                                        slot = (slot + 1) & mask;
-                                    }
-                                } else {
-                                    let lt = long_table.get_or_insert_with(HashTable::new);
-                                    let ev_bytes = LongArena::resolve_in(arenas_ref, ev.ev_key);
-                                    let eh = hash_bytes_fast(ev_bytes);
-                                    match lt.entry(
-                                        eh,
-                                        |&packed| {
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            LongArena::resolve_in(arenas_ref, shard_vecs[pw][pr].ev_key)
-                                                == ev_bytes
-                                        },
-                                        |&packed| {
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            hash_bytes_fast(LongArena::resolve_in(
-                                                arenas_ref,
-                                                shard_vecs[pw][pr].ev_key,
-                                            ))
-                                        },
-                                    ) {
-                                        hashbrown::hash_table::Entry::Occupied(occ) => {
-                                            let packed = *occ.get();
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            let ev_ing = ev_ingest_ts(&ev, window_start_sec, ext_ref);
-                                            let cur_ing = ev_ingest_ts(
-                                                &shard_vecs[pw][pr],
-                                                window_start_sec,
-                                                ext_ref,
-                                            );
-                                            if ev_ing < cur_ing {
-                                                shard_vecs[pw][pr] = ev;
-                                            }
-                                            shard_vecs[widx][ridx].meta = META_DEAD;
-                                        }
-                                        hashbrown::hash_table::Entry::Vacant(vac) => {
-                                            vac.insert(wbase | (ridx as u32));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        for batch in shard_vecs {
-                            for ev in batch {
-                                let tag = ev.meta & (3u64 << META_TAG_SHIFT);
-                                if tag < META_INVALID {
-                                    let ph = hash_raw_key(ev.person_key, arenas_ref);
-                                    let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-                                    let (ts_rel_ms, price_cat) =
-                                        ev_payload_compact(&ev, window_start_ms, ext_ref);
-                                    person_out[pshard].push(PersonEvent16 {
-                                        person_key: ev.person_key,
-                                        ts_rel_ms,
-                                        price_cat,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        person_event_batches_16 = (0..P_PERSON)
-            .map(|_| Vec::with_capacity(n_dedup_workers))
-            .collect();
-        for mut wouts in dedup_worker_outs {
-            for (ps, v) in wouts.drain(..).enumerate() {
-                if !v.is_empty() {
-                    person_event_counts[ps] += v.len();
-                    person_event_batches_16[ps].push(v);
-                }
-            }
-        }
+    let (
+        person_event_batches_16,
+        person_event_batches_wide,
+        person_event_counts,
+    ) = if compact_mode {
+        let (b, c) = run_events_dedup::<PersonEvent16>(
+            &dedup_slots,
+            &ev_worker_ext,
+            &ev_worker_arenas,
+            window_start_ms,
+            window_start_sec,
+            n_dedup_workers,
+            est_p_cap,
+        );
+        (b, Vec::new(), c)
     } else {
-        let mut dedup_worker_outs: Vec<Vec<Vec<PersonEventWide>>> = (0..n_dedup_workers)
-            .map(|_| (0..P_PERSON).map(|_| Vec::with_capacity(est_p_cap)).collect())
-            .collect();
-        std::thread::scope(|scope| {
-            for person_out in &mut dedup_worker_outs {
-                let slots_ref = &dedup_slots;
-                let next_ref = &next_d_shard;
-                let ext_ref = &ev_worker_ext;
-                let arenas_ref = &ev_worker_arenas;
-                scope.spawn(move || {
-                    let mut dedup_keys: Vec<u64> = Vec::new();
-                    let mut dedup_idxs: Vec<u32> = Vec::new();
-                    let mut long_table: Option<HashTable<u32>> = None;
-
-                    loop {
-                        let ds = next_ref.fetch_add(1, Ordering::Relaxed);
-                        if ds >= P_DEDUP {
-                            break;
-                        }
-                        let Some(mut shard_vecs) = slots_ref[ds].lock().unwrap().take() else {
-                            continue;
-                        };
-                        let total: usize = shard_vecs.iter().map(Vec::len).sum();
-                        if total == 0 {
-                            continue;
-                        }
-                        let cap = (total * 10 / 6).max(16).next_power_of_two();
-                        let mask = cap - 1;
-                        dedup_keys.clear();
-                        dedup_keys.resize(cap, 0u64);
-                        dedup_idxs.resize(cap, 0u32);
-                        if let Some(lt) = &mut long_table {
-                            lt.clear();
-                        }
-
-                        for widx in 0..shard_vecs.len() {
-                            let batch_len = shard_vecs[widx].len();
-                            let wbase = (widx as u32) << 26;
-                            for ridx in 0..batch_len {
-                                let ev = shard_vecs[widx][ridx];
-                                if !ev.ev_key.is_ref() {
-                                    let mut slot = (mix64(ev.ev_key.0) as usize) & mask;
-                                    loop {
-                                        let cur = dedup_keys[slot];
-                                        if cur == ev.ev_key.0 {
-                                            let packed = dedup_idxs[slot];
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            let ev_ing = ev_ingest_ts(&ev, window_start_sec, ext_ref);
-                                            let cur_ing = ev_ingest_ts(
-                                                &shard_vecs[pw][pr],
-                                                window_start_sec,
-                                                ext_ref,
-                                            );
-                                            if ev_ing < cur_ing {
-                                                shard_vecs[pw][pr] = ev;
-                                            }
-                                            shard_vecs[widx][ridx].meta = META_DEAD;
-                                            break;
-                                        }
-                                        if cur == 0 {
-                                            dedup_keys[slot] = ev.ev_key.0;
-                                            dedup_idxs[slot] = wbase | (ridx as u32);
-                                            break;
-                                        }
-                                        slot = (slot + 1) & mask;
-                                    }
-                                } else {
-                                    let lt = long_table.get_or_insert_with(HashTable::new);
-                                    let ev_bytes = LongArena::resolve_in(arenas_ref, ev.ev_key);
-                                    let eh = hash_bytes_fast(ev_bytes);
-                                    match lt.entry(
-                                        eh,
-                                        |&packed| {
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            LongArena::resolve_in(arenas_ref, shard_vecs[pw][pr].ev_key)
-                                                == ev_bytes
-                                        },
-                                        |&packed| {
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            hash_bytes_fast(LongArena::resolve_in(
-                                                arenas_ref,
-                                                shard_vecs[pw][pr].ev_key,
-                                            ))
-                                        },
-                                    ) {
-                                        hashbrown::hash_table::Entry::Occupied(occ) => {
-                                            let packed = *occ.get();
-                                            let pw = (packed >> 26) as usize;
-                                            let pr = (packed & ((1 << 26) - 1)) as usize;
-                                            let ev_ing = ev_ingest_ts(&ev, window_start_sec, ext_ref);
-                                            let cur_ing = ev_ingest_ts(
-                                                &shard_vecs[pw][pr],
-                                                window_start_sec,
-                                                ext_ref,
-                                            );
-                                            if ev_ing < cur_ing {
-                                                shard_vecs[pw][pr] = ev;
-                                            }
-                                            shard_vecs[widx][ridx].meta = META_DEAD;
-                                        }
-                                        hashbrown::hash_table::Entry::Vacant(vac) => {
-                                            vac.insert(wbase | (ridx as u32));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        for batch in shard_vecs {
-                            for ev in batch {
-                                let tag = ev.meta & (3u64 << META_TAG_SHIFT);
-                                if tag < META_INVALID {
-                                    let ph = hash_raw_key(ev.person_key, arenas_ref);
-                                    let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-                                    let (ts_ms, price_cents, cat_id) =
-                                        ev_payload_wide(&ev, ext_ref);
-                                    person_out[pshard].push(PersonEventWide {
-                                        person_key: ev.person_key,
-                                        ts_ms,
-                                        price_cents,
-                                        cat_id,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        person_event_batches_wide = (0..P_PERSON)
-            .map(|_| Vec::with_capacity(n_dedup_workers))
-            .collect();
-        for mut wouts in dedup_worker_outs {
-            for (ps, v) in wouts.drain(..).enumerate() {
-                if !v.is_empty() {
-                    person_event_counts[ps] += v.len();
-                    person_event_batches_wide[ps].push(v);
-                }
-            }
-        }
-    }
+        let (b, c) = run_events_dedup::<PersonEventWide>(
+            &dedup_slots,
+            &ev_worker_ext,
+            &ev_worker_arenas,
+            window_start_ms,
+            window_start_sec,
+            n_dedup_workers,
+            est_p_cap,
+        );
+        (Vec::new(), b, c)
+    };
     drop(dedup_slots);
     drop(ev_worker_ext);
     let t_events_dedup = Instant::now();
