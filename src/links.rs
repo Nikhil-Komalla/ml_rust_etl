@@ -1,6 +1,6 @@
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use rayon::prelude::*;
@@ -27,12 +27,43 @@ struct LinkSlot {
 
 struct FlatLinkShard {
     slots: Vec<LinkSlot>,
-    mask: usize,
+    cap: usize,
+}
+
+#[inline(always)]
+fn fast_range32(h: u64, cap: usize) -> usize {
+    (((h as u32 as u64).wrapping_mul(cap as u64)) >> 32) as usize
+}
+
+#[inline(always)]
+fn bloom_bits(h: u64) -> u64 {
+    (1u64 << ((h >> 12) & 63)) | (1u64 << ((h >> 18) & 63)) | (1u64 << ((h >> 24) & 63))
+}
+
+#[inline(always)]
+fn atomic_find(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Ordering::Relaxed);
+        if p == x {
+            return x;
+        }
+        let gp = parent[p as usize].load(Ordering::Relaxed);
+        if gp != p {
+            let _ = parent[x as usize].compare_exchange_weak(
+                p,
+                gp,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        x = gp;
+    }
 }
 
 pub struct LinkMap {
     bloom: Vec<u64>,
-    bloom_mask: usize,
+    bloom_shift: u32,
+    bloom_sub_mask: usize,
     shards: Vec<FlatLinkShard>,
     long_map: HashMap<Box<[u8]>, CompactKey64>,
     has_long: bool,
@@ -45,7 +76,8 @@ impl LinkMap {
     pub fn empty() -> Self {
         Self {
             bloom: Vec::new(),
-            bloom_mask: 0,
+            bloom_shift: 0,
+            bloom_sub_mask: 0,
             shards: Vec::new(),
             long_map: HashMap::new(),
             has_long: false,
@@ -55,31 +87,100 @@ impl LinkMap {
         }
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
-    pub fn resolve_inline(&self, k: CompactKey64) -> CompactKey64 {
-        debug_assert!(!k.is_ref() && k != CompactKey64::EMPTY);
-        if self.empty {
-            return k;
-        }
-        let h = mix64(k.0);
-        let w = self.bloom[((h >> 32) as usize) & self.bloom_mask];
-        let need = (1u64 << ((h >> 16) & 63)) | (1u64 << ((h >> 22) & 63));
-        if (w & need) != need {
-            return k;
-        }
+    pub fn is_empty(&self) -> bool {
+        self.empty
+    }
+
+    #[inline(always)]
+    fn bloom_idx(&self, h: u64) -> usize {
         let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
-        let shard = &self.shards[s];
-        let mut slot = (h as usize) & shard.mask;
+        (s << self.bloom_shift) | (((h >> 32) as usize) & self.bloom_sub_mask)
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn prefetch_bloom(&self, h: u64) {
+        if self.empty {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let idx = self.bloom_idx(h);
+            std::arch::x86_64::_mm_prefetch(
+                self.bloom.as_ptr().add(idx) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+    }
+
+    #[inline(always)]
+    pub fn bloom_may_contain(&self, h: u64) -> bool {
+        if self.empty {
+            return false;
+        }
+        let idx = self.bloom_idx(h);
+        let w = unsafe { *self.bloom.get_unchecked(idx) };
+        let need = bloom_bits(h);
+        (w & need) == need
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn prefetch_slot(&self, h: u64) {
+        if self.empty {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
+            let shard = self.shards.get_unchecked(s);
+            let slot = fast_range32(h, shard.cap);
+            std::arch::x86_64::_mm_prefetch(
+                shard.slots.as_ptr().add(slot) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+    }
+
+    #[inline(always)]
+    pub fn probe_inline_with_hash(&self, k: CompactKey64, h: u64) -> CompactKey64 {
+        debug_assert!(!self.empty && k.is_inline());
+        let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
+        let shard = unsafe { self.shards.get_unchecked(s) };
+        let cap = shard.cap;
+        let mut slot = fast_range32(h, cap);
         loop {
-            let cur = shard.slots[slot];
+            let cur = unsafe { *shard.slots.get_unchecked(slot) };
             if cur.key == k.0 {
                 return cur.canon;
             }
             if cur.key == 0 {
                 return k;
             }
-            slot = (slot + 1) & shard.mask;
+            slot += 1;
+            if slot == cap {
+                slot = 0;
+            }
         }
+    }
+
+    #[inline(always)]
+    pub fn resolve_inline_with_hash(&self, k: CompactKey64, h: u64) -> CompactKey64 {
+        if !self.bloom_may_contain(h) {
+            return k;
+        }
+        self.probe_inline_with_hash(k, h)
+    }
+
+    #[inline(always)]
+    pub fn resolve_inline(&self, k: CompactKey64) -> CompactKey64 {
+        debug_assert!(!k.is_ref() && k != CompactKey64::EMPTY);
+        if self.empty {
+            return k;
+        }
+        self.resolve_inline_with_hash(k, mix64(k.0))
     }
 
     #[inline(always)]
@@ -94,6 +195,15 @@ impl LinkMap {
     pub fn canon_bytes(&self, comp_id: u32) -> &[u8] {
         let (off, len) = self.canon_spans[comp_id as usize];
         &self.canon_arena[off as usize..off as usize + len as usize]
+    }
+
+    #[allow(dead_code)]
+    pub fn drop_lookup_tables(&mut self) {
+        self.bloom = Vec::new();
+        self.shards = Vec::new();
+        self.long_map = HashMap::new();
+        self.has_long = false;
+        self.empty = true;
     }
 }
 
@@ -307,110 +417,155 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     drop(build_shards);
     drop(long_build_map);
 
-    // Stage L4: iterative DSU union-to-byte-wise-smallest root.
-    let mut parent: Vec<u32> = (0..num_nodes as u32).collect();
-    #[inline(always)]
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
+    // Stage L4: parallel lock-free DSU union-to-byte-wise-smallest root.
+    let parent: Vec<AtomicU32> = (0..num_nodes as u32)
+        .into_par_iter()
+        .map(AtomicU32::new)
+        .collect();
 
-    for batch in resolved_batches {
-        for (u, v) in batch {
-            let ru = find(&mut parent, u);
-            let rv = find(&mut parent, v);
-            if ru != rv {
+    let all_nodes_ref = &all_nodes;
+    let arenas_ref = &worker_arenas;
+    resolved_batches.into_par_iter().for_each(|batch| {
+        for (u0, v0) in batch {
+            loop {
+                let u = atomic_find(&parent, u0);
+                let v = atomic_find(&parent, v0);
+                if u == v {
+                    break;
+                }
                 let ord = cmp_raw_keys(
-                    all_nodes[ru as usize],
-                    all_nodes[rv as usize],
-                    &worker_arenas,
-                    &worker_arenas,
+                    all_nodes_ref[u as usize],
+                    all_nodes_ref[v as usize],
+                    arenas_ref,
+                    arenas_ref,
                 );
-                if ord == std::cmp::Ordering::Less {
-                    parent[rv as usize] = ru;
+                let (lo, hi) = if ord == std::cmp::Ordering::Less {
+                    (u, v)
                 } else {
-                    parent[ru as usize] = rv;
+                    (v, u)
+                };
+                if parent[hi as usize]
+                    .compare_exchange_weak(hi, lo, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
                 }
             }
         }
-    }
+    });
 
-    // Flatten iteratively.
-    for i in 0..num_nodes {
-        let mut r = parent[i];
-        while parent[r as usize] != r {
-            r = parent[r as usize];
-        }
-        let mut cur = i as u32;
-        while parent[cur as usize] != r {
-            let nxt = parent[cur as usize];
-            parent[cur as usize] = r;
-            cur = nxt;
-        }
-    }
+    // Flatten into static u32 vector in parallel.
+    let flat_parent: Vec<u32> = (0..num_nodes)
+        .into_par_iter()
+        .map(|i| {
+            let mut r = parent[i].load(Ordering::Relaxed);
+            loop {
+                let p = parent[r as usize].load(Ordering::Relaxed);
+                if p == r {
+                    return r;
+                }
+                r = p;
+            }
+        })
+        .collect();
+    drop(parent);
 
-    // Build non-root-only canonical mapping (plus both root+non-roots for Tag 11 long roots).
-    let mut root_canon = vec![CompactKey64::EMPTY; num_nodes];
+    let has_long_nodes = num_inline < num_nodes;
+    let has_long_root = has_long_nodes
+        && flat_parent
+            .par_iter()
+            .any(|&r| all_nodes[r as usize].is_ref());
+
     let mut canon_arena: Vec<u8> = Vec::new();
     let mut canon_spans: Vec<(u32, u32)> = Vec::new();
-    let mut scratch = [0u8; 10];
-    for i in 0..num_nodes {
-        let r = parent[i] as usize;
-        if root_canon[r] == CompactKey64::EMPTY {
-            let r_key = all_nodes[r];
-            if !r_key.is_ref() {
-                root_canon[r] = r_key;
-            } else {
-                let cid = canon_spans.len() as u32;
-                let bytes = resolve_raw_key(r_key, &worker_arenas, &mut scratch);
-                let off = canon_arena.len() as u32;
-                canon_arena.extend_from_slice(bytes);
-                canon_spans.push((off, bytes.len() as u32));
-                root_canon[r] = CompactKey64::from_comp(cid);
+    let mut long_map: HashMap<Box<[u8]>, CompactKey64> = HashMap::new();
+    let mut node_canon: Vec<CompactKey64> = Vec::new();
+
+    if !has_long_root {
+        if has_long_nodes {
+            for i in num_inline..num_nodes {
+                let r = flat_parent[i] as usize;
+                let canon = all_nodes[r];
+                let bytes = LongArena::resolve_in(&worker_arenas, all_nodes[i]);
+                long_map.insert(bytes.to_vec().into_boxed_slice(), canon);
             }
         }
-    }
-
-    // node_canon[i] == CompactKey64::EMPTY means skip storing node i (inline root resolves to itself on miss).
-    let mut node_canon = vec![CompactKey64::EMPTY; num_nodes];
-    let mut long_map: HashMap<Box<[u8]>, CompactKey64> = HashMap::new();
-    for i in 0..num_nodes {
-        let r = parent[i] as usize;
-        let canon = root_canon[r];
-        let k = all_nodes[i];
-        if !k.is_ref() {
-            if i != r || all_nodes[r].is_ref() {
-                node_canon[i] = canon;
+    } else {
+        let mut root_canon = vec![CompactKey64::EMPTY; num_nodes];
+        let mut scratch = [0u8; 10];
+        for i in 0..num_nodes {
+            let r = flat_parent[i] as usize;
+            if root_canon[r] == CompactKey64::EMPTY {
+                let r_key = all_nodes[r];
+                if !r_key.is_ref() {
+                    root_canon[r] = r_key;
+                } else {
+                    let cid = canon_spans.len() as u32;
+                    let bytes = resolve_raw_key(r_key, &worker_arenas, &mut scratch);
+                    let off = canon_arena.len() as u32;
+                    canon_arena.extend_from_slice(bytes);
+                    canon_spans.push((off, bytes.len() as u32));
+                    root_canon[r] = CompactKey64::from_comp(cid);
+                }
             }
-        } else {
-            let bytes = LongArena::resolve_in(&worker_arenas, k);
-            long_map.insert(bytes.to_vec().into_boxed_slice(), canon);
+        }
+
+        node_canon = vec![CompactKey64::EMPTY; num_nodes];
+        for i in 0..num_nodes {
+            let r = flat_parent[i] as usize;
+            let canon = root_canon[r];
+            let k = all_nodes[i];
+            if !k.is_ref() {
+                if i != r || all_nodes[r].is_ref() {
+                    node_canon[i] = canon;
+                }
+            } else {
+                let bytes = LongArena::resolve_in(&worker_arenas, k);
+                long_map.insert(bytes.to_vec().into_boxed_slice(), canon);
+            }
         }
     }
     let has_long = !long_map.is_empty();
-
-    drop(parent);
-    drop(root_canon);
     drop(worker_arenas);
 
-    // Stage L5: parallel compact rebuild of the 32 final shards sized tightly to emitted non-root count!
-    let final_shard_results: Vec<(FlatLinkShard, usize)> = (0..LINK_SHARDS)
-        .into_par_iter()
-        .map(|s| {
+    // Stage L5: parallel compact fast_range shards + parallel L2-resident 1 MB 3-bit Bloom.
+    let total_words = (num_inline / 8)
+        .max(64)
+        .next_power_of_two()
+        .min(131_072);
+    let words_per_shard = (total_words / LINK_SHARDS).max(2);
+    let bloom_shift = words_per_shard.trailing_zeros();
+    let bloom_sub_mask = words_per_shard - 1;
+    let mut bloom = vec![0u64; LINK_SHARDS * words_per_shard];
+
+    let all_nodes_slice = &all_nodes;
+    let flat_parent_slice = &flat_parent;
+    let node_canon_slice = &node_canon;
+    let shards: Vec<FlatLinkShard> = bloom
+        .par_chunks_mut(words_per_shard)
+        .enumerate()
+        .map(|(s, bloom_slice)| {
             let lo = offsets[s];
             let hi = offsets[s + 1];
+            let canon_of = |i: usize| -> CompactKey64 {
+                if node_canon_slice.is_empty() {
+                    let r = flat_parent_slice[i] as usize;
+                    if i != r {
+                        all_nodes_slice[r]
+                    } else {
+                        CompactKey64::EMPTY
+                    }
+                } else {
+                    node_canon_slice[i]
+                }
+            };
             let mut m = 0usize;
             for i in lo..hi {
-                if node_canon[i] != CompactKey64::EMPTY {
+                if canon_of(i) != CompactKey64::EMPTY {
                     m += 1;
                 }
             }
-            let cap = (m * 10 / 6).max(2).next_power_of_two();
-            let mask = cap - 1;
+            let cap = ((m * 10 + 6) / 7).max(m + 1).max(2);
             let mut slots = vec![
                 LinkSlot {
                     key: 0,
@@ -419,41 +574,30 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
                 cap
             ];
             for i in lo..hi {
-                let canon = node_canon[i];
+                let canon = canon_of(i);
                 if canon != CompactKey64::EMPTY {
-                    let key = all_nodes[i].0;
-                    let mut pos = (mix64(key) as usize) & mask;
+                    let key = all_nodes_slice[i].0;
+                    let h = mix64(key);
+                    let widx = ((h >> 32) as usize) & bloom_sub_mask;
+                    bloom_slice[widx] |= bloom_bits(h);
+                    let mut pos = fast_range32(h, cap);
                     while slots[pos].key != 0 {
-                        pos = (pos + 1) & mask;
+                        pos += 1;
+                        if pos == cap {
+                            pos = 0;
+                        }
                     }
                     slots[pos] = LinkSlot { key, canon };
                 }
             }
-            (FlatLinkShard { slots, mask }, m)
+            FlatLinkShard { slots, cap }
         })
         .collect();
 
-    let mut shards = Vec::with_capacity(LINK_SHARDS);
-    let mut total_inline_entries = 0usize;
-    for (sh, m) in final_shard_results {
-        total_inline_entries += m;
-        shards.push(sh);
-    }
-
-    let bloom_words = (total_inline_entries * 3 / 8).max(64).next_power_of_two();
-    let bloom_mask = bloom_words - 1;
-    let mut bloom = vec![0u64; bloom_words];
-    for i in 0..num_inline {
-        if node_canon[i] != CompactKey64::EMPTY {
-            let h = mix64(all_nodes[i].0);
-            let w = ((h >> 32) as usize) & bloom_mask;
-            bloom[w] |= (1u64 << ((h >> 16) & 63)) | (1u64 << ((h >> 22) & 63));
-        }
-    }
-
     Ok(LinkMap {
         bloom,
-        bloom_mask,
+        bloom_shift,
+        bloom_sub_mask,
         shards,
         long_map,
         has_long,
@@ -505,6 +649,42 @@ mod tests {
         assert_eq!(kchain_min, kchain);
         let ku99 = CompactKey64::encode_raw_inline(b"u99").unwrap();
         assert_eq!(lm.resolve_inline(ku99), kchain);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dsu_fast_path_bloom_and_drop() {
+        let dir = std::env::temp_dir().join("ss_test_links_fast");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut content = String::from("user_id_a,user_id_b\n");
+        for i in 0..300 {
+            content.push_str(&format!("id_{i:03},id_{:03}\n", i + 1));
+        }
+        content.push_str("id_150,!minroot\n");
+        content.push_str("long_alias_12345,id_200\n");
+        let p = dir.join("part-0.csv");
+        fs::write(&p, content).unwrap();
+
+        let mut lm = build_link_map(&[p], 4).unwrap();
+        assert!(!lm.is_empty());
+        let k_min = CompactKey64::encode_raw_inline(b"!minroot").unwrap();
+        let k_300 = CompactKey64::encode_raw_inline(b"id_300").unwrap();
+        let h_300 = mix64(k_300.0);
+        lm.prefetch_bloom(h_300);
+        assert!(lm.bloom_may_contain(h_300));
+        lm.prefetch_slot(h_300);
+        assert_eq!(lm.probe_inline_with_hash(k_300, h_300), k_min);
+        assert_eq!(lm.resolve_inline(k_min), k_min);
+        assert_eq!(lm.resolve_long(b"long_alias_12345"), Some(k_min));
+
+        let k_miss = CompactKey64::encode_raw_inline(b"unseen999").unwrap();
+        assert_eq!(lm.resolve_inline(k_miss), k_miss);
+
+        lm.drop_lookup_tables();
+        assert!(lm.is_empty());
+        assert_eq!(lm.resolve_inline(k_300), k_300);
 
         let _ = fs::remove_dir_all(&dir);
     }
