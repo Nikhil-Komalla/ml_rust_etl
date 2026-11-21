@@ -2147,9 +2147,8 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     ev_fill.clear();
                     ev_fill.extend_from_slice(&ev_offsets[..num_p]);
                     grouped_events.clear();
-                    if grouped_events.capacity() < ev_total {
-                        grouped_events.reserve(ev_total - grouped_events.capacity());
-                    }
+                    grouped_events.reserve(ev_total);
+                    debug_assert!(grouped_events.capacity() >= ev_total);
                     let ev_ptr = grouped_events.as_mut_ptr();
                     let mut pid_idx = 0usize;
                     for batch in evs_batches {
@@ -2234,9 +2233,8 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                         cl_fill.clear();
                         cl_fill.extend_from_slice(&cl_offsets[..num_p]);
                         grouped_clicks.clear();
-                        if grouped_clicks.capacity() < total_matched_cl {
-                            grouped_clicks.reserve(total_matched_cl - grouped_clicks.capacity());
-                        }
+                        grouped_clicks.reserve(total_matched_cl);
+                        debug_assert!(grouped_clicks.capacity() >= total_matched_cl);
                         let cl_ptr = grouped_clicks.as_mut_ptr();
                         let mut cpid_idx = 0usize;
                         for batch in cls_batches {
