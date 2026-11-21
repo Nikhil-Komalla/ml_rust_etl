@@ -241,10 +241,7 @@ def define_macros(con: duckdb.DuckDBPyConnection) -> None:
 
         CREATE TEMP MACRO parse_f1_ms(s) AS (
             CASE
-                WHEN s IS NOT NULL
-                     AND strlen(s) = 20
-                     AND ends_with(s, 'Z')
-                     AND strftime(try_cast(substr(s, 1, 19) AS TIMESTAMP), '%Y-%m-%dT%H:%M:%SZ') = s
+                WHEN s IS NOT NULL AND strlen(s) = 20 AND ends_with(s, 'Z')
                 THEN epoch_ms(try_cast(substr(s, 1, 19) AS TIMESTAMP))
                 ELSE NULL
             END
