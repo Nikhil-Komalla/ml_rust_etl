@@ -1,0 +1,8 @@
+.venv/
+dev/
+dev-answer/
+out/
+scratch/
+__pycache__/
+*.pyc
+tests/__pycache__/
