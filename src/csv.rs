@@ -1,19 +1,13 @@
 use std::cmp::Ordering;
 use std::fs::{self, File};
-use std::hash::BuildHasher;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use hashbrown::DefaultHashBuilder;
 use memchr::{memchr, memrchr};
-use memmap2::Mmap;
 
 pub const CHUNK_BYTES: usize = 2 * 1024 * 1024;
 pub const READ_BLOCK_BYTES: usize = 256 * 1024;
-pub const MAX_MMAP_FILES: usize = 65533;
-pub const FILE_IDX_ARENA: u16 = 65533;
-pub const FILE_IDX_OVERFLOW: u16 = 65534;
 
 pub const LONG_LEN_OVERFLOW: usize = 0xF_FFFF;
 pub const LONG_LEN_MASK: u64 = 0xF_FFFF;
@@ -115,11 +109,6 @@ impl CompactKey64 {
     }
 
     #[inline(always)]
-    pub const fn tag(self) -> u64 {
-        self.0 >> 62
-    }
-
-    #[inline(always)]
     pub const fn is_comp(self) -> bool {
         (self.0 >> 62) == 0 && self.0 != 0
     }
@@ -146,21 +135,121 @@ impl CompactKey64 {
             let mut buf = [0u8; 8];
             buf[..n].copy_from_slice(s);
             let raw = u64::from_le_bytes(buf);
-            Some(Self((1u64 << 62) | ((n as u64) << 59) | raw))
-        } else if n <= 10 {
-            let mut acc = 2u64 << 62;
-            let mut i = 0usize;
-            while i < n {
-                let c = ENC6[s[i] as usize];
-                if c == 0 {
+            return Some(Self((1u64 << 62) | ((n as u64) << 59) | raw));
+        }
+        match n {
+            8 => {
+                let c0 = ENC6[s[0] as usize];
+                let c1 = ENC6[s[1] as usize];
+                let c2 = ENC6[s[2] as usize];
+                let c3 = ENC6[s[3] as usize];
+                let c4 = ENC6[s[4] as usize];
+                let c5 = ENC6[s[5] as usize];
+                let c6 = ENC6[s[6] as usize];
+                let c7 = ENC6[s[7] as usize];
+                if ((c0.wrapping_sub(1)
+                    | c1.wrapping_sub(1)
+                    | c2.wrapping_sub(1)
+                    | c3.wrapping_sub(1)
+                    | c4.wrapping_sub(1)
+                    | c5.wrapping_sub(1)
+                    | c6.wrapping_sub(1)
+                    | c7.wrapping_sub(1))
+                    & 0x80)
+                    != 0
+                {
                     return None;
                 }
-                acc |= (c as u64) << (54 - 6 * i);
-                i += 1;
+                Some(Self(
+                    (2u64 << 62)
+                        | ((c0 as u64) << 54)
+                        | ((c1 as u64) << 48)
+                        | ((c2 as u64) << 42)
+                        | ((c3 as u64) << 36)
+                        | ((c4 as u64) << 30)
+                        | ((c5 as u64) << 24)
+                        | ((c6 as u64) << 18)
+                        | ((c7 as u64) << 12),
+                ))
             }
-            Some(Self(acc))
-        } else {
-            None
+            9 => {
+                let c0 = ENC6[s[0] as usize];
+                let c1 = ENC6[s[1] as usize];
+                let c2 = ENC6[s[2] as usize];
+                let c3 = ENC6[s[3] as usize];
+                let c4 = ENC6[s[4] as usize];
+                let c5 = ENC6[s[5] as usize];
+                let c6 = ENC6[s[6] as usize];
+                let c7 = ENC6[s[7] as usize];
+                let c8 = ENC6[s[8] as usize];
+                if ((c0.wrapping_sub(1)
+                    | c1.wrapping_sub(1)
+                    | c2.wrapping_sub(1)
+                    | c3.wrapping_sub(1)
+                    | c4.wrapping_sub(1)
+                    | c5.wrapping_sub(1)
+                    | c6.wrapping_sub(1)
+                    | c7.wrapping_sub(1)
+                    | c8.wrapping_sub(1))
+                    & 0x80)
+                    != 0
+                {
+                    return None;
+                }
+                Some(Self(
+                    (2u64 << 62)
+                        | ((c0 as u64) << 54)
+                        | ((c1 as u64) << 48)
+                        | ((c2 as u64) << 42)
+                        | ((c3 as u64) << 36)
+                        | ((c4 as u64) << 30)
+                        | ((c5 as u64) << 24)
+                        | ((c6 as u64) << 18)
+                        | ((c7 as u64) << 12)
+                        | ((c8 as u64) << 6),
+                ))
+            }
+            10 => {
+                let c0 = ENC6[s[0] as usize];
+                let c1 = ENC6[s[1] as usize];
+                let c2 = ENC6[s[2] as usize];
+                let c3 = ENC6[s[3] as usize];
+                let c4 = ENC6[s[4] as usize];
+                let c5 = ENC6[s[5] as usize];
+                let c6 = ENC6[s[6] as usize];
+                let c7 = ENC6[s[7] as usize];
+                let c8 = ENC6[s[8] as usize];
+                let c9 = ENC6[s[9] as usize];
+                if ((c0.wrapping_sub(1)
+                    | c1.wrapping_sub(1)
+                    | c2.wrapping_sub(1)
+                    | c3.wrapping_sub(1)
+                    | c4.wrapping_sub(1)
+                    | c5.wrapping_sub(1)
+                    | c6.wrapping_sub(1)
+                    | c7.wrapping_sub(1)
+                    | c8.wrapping_sub(1)
+                    | c9.wrapping_sub(1))
+                    & 0x80)
+                    != 0
+                {
+                    return None;
+                }
+                Some(Self(
+                    (2u64 << 62)
+                        | ((c0 as u64) << 54)
+                        | ((c1 as u64) << 48)
+                        | ((c2 as u64) << 42)
+                        | ((c3 as u64) << 36)
+                        | ((c4 as u64) << 30)
+                        | ((c5 as u64) << 24)
+                        | ((c6 as u64) << 18)
+                        | ((c7 as u64) << 12)
+                        | ((c8 as u64) << 6)
+                        | (c9 as u64),
+                ))
+            }
+            _ => None,
         }
     }
 
@@ -253,24 +342,6 @@ pub fn resolve_raw_key<'a>(
 }
 
 #[inline(always)]
-pub fn raw_keys_equal(
-    a: CompactKey64,
-    b: CompactKey64,
-    arenas_a: &[LongArena],
-    arenas_b: &[LongArena],
-) -> bool {
-    let ar = a.is_ref();
-    let br = b.is_ref();
-    if !ar && !br {
-        a.0 == b.0
-    } else if ar != br {
-        false
-    } else {
-        LongArena::resolve_in(arenas_a, a) == LongArena::resolve_in(arenas_b, b)
-    }
-}
-
-#[inline(always)]
 pub fn cmp_raw_keys(
     a: CompactKey64,
     b: CompactKey64,
@@ -315,26 +386,23 @@ fn emit_line_if_valid<const K: usize>(
     }
     let mut fields: [&[u8]; K] = [&[]; K];
     let mut prev = line_start;
+    let mut expected_quotes = 0u32;
     let mut i = 0usize;
-    while i < K - 1 {
-        let c = commas[i];
-        fields[i] = &data[prev..c];
-        prev = c + 1;
+    while i < K {
+        let end = if i < K - 1 { commas[i] } else { line_end };
+        let len = end - prev;
+        let is_q = if len >= 2 {
+            usize::from((data[prev] == b'"') & (data[end - 1] == b'"'))
+        } else {
+            0
+        };
+        fields[i] = &data[prev + is_q..end - is_q];
+        expected_quotes += (is_q as u32) << 1;
+        prev = end + 1;
         i += 1;
     }
-    fields[K - 1] = &data[prev..line_end];
-
-    if total_quotes != 0 {
-        let mut expected_quotes = 0u32;
-        for slot in &mut fields {
-            if slot.len() >= 2 && slot[0] == b'"' && slot[slot.len() - 1] == b'"' {
-                *slot = &slot[1..slot.len() - 1];
-                expected_quotes += 2;
-            }
-        }
-        if expected_quotes != total_quotes {
-            return;
-        }
+    if expected_quotes != total_quotes {
+        return;
     }
     f(fields);
 }
@@ -594,17 +662,50 @@ pub fn for_each_line_fields_slice<const K: usize>(slice: &[u8], mut f: impl FnMu
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
 pub fn for_each_line_fields_slice<const K: usize>(slice: &[u8], mut f: impl FnMut([&[u8]; K])) {
+    #[inline(always)]
+    fn parse_line_scalar<const K: usize>(line: &[u8]) -> Option<[&[u8]; K]> {
+        if line.is_empty() || (!line.is_ascii() && std::str::from_utf8(line).is_err()) {
+            return None;
+        }
+        let mut out: [&[u8]; K] = [&[]; K];
+        let mut pos = 0usize;
+        for slot in out.iter_mut().take(K - 1) {
+            let c = memchr(b',', &line[pos..])?;
+            *slot = &line[pos..pos + c];
+            pos += c + 1;
+        }
+        let last = &line[pos..];
+        if memchr(b',', last).is_some() {
+            return None;
+        }
+        out[K - 1] = last;
+        if memchr(b'"', line).is_some() {
+            for slot in &mut out {
+                if memchr(b'"', slot).is_some() {
+                    if slot.len() >= 2 && slot[0] == b'"' && slot[slot.len() - 1] == b'"' {
+                        let inner = &slot[1..slot.len() - 1];
+                        if memchr(b'"', inner).is_some() {
+                            return None;
+                        }
+                        *slot = inner;
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
     let mut start = 0usize;
     for nl in memchr::memchr_iter(b'\n', slice) {
-        let line = &slice[start..nl];
-        start = nl + 1;
-        if let Some(fields) = parse_csv_line::<K>(line) {
+        if let Some(fields) = parse_line_scalar::<K>(&slice[start..nl]) {
             f(fields);
         }
+        start = nl + 1;
     }
     if start < slice.len() {
-        let line = &slice[start..];
-        if let Some(fields) = parse_csv_line::<K>(line) {
+        if let Some(fields) = parse_line_scalar::<K>(&slice[start..]) {
             f(fields);
         }
     }
@@ -717,45 +818,10 @@ impl CsvSource {
         let mut offset = task.start as u64;
         let mut carry = 0usize;
 
-        if task.skip_header {
-            let mut found = false;
-            while offset < task.end as u64 {
-                let to_read = READ_BLOCK_BYTES.min(task.end - offset as usize);
-                if buf.len() < to_read + 32 {
-                    buf.resize(to_read + 32, 0);
-                }
-                let n = read_at_full(file, &mut buf[..to_read], offset)?;
-                if n == 0 {
-                    break;
-                }
-                offset += n as u64;
-                if let Some(nl) = memchr(b'\n', &buf[..n]) {
-                    let rem = n - (nl + 1);
-                    buf.copy_within(nl + 1..n, 0);
-                    carry = rem;
-                    found = true;
-                    break;
-                }
+        if task.skip_header || task.align_start {
+            if task.align_start {
+                offset = (task.start as u64) - 1;
             }
-            if !found {
-                // Header spanned past task.end: only possible if a header line straddles chunk boundary!
-                if (task.end as u64) < file_len as u64 {
-                    let mut tmp = [0u8; 4096];
-                    while offset < file_len as u64 {
-                        let n = read_at_full(file, &mut tmp, offset)?;
-                        if n == 0 {
-                            break;
-                        }
-                        offset += n as u64;
-                        if memchr(b'\n', &tmp[..n]).is_some() {
-                            break;
-                        }
-                    }
-                }
-                return Ok(());
-            }
-        } else if task.align_start {
-            offset = (task.start as u64) - 1;
             let mut found = false;
             while offset < task.end as u64 {
                 let to_read = READ_BLOCK_BYTES.min(task.end - offset as usize);
@@ -806,7 +872,7 @@ impl CsvSource {
         }
 
         if carry > 0 {
-            if (task.end) < file_len {
+            if task.end < file_len {
                 let mut pos = task.end as u64;
                 let mut line_len = carry;
                 loop {
@@ -843,264 +909,6 @@ impl CsvSource {
     }
 }
 
-// ===== Legacy compatibility definitions (removed in Step 4 after pipeline/links migrate) =====
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct SliceRef {
-    pub file_idx: u16,
-    pub len: u16,
-    pub off: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<SliceRef>() == 8);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct InlineKey16 {
-    pub bytes: [u8; 16],
-}
-
-const _: () = assert!(std::mem::size_of::<InlineKey16>() == 16);
-
-impl InlineKey16 {
-    #[inline(always)]
-    pub const fn zero() -> Self {
-        Self { bytes: [0u8; 16] }
-    }
-
-    #[inline(always)]
-    pub fn from_inline(s: &[u8]) -> Self {
-        debug_assert!(s.len() <= 15);
-        let mut bytes = [0u8; 16];
-        let n = s.len();
-        bytes[..n].copy_from_slice(s);
-        bytes[15] = n as u8;
-        Self { bytes }
-    }
-
-    #[inline(always)]
-    pub fn from_ref(r: SliceRef) -> Self {
-        let mut bytes = [0u8; 16];
-        let fi = r.file_idx.to_le_bytes();
-        let ln = r.len.to_le_bytes();
-        let of = r.off.to_le_bytes();
-        bytes[0] = fi[0];
-        bytes[1] = fi[1];
-        bytes[2] = ln[0];
-        bytes[3] = ln[1];
-        bytes[4] = of[0];
-        bytes[5] = of[1];
-        bytes[6] = of[2];
-        bytes[7] = of[3];
-        bytes[15] = 0xFF;
-        Self { bytes }
-    }
-
-    #[inline(always)]
-    pub fn is_inline(&self) -> bool {
-        self.bytes[15] < 16
-    }
-
-    #[inline(always)]
-    pub fn inline_slice(&self) -> &[u8] {
-        &self.bytes[..self.bytes[15] as usize]
-    }
-
-    #[inline(always)]
-    pub fn slice_ref(&self) -> SliceRef {
-        SliceRef {
-            file_idx: u16::from_le_bytes([self.bytes[0], self.bytes[1]]),
-            len: u16::from_le_bytes([self.bytes[2], self.bytes[3]]),
-            off: u32::from_le_bytes([self.bytes[4], self.bytes[5], self.bytes[6], self.bytes[7]]),
-        }
-    }
-
-    #[inline(always)]
-    pub fn hash_inline(&self) -> u64 {
-        let lo = u64::from_le_bytes([
-            self.bytes[0],
-            self.bytes[1],
-            self.bytes[2],
-            self.bytes[3],
-            self.bytes[4],
-            self.bytes[5],
-            self.bytes[6],
-            self.bytes[7],
-        ]);
-        let hi = u64::from_le_bytes([
-            self.bytes[8],
-            self.bytes[9],
-            self.bytes[10],
-            self.bytes[11],
-            self.bytes[12],
-            self.bytes[13],
-            self.bytes[14],
-            self.bytes[15],
-        ]);
-        let a = lo ^ 0xA076_1D64_78BD_642F;
-        let b = hi ^ 0xE703_7ED1_A0B4_28DB;
-        let prod = (a as u128).wrapping_mul(b as u128);
-        let mut x = (prod as u64) ^ ((prod >> 64) as u64);
-        x ^= x >> 30;
-        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        x ^= x >> 27;
-        x.wrapping_mul(0x94D0_49BB_1331_11EB)
-    }
-}
-
-#[inline(always)]
-pub fn fast_hash_bytes(b: &[u8], fallback: &DefaultHashBuilder) -> u64 {
-    if b.len() <= 15 {
-        InlineKey16::from_inline(b).hash_inline()
-    } else {
-        fallback.hash_one(b)
-    }
-}
-
-enum FileBacking {
-    Mmap(Mmap),
-    Bytes(Vec<u8>),
-}
-
-impl FileBacking {
-    #[inline(always)]
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            FileBacking::Mmap(m) => m.as_ref(),
-            FileBacking::Bytes(v) => v.as_slice(),
-        }
-    }
-}
-
-pub struct FileSet {
-    files: Vec<FileBacking>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct CsvChunk {
-    pub file_idx: usize,
-    pub start: usize,
-    pub end: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct OverflowSpan {
-    pub file_idx: usize,
-    pub off: usize,
-    pub len: usize,
-}
-
-impl FileSet {
-    pub fn open(paths: &[PathBuf]) -> io::Result<Self> {
-        let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
-            let file = File::open(path)?;
-            let meta_len = file.metadata()?.len();
-            if meta_len == 0 {
-                files.push(FileBacking::Bytes(Vec::new()));
-                continue;
-            }
-            // SAFETY: Input files under DATA_DIR are mounted read-only and never mutated during execution.
-            match unsafe { Mmap::map(&file) } {
-                Ok(mmap) => files.push(FileBacking::Mmap(mmap)),
-                Err(_) => files.push(FileBacking::Bytes(fs::read(path)?)),
-            }
-        }
-        Ok(Self { files })
-    }
-
-    #[inline(always)]
-    pub fn file_bytes(&self, file_idx: usize) -> &[u8] {
-        self.files[file_idx].as_bytes()
-    }
-
-    #[inline(always)]
-    pub fn slice_ptr_range(&self, file_idx: usize, slice: &[u8]) -> usize {
-        let base = self.file_bytes(file_idx).as_ptr() as usize;
-        slice.as_ptr() as usize - base
-    }
-
-    #[inline(always)]
-    pub fn make_ref(
-        &self,
-        file_idx: usize,
-        slice: &[u8],
-        local_overflow: &mut Vec<OverflowSpan>,
-        worker_id: usize,
-    ) -> SliceRef {
-        let off = self.slice_ptr_range(file_idx, slice);
-        let len = slice.len();
-        if file_idx < MAX_MMAP_FILES && off <= u32::MAX as usize && len <= u16::MAX as usize {
-            SliceRef {
-                file_idx: file_idx as u16,
-                len: len as u16,
-                off: off as u32,
-            }
-        } else {
-            let idx = local_overflow.len();
-            debug_assert!(worker_id < 64 && idx < (1 << 26));
-            local_overflow.push(OverflowSpan { file_idx, off, len });
-            SliceRef {
-                file_idx: FILE_IDX_OVERFLOW,
-                len: 0,
-                off: ((worker_id as u32) << 26) | (idx as u32),
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn resolve<'a>(
-        &'a self,
-        r: SliceRef,
-        arena: &'a [u8],
-        overflow_by_worker: &'a [Vec<OverflowSpan>],
-    ) -> &'a [u8] {
-        if r.file_idx < FILE_IDX_ARENA {
-            let b = self.files[r.file_idx as usize].as_bytes();
-            let off = r.off as usize;
-            &b[off..off + r.len as usize]
-        } else if r.file_idx == FILE_IDX_ARENA {
-            let off = r.off as usize;
-            &arena[off..off + r.len as usize]
-        } else {
-            let worker = (r.off >> 26) as usize;
-            let idx = (r.off & ((1 << 26) - 1)) as usize;
-            let span = overflow_by_worker[worker][idx];
-            &self.files[span.file_idx].as_bytes()[span.off..span.off + span.len]
-        }
-    }
-
-    pub fn chunks(&self, chunk_bytes: usize) -> Vec<CsvChunk> {
-        let mut out = Vec::new();
-        for (file_idx, backing) in self.files.iter().enumerate() {
-            let data = backing.as_bytes();
-            let Some(hdr_end) = memchr(b'\n', data) else {
-                continue;
-            };
-            let mut pos = hdr_end + 1;
-            while pos < data.len() {
-                let mut end = pos.saturating_add(chunk_bytes).min(data.len());
-                if end < data.len() {
-                    end = match memchr(b'\n', &data[end..]) {
-                        Some(nl) => end + nl + 1,
-                        None => data.len(),
-                    };
-                }
-                if pos < end {
-                    out.push(CsvChunk {
-                        file_idx,
-                        start: pos,
-                        end,
-                    });
-                }
-                pos = end;
-            }
-        }
-        out
-    }
-}
-
 pub fn list_csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -1115,71 +923,6 @@ pub fn list_csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
-}
-
-#[inline(always)]
-pub fn unquote_field(f: &[u8]) -> Option<&[u8]> {
-    if f.is_empty() {
-        return Some(b"");
-    }
-    if f[0] == b'"' {
-        if f.len() < 2 || f[f.len() - 1] != b'"' {
-            return None;
-        }
-        let inner = &f[1..f.len() - 1];
-        if memchr(b'"', inner).is_some() {
-            return None;
-        }
-        Some(inner)
-    } else if memchr(b'"', f).is_some() {
-        None
-    } else {
-        Some(f)
-    }
-}
-
-#[inline(always)]
-pub fn parse_csv_line<const K: usize>(line: &[u8]) -> Option<[&[u8]; K]> {
-    if line.is_empty() {
-        return None;
-    }
-    let has_quote = memchr(b'"', line).is_some();
-    let mut out: [&[u8]; K] = [&[]; K];
-    let mut pos = 0usize;
-    if !has_quote {
-        for slot in out.iter_mut().take(K - 1) {
-            let c = memchr(b',', &line[pos..])?;
-            *slot = &line[pos..pos + c];
-            pos += c + 1;
-        }
-        let last = &line[pos..];
-        if memchr(b',', last).is_some() {
-            return None;
-        }
-        out[K - 1] = last;
-    } else {
-        for slot in out.iter_mut().take(K - 1) {
-            let c = memchr(b',', &line[pos..])?;
-            *slot = unquote_field(&line[pos..pos + c])?;
-            pos += c + 1;
-        }
-        let last = &line[pos..];
-        if memchr(b',', last).is_some() {
-            return None;
-        }
-        out[K - 1] = unquote_field(last)?;
-    }
-    Some(out)
-}
-
-#[inline(always)]
-pub fn for_each_line_fields<const K: usize>(chunk: &[u8], f: impl FnMut([&[u8]; K])) {
-    for_each_line_fields_slice::<K>(chunk, f);
-}
-
-#[inline(always)]
-pub fn is_valid_utf8(b: &[u8]) -> bool {
-    b.is_ascii() || std::str::from_utf8(b).is_ok()
 }
 
 #[cfg(test)]
@@ -1240,28 +983,31 @@ mod tests {
                 data.push(b'\n');
             }
         }
-        let mut scalar_rows = Vec::new();
-        for line in data.split(|&b| b == b'\n') {
-            if is_valid_utf8(line) {
-                if let Some(f) = parse_csv_line::<2>(line) {
-                    scalar_rows.push((f[0].to_vec(), f[1].to_vec()));
-                }
-            }
-        }
-        let mut simd_rows = Vec::new();
-        for_each_line_fields_slice::<2>(&data, |f| {
-            simd_rows.push((f[0].to_vec(), f[1].to_vec()));
-        });
-        assert_eq!(simd_rows, scalar_rows);
-
-        // Also test padded buffer across every boundary offset
         let mut padded = data.clone();
         padded.resize(data.len() + 32, 0);
         let mut padded_rows = Vec::new();
         for_each_line_fields_padded::<2>(&padded, data.len(), |f| {
             padded_rows.push((f[0].to_vec(), f[1].to_vec()));
         });
-        assert_eq!(padded_rows, scalar_rows);
+        let mut slice_rows = Vec::new();
+        for_each_line_fields_slice::<2>(&data, |f| {
+            slice_rows.push((f[0].to_vec(), f[1].to_vec()));
+        });
+        assert_eq!(padded_rows, slice_rows);
+        assert_eq!(
+            slice_rows,
+            vec![
+                (b"a".to_vec(), b"b".to_vec()),
+                (b"a".to_vec(), b"b".to_vec()),
+                (b"".to_vec(), b"".to_vec()),
+                (b"a\r".to_vec(), b"b\r".to_vec()),
+                (b" u1 ".to_vec(), b"p\xc3\xa9".to_vec()),
+                (
+                    b"1234567890123456789012345678901234567890".to_vec(),
+                    b"z".to_vec()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1307,13 +1053,11 @@ mod tests {
     #[test]
     fn test_compact_key64_tags_order_and_arena() {
         let mut arena = LongArena::default();
-        // Comp ID 0 never produces 0
         let c0 = CompactKey64::from_comp(0);
         assert_ne!(c0, CompactKey64::EMPTY);
         assert!(c0.is_comp());
         assert_eq!(c0.comp_id(), 0);
 
-        // Tag 01: len <= 7, distinct with trailing NUL
         let k_empty = CompactKey64::encode_raw_inline(b"").unwrap();
         let k_u = CompactKey64::encode_raw_inline(b"u").unwrap();
         let k_unul = CompactKey64::encode_raw_inline(b"u\x00").unwrap();
@@ -1326,7 +1070,6 @@ mod tests {
         let nunul = k_unul.decode_inline(&mut buf);
         assert_eq!(&buf[..nunul], b"u\x00");
 
-        // Tag 10: 8..=10 [0-9A-Z_a-z], strict ASCII lexicographic ordering!
         let ordered = [
             b"00000000".as_slice(),
             b"000000000",
@@ -1351,7 +1094,6 @@ mod tests {
             assert!(w[0].0 < w[1].0, "order failed for {:?} vs {:?}", w[0], w[1]);
         }
 
-        // 8..=10 with special char falls back to Tag 11
         assert!(CompactKey64::encode_raw_inline(b"!chain_min").is_none());
         let k_special = CompactKey64::encode_raw(b"!chain_min", 0, &mut arena);
         assert!(k_special.is_ref());
@@ -1362,24 +1104,5 @@ mod tests {
             cmp_raw_keys(k_special, k_long, &arenas, &arenas),
             Ordering::Less
         );
-    }
-
-    #[test]
-    fn test_inline_key16_and_fast_hash() {
-        let hb = DefaultHashBuilder::default();
-        for s in [
-            b"".as_slice(),
-            b"u1",
-            b"123456789012345",
-            b"u\x00with_nul",
-        ] {
-            let k = InlineKey16::from_inline(s);
-            assert!(k.is_inline());
-            assert_eq!(k.inline_slice(), s);
-            assert_eq!(k.hash_inline(), fast_hash_bytes(s, &hb));
-        }
-        let k1 = InlineKey16::from_inline(b"u\x00");
-        let k2 = InlineKey16::from_inline(b"u");
-        assert_ne!(k1, k2);
     }
 }

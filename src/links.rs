@@ -2,274 +2,312 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hashbrown::{DefaultHashBuilder, HashTable};
+use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::csv::{
-    fast_hash_bytes, for_each_line_fields, is_valid_utf8, FileSet, OverflowSpan, SliceRef,
-    CHUNK_BYTES, FILE_IDX_ARENA, FILE_IDX_OVERFLOW,
+    cmp_raw_keys, mix64, resolve_raw_key, CompactKey64, CsvSource, LongArena, CHUNK_BYTES,
 };
 
 const LINK_SHARDS: usize = 32;
 
 #[derive(Clone, Copy)]
-struct RawEdge {
-    a: SliceRef,
-    b: SliceRef,
-    ha: u64,
-    hb: u64,
+#[repr(C)]
+struct BuildSlot {
+    key: u64,
+    val: u32,
 }
 
 #[derive(Clone, Copy)]
-pub struct LinkEntry {
-    raw_off: u32,
-    raw_len: u16,
-    canon_len: u16,
-    canon_off: u32,
-    raw_hash: u64,
-    canon_hash: u64,
+#[repr(C)]
+struct LinkSlot {
+    key: u64,
+    canon: CompactKey64,
 }
 
-#[derive(Clone)]
-struct ShardNode {
-    sref: SliceRef,
-    hash: u64,
+struct FlatLinkShard {
+    slots: Vec<LinkSlot>,
+    mask: usize,
 }
 
 pub struct LinkMap {
-    shards: Vec<HashTable<LinkEntry>>,
-    raw_arena: Vec<u8>,
-    pub canon_arena: Vec<u8>,
-    overflow_raw: Vec<Box<[u8]>>,
-    overflow_canon: Vec<Box<[u8]>>,
+    bloom: Vec<u64>,
+    bloom_mask: usize,
+    shards: Vec<FlatLinkShard>,
+    long_map: HashMap<Box<[u8]>, CompactKey64>,
+    has_long: bool,
+    canon_arena: Vec<u8>,
+    canon_spans: Vec<(u32, u32)>,
     empty: bool,
 }
 
 impl LinkMap {
     pub fn empty() -> Self {
         Self {
+            bloom: Vec::new(),
+            bloom_mask: 0,
             shards: Vec::new(),
-            raw_arena: Vec::new(),
+            long_map: HashMap::new(),
+            has_long: false,
             canon_arena: Vec::new(),
-            overflow_raw: Vec::new(),
-            overflow_canon: Vec::new(),
+            canon_spans: Vec::new(),
             empty: true,
         }
     }
 
     #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.empty
-    }
-
-    #[inline(always)]
-    fn entry_raw<'a>(&'a self, e: &LinkEntry) -> &'a [u8] {
-        if e.raw_len != u16::MAX {
-            let off = e.raw_off as usize;
-            &self.raw_arena[off..off + e.raw_len as usize]
-        } else {
-            &self.overflow_raw[e.raw_off as usize]
-        }
-    }
-
-    #[inline(always)]
-    fn entry_canon_ref(&self, e: &LinkEntry) -> SliceRef {
-        if e.canon_len != u16::MAX {
-            SliceRef {
-                file_idx: FILE_IDX_ARENA,
-                len: e.canon_len,
-                off: e.canon_off,
-            }
-        } else {
-            SliceRef {
-                file_idx: FILE_IDX_OVERFLOW,
-                len: 0,
-                off: e.canon_off,
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn resolve(&self, raw: &[u8], raw_hash: u64) -> Option<(SliceRef, u64)> {
+    pub fn resolve_inline(&self, k: CompactKey64) -> CompactKey64 {
+        debug_assert!(!k.is_ref() && k != CompactKey64::EMPTY);
         if self.empty {
+            return k;
+        }
+        let h = mix64(k.0);
+        let w = self.bloom[((h >> 32) as usize) & self.bloom_mask];
+        let need = (1u64 << ((h >> 16) & 63)) | (1u64 << ((h >> 22) & 63));
+        if (w & need) != need {
+            return k;
+        }
+        let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
+        let shard = &self.shards[s];
+        let mut slot = (h as usize) & shard.mask;
+        loop {
+            let cur = shard.slots[slot];
+            if cur.key == k.0 {
+                return cur.canon;
+            }
+            if cur.key == 0 {
+                return k;
+            }
+            slot = (slot + 1) & shard.mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn resolve_long(&self, bytes: &[u8]) -> Option<CompactKey64> {
+        if !self.has_long {
             return None;
         }
-        let shard = ((raw_hash >> 28) as usize) & (LINK_SHARDS - 1);
-        self.shards[shard]
-            .find(raw_hash, |e| self.entry_raw(e) == raw)
-            .map(|e| (self.entry_canon_ref(e), e.canon_hash))
+        self.long_map.get(bytes).copied()
     }
 
     #[inline(always)]
-    pub fn canon_overflow_slice(&self, idx: u32) -> &[u8] {
-        &self.overflow_canon[idx as usize]
+    pub fn canon_bytes(&self, comp_id: u32) -> &[u8] {
+        let (off, len) = self.canon_spans[comp_id as usize];
+        &self.canon_arena[off as usize..off as usize + len as usize]
     }
 }
 
-pub fn build_link_map(
-    paths: &[PathBuf],
-    hash_builder: &DefaultHashBuilder,
-    ncpu: usize,
-) -> io::Result<LinkMap> {
+pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     if paths.is_empty() {
         return Ok(LinkMap::empty());
     }
-    let files = FileSet::open(paths)?;
-    let chunks = files.chunks(CHUNK_BYTES);
+    let src = CsvSource::open(paths)?;
+    let chunks = src.chunks(CHUNK_BYTES);
     if chunks.is_empty() {
         return Ok(LinkMap::empty());
     }
 
-    // Stage L1: parse valid link edges in parallel using ncpu workers (no locks).
+    // Stage L1: parallel CsvSource parse into per-worker edge lists and sharded inline endpoints.
     let next_chunk = AtomicUsize::new(0);
-    let nworkers = ncpu.clamp(1, 64).min(chunks.len());
-    let mut worker_edges: Vec<Vec<RawEdge>> = (0..nworkers).map(|_| Vec::new()).collect();
-    let mut worker_overflow: Vec<Vec<OverflowSpan>> = (0..nworkers).map(|_| Vec::new()).collect();
+    let nworkers = ncpu.clamp(1, 63).min(chunks.len());
+    let mut worker_edges: Vec<Vec<(CompactKey64, CompactKey64)>> =
+        (0..nworkers).map(|_| Vec::new()).collect();
+    let mut worker_inline_buckets: Vec<Vec<Vec<CompactKey64>>> = (0..nworkers)
+        .map(|_| (0..LINK_SHARDS).map(|_| Vec::new()).collect())
+        .collect();
+    let mut worker_long_endpoints: Vec<Vec<CompactKey64>> =
+        (0..nworkers).map(|_| Vec::new()).collect();
+    let mut worker_arenas: Vec<LongArena> = (0..nworkers).map(|_| LongArena::default()).collect();
+    let mut worker_errs: Vec<Option<io::Error>> = (0..nworkers).map(|_| None).collect();
 
     std::thread::scope(|scope| {
-        for (wid, (edges_out, ov_out)) in worker_edges
+        for (wid, ((((edges_out, buckets_out), long_out), arena_out), err_out)) in worker_edges
             .iter_mut()
-            .zip(worker_overflow.iter_mut())
+            .zip(worker_inline_buckets.iter_mut())
+            .zip(worker_long_endpoints.iter_mut())
+            .zip(worker_arenas.iter_mut())
+            .zip(worker_errs.iter_mut())
             .enumerate()
         {
-            let files_ref = &files;
+            let src_ref = &src;
             let chunks_ref = &chunks;
             let next_ref = &next_chunk;
             scope.spawn(move || {
+                let mut buf = Vec::new();
                 loop {
                     let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks_ref.get(cidx) else {
+                    let Some(&task) = chunks_ref.get(cidx) else {
                         break;
                     };
-                    let slice = &files_ref.file_bytes(chunk.file_idx)[chunk.start..chunk.end];
-                    for_each_line_fields::<2>(slice, |[a, b]| {
+                    if let Err(e) = src_ref.for_each_chunk_line::<2>(task, &mut buf, |[a, b]| {
                         if a.is_empty() || b.is_empty() || a == b {
                             return;
                         }
-                        if !is_valid_utf8(a) || !is_valid_utf8(b) {
-                            return;
+                        let ka = CompactKey64::encode_raw(a, wid, arena_out);
+                        let kb = CompactKey64::encode_raw(b, wid, arena_out);
+                        edges_out.push((ka, kb));
+                        if !ka.is_ref() {
+                            let s = ((mix64(ka.0) >> 52) as usize) & (LINK_SHARDS - 1);
+                            buckets_out[s].push(ka);
+                        } else {
+                            long_out.push(ka);
                         }
-                        let ra = files_ref.make_ref(chunk.file_idx, a, ov_out, wid);
-                        let rb = files_ref.make_ref(chunk.file_idx, b, ov_out, wid);
-                        let ha = fast_hash_bytes(a, hash_builder);
-                        let hb = fast_hash_bytes(b, hash_builder);
-                        edges_out.push(RawEdge {
-                            a: ra,
-                            b: rb,
-                            ha,
-                            hb,
-                        });
-                    });
+                        if !kb.is_ref() {
+                            let s = ((mix64(kb.0) >> 52) as usize) & (LINK_SHARDS - 1);
+                            buckets_out[s].push(kb);
+                        } else {
+                            long_out.push(kb);
+                        }
+                    }) {
+                        *err_out = Some(e);
+                        break;
+                    }
                 }
             });
         }
     });
+
+    for e in worker_errs.into_iter().flatten() {
+        return Err(e);
+    }
 
     let total_edges: usize = worker_edges.iter().map(Vec::len).sum();
     if total_edges == 0 {
         return Ok(LinkMap::empty());
     }
 
-    // Stage L2: shard-parallel interning of distinct endpoints into local dense node IDs.
-    let shard_results: Vec<(Vec<ShardNode>, HashTable<u32>)> = (0..LINK_SHARDS)
+    // Transpose [worker][shard] -> [shard][worker] without copying elements.
+    let mut shard_inputs: Vec<Vec<Vec<CompactKey64>>> = (0..LINK_SHARDS)
+        .map(|_| Vec::with_capacity(nworkers))
+        .collect();
+    for mut w_buckets in worker_inline_buckets {
+        for (s, v) in w_buckets.drain(..).enumerate() {
+            if !v.is_empty() {
+                shard_inputs[s].push(v);
+            }
+        }
+    }
+
+    // Stage L2: shard-parallel interning with tight dynamic capacity (avoids huge 2*total buffers).
+    let shard_results: Vec<(Vec<BuildSlot>, usize, Vec<CompactKey64>)> = shard_inputs
         .into_par_iter()
-        .map(|s| {
-            let mut nodes: Vec<ShardNode> = Vec::new();
-            let mut table: HashTable<u32> = HashTable::new();
-            let mask = (LINK_SHARDS - 1) as u64;
-            let files_ref = &files;
-            let ov_ref = &worker_overflow;
-            for edges in &worker_edges {
-                for e in edges {
-                    if (((e.ha >> 28) as usize) & mask as usize) == s {
-                        let bytes = files_ref.resolve(e.a, &[], ov_ref);
-                        if table
-                            .find(e.ha, |&idx| {
-                                files_ref.resolve(nodes[idx as usize].sref, &[], ov_ref) == bytes
-                            })
-                            .is_none()
-                        {
-                            let idx = nodes.len() as u32;
-                            nodes.push(ShardNode {
-                                sref: e.a,
-                                hash: e.ha,
-                            });
-                            table.insert_unique(e.ha, idx, |&i| nodes[i as usize].hash);
+        .map(|batches| {
+            let total: usize = batches.iter().map(Vec::len).sum();
+            let mut cap = (total / 2).max(8).next_power_of_two();
+            let mut mask = cap - 1;
+            let mut slots = vec![BuildSlot { key: 0, val: 0 }; cap];
+            let mut nodes = Vec::with_capacity((total / 3).max(16));
+            for batch in batches {
+                for k in batch {
+                    if (nodes.len() + 1) * 10 >= cap * 6 {
+                        let new_cap = cap * 2;
+                        let new_mask = new_cap - 1;
+                        let mut new_slots = vec![BuildSlot { key: 0, val: 0 }; new_cap];
+                        for s in &slots {
+                            if s.key != 0 {
+                                let mut p = (mix64(s.key) as usize) & new_mask;
+                                while new_slots[p].key != 0 {
+                                    p = (p + 1) & new_mask;
+                                }
+                                new_slots[p] = *s;
+                            }
                         }
+                        slots = new_slots;
+                        cap = new_cap;
+                        mask = new_mask;
                     }
-                    if (((e.hb >> 28) as usize) & mask as usize) == s {
-                        let bytes = files_ref.resolve(e.b, &[], ov_ref);
-                        if table
-                            .find(e.hb, |&idx| {
-                                files_ref.resolve(nodes[idx as usize].sref, &[], ov_ref) == bytes
-                            })
-                            .is_none()
-                        {
-                            let idx = nodes.len() as u32;
-                            nodes.push(ShardNode {
-                                sref: e.b,
-                                hash: e.hb,
-                            });
-                            table.insert_unique(e.hb, idx, |&i| nodes[i as usize].hash);
+                    let h = mix64(k.0);
+                    let mut slot = (h as usize) & mask;
+                    loop {
+                        let cur = slots[slot];
+                        if cur.key == k.0 {
+                            break;
                         }
+                        if cur.key == 0 {
+                            let idx = nodes.len() as u32;
+                            nodes.push(k);
+                            slots[slot] = BuildSlot {
+                                key: k.0,
+                                val: idx,
+                            };
+                            break;
+                        }
+                        slot = (slot + 1) & mask;
                     }
                 }
             }
-            (nodes, table)
+            (slots, mask, nodes)
         })
         .collect();
 
-    let mut offsets = [0u32; LINK_SHARDS];
-    let mut num_nodes = 0usize;
+    let mut offsets = [0usize; LINK_SHARDS + 1];
+    let mut num_inline = 0usize;
+    let mut build_shards = Vec::with_capacity(LINK_SHARDS);
     let mut shard_nodes_list = Vec::with_capacity(LINK_SHARDS);
-    let mut shard_tables = Vec::with_capacity(LINK_SHARDS);
-    for (s, (nodes, table)) in shard_results.into_iter().enumerate() {
-        offsets[s] = num_nodes as u32;
-        num_nodes += nodes.len();
+    for (s, (slots, mask, nodes)) in shard_results.into_iter().enumerate() {
+        offsets[s] = num_inline;
+        num_inline += nodes.len();
+        build_shards.push((slots, mask));
         shard_nodes_list.push(nodes);
-        shard_tables.push(table);
     }
+    offsets[LINK_SHARDS] = num_inline;
 
-    let mut all_nodes: Vec<ShardNode> = Vec::with_capacity(num_nodes);
+    let mut long_build_map: HashMap<Box<[u8]>, u32> = HashMap::new();
+    let mut long_nodes: Vec<CompactKey64> = Vec::new();
+    for batch in &worker_long_endpoints {
+        for &k in batch {
+            let bytes = LongArena::resolve_in(&worker_arenas, k);
+            if !long_build_map.contains_key(bytes) {
+                let global_id = (num_inline + long_nodes.len()) as u32;
+                long_build_map.insert(bytes.to_vec().into_boxed_slice(), global_id);
+                long_nodes.push(k);
+            }
+        }
+    }
+    drop(worker_long_endpoints);
+
+    let num_nodes = num_inline + long_nodes.len();
+    let mut all_nodes: Vec<CompactKey64> = Vec::with_capacity(num_nodes);
     for mut v in shard_nodes_list {
         all_nodes.append(&mut v);
     }
+    all_nodes.append(&mut long_nodes);
 
     // Stage L3: map all edges to dense u32 pairs in parallel.
     let resolved_batches: Vec<Vec<(u32, u32)>> = worker_edges
         .par_iter()
         .map(|edges| {
             let mut out = Vec::with_capacity(edges.len());
-            let mask = LINK_SHARDS - 1;
-            for e in edges {
-                let sa = ((e.ha >> 28) as usize) & mask;
-                let ba = files.resolve(e.a, &[], &worker_overflow);
-                let la = *shard_tables[sa]
-                    .find(e.ha, |&idx| {
-                        files.resolve(all_nodes[(offsets[sa] + idx) as usize].sref, &[], &worker_overflow)
-                            == ba
-                    })
-                    .unwrap();
-
-                let sb = ((e.hb >> 28) as usize) & mask;
-                let bb = files.resolve(e.b, &[], &worker_overflow);
-                let lb = *shard_tables[sb]
-                    .find(e.hb, |&idx| {
-                        files.resolve(all_nodes[(offsets[sb] + idx) as usize].sref, &[], &worker_overflow)
-                            == bb
-                    })
-                    .unwrap();
-
-                out.push((offsets[sa] + la, offsets[sb] + lb));
+            let resolve_node = |k: CompactKey64| -> u32 {
+                if !k.is_ref() {
+                    let h = mix64(k.0);
+                    let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
+                    let (ref slots, mask) = build_shards[s];
+                    let mut slot = (h as usize) & mask;
+                    loop {
+                        let cur = slots[slot];
+                        if cur.key == k.0 {
+                            return (offsets[s] as u32) + cur.val;
+                        }
+                        slot = (slot + 1) & mask;
+                    }
+                } else {
+                    let bytes = LongArena::resolve_in(&worker_arenas, k);
+                    *long_build_map.get(bytes).unwrap()
+                }
+            };
+            for &(ka, kb) in edges {
+                out.push((resolve_node(ka), resolve_node(kb)));
             }
             out
         })
         .collect();
 
     drop(worker_edges);
-    drop(shard_tables);
+    drop(build_shards);
+    drop(long_build_map);
 
-    // Stage L4: iterative DSU union-to-byte-wise-smallest root (zero recursion).
+    // Stage L4: iterative DSU union-to-byte-wise-smallest root.
     let mut parent: Vec<u32> = (0..num_nodes as u32).collect();
     #[inline(always)]
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -286,9 +324,13 @@ pub fn build_link_map(
             let ru = find(&mut parent, u);
             let rv = find(&mut parent, v);
             if ru != rv {
-                let bu = files.resolve(all_nodes[ru as usize].sref, &[], &worker_overflow);
-                let bv = files.resolve(all_nodes[rv as usize].sref, &[], &worker_overflow);
-                if bu < bv {
+                let ord = cmp_raw_keys(
+                    all_nodes[ru as usize],
+                    all_nodes[rv as usize],
+                    &worker_arenas,
+                    &worker_arenas,
+                );
+                if ord == std::cmp::Ordering::Less {
                     parent[rv as usize] = ru;
                 } else {
                     parent[ru as usize] = rv;
@@ -297,7 +339,7 @@ pub fn build_link_map(
         }
     }
 
-    // Flatten iteratively: parent[i] points directly to final root of component.
+    // Flatten iteratively.
     for i in 0..num_nodes {
         let mut r = parent[i];
         while parent[r as usize] != r {
@@ -311,70 +353,112 @@ pub fn build_link_map(
         }
     }
 
-    // Stage L5: Pack ONLY non-root nodes into compact LinkMap shards and drop link mmaps.
-    let mut raw_arena: Vec<u8> = Vec::new();
+    // Build non-root-only canonical mapping (plus both root+non-roots for Tag 11 long roots).
+    let mut root_canon = vec![CompactKey64::EMPTY; num_nodes];
     let mut canon_arena: Vec<u8> = Vec::new();
-    let mut overflow_raw: Vec<Box<[u8]>> = Vec::new();
-    let mut overflow_canon: Vec<Box<[u8]>> = Vec::new();
-    let mut canon_placed: Vec<(u32, u16)> = vec![(0, 0); num_nodes]; // off, len (u16::MAX => overflow)
-    let mut has_canon_placed = vec![false; num_nodes];
-    let mut shards: Vec<HashTable<LinkEntry>> = (0..LINK_SHARDS).map(|_| HashTable::new()).collect();
-
+    let mut canon_spans: Vec<(u32, u32)> = Vec::new();
+    let mut scratch = [0u8; 10];
     for i in 0..num_nodes {
         let r = parent[i] as usize;
-        if r == i {
-            continue;
-        }
-        if !has_canon_placed[r] {
-            let cb = files.resolve(all_nodes[r].sref, &[], &worker_overflow);
-            if cb.len() < u16::MAX as usize && canon_arena.len() + cb.len() <= u32::MAX as usize {
+        if root_canon[r] == CompactKey64::EMPTY {
+            let r_key = all_nodes[r];
+            if !r_key.is_ref() {
+                root_canon[r] = r_key;
+            } else {
+                let cid = canon_spans.len() as u32;
+                let bytes = resolve_raw_key(r_key, &worker_arenas, &mut scratch);
                 let off = canon_arena.len() as u32;
-                canon_arena.extend_from_slice(cb);
-                canon_placed[r] = (off, cb.len() as u16);
-            } else {
-                let idx = overflow_canon.len() as u32;
-                overflow_canon.push(cb.to_vec().into_boxed_slice());
-                canon_placed[r] = (idx, u16::MAX);
+                canon_arena.extend_from_slice(bytes);
+                canon_spans.push((off, bytes.len() as u32));
+                root_canon[r] = CompactKey64::from_comp(cid);
             }
-            has_canon_placed[r] = true;
         }
-        let (canon_off, canon_len) = canon_placed[r];
+    }
 
-        let rb = files.resolve(all_nodes[i].sref, &[], &worker_overflow);
-        let (raw_off, raw_len) =
-            if rb.len() < u16::MAX as usize && raw_arena.len() + rb.len() <= u32::MAX as usize {
-                let off = raw_arena.len() as u32;
-                raw_arena.extend_from_slice(rb);
-                (off, rb.len() as u16)
-            } else {
-                let idx = overflow_raw.len() as u32;
-                overflow_raw.push(rb.to_vec().into_boxed_slice());
-                (idx, u16::MAX)
-            };
+    // node_canon[i] == CompactKey64::EMPTY means skip storing node i (inline root resolves to itself on miss).
+    let mut node_canon = vec![CompactKey64::EMPTY; num_nodes];
+    let mut long_map: HashMap<Box<[u8]>, CompactKey64> = HashMap::new();
+    for i in 0..num_nodes {
+        let r = parent[i] as usize;
+        let canon = root_canon[r];
+        let k = all_nodes[i];
+        if !k.is_ref() {
+            if i != r || all_nodes[r].is_ref() {
+                node_canon[i] = canon;
+            }
+        } else {
+            let bytes = LongArena::resolve_in(&worker_arenas, k);
+            long_map.insert(bytes.to_vec().into_boxed_slice(), canon);
+        }
+    }
+    let has_long = !long_map.is_empty();
 
-        let raw_hash = all_nodes[i].hash;
-        let canon_hash = all_nodes[r].hash;
-        let shard = ((raw_hash >> 28) as usize) & (LINK_SHARDS - 1);
-        shards[shard].insert_unique(
-            raw_hash,
-            LinkEntry {
-                raw_off,
-                raw_len,
-                canon_len,
-                canon_off,
-                raw_hash,
-                canon_hash,
-            },
-            |e| e.raw_hash,
-        );
+    drop(parent);
+    drop(root_canon);
+    drop(worker_arenas);
+
+    // Stage L5: parallel compact rebuild of the 32 final shards sized tightly to emitted non-root count!
+    let final_shard_results: Vec<(FlatLinkShard, usize)> = (0..LINK_SHARDS)
+        .into_par_iter()
+        .map(|s| {
+            let lo = offsets[s];
+            let hi = offsets[s + 1];
+            let mut m = 0usize;
+            for i in lo..hi {
+                if node_canon[i] != CompactKey64::EMPTY {
+                    m += 1;
+                }
+            }
+            let cap = (m * 10 / 6).max(2).next_power_of_two();
+            let mask = cap - 1;
+            let mut slots = vec![
+                LinkSlot {
+                    key: 0,
+                    canon: CompactKey64::EMPTY,
+                };
+                cap
+            ];
+            for i in lo..hi {
+                let canon = node_canon[i];
+                if canon != CompactKey64::EMPTY {
+                    let key = all_nodes[i].0;
+                    let mut pos = (mix64(key) as usize) & mask;
+                    while slots[pos].key != 0 {
+                        pos = (pos + 1) & mask;
+                    }
+                    slots[pos] = LinkSlot { key, canon };
+                }
+            }
+            (FlatLinkShard { slots, mask }, m)
+        })
+        .collect();
+
+    let mut shards = Vec::with_capacity(LINK_SHARDS);
+    let mut total_inline_entries = 0usize;
+    for (sh, m) in final_shard_results {
+        total_inline_entries += m;
+        shards.push(sh);
+    }
+
+    let bloom_words = (total_inline_entries * 3 / 8).max(64).next_power_of_two();
+    let bloom_mask = bloom_words - 1;
+    let mut bloom = vec![0u64; bloom_words];
+    for i in 0..num_inline {
+        if node_canon[i] != CompactKey64::EMPTY {
+            let h = mix64(all_nodes[i].0);
+            let w = ((h >> 32) as usize) & bloom_mask;
+            bloom[w] |= (1u64 << ((h >> 16) & 63)) | (1u64 << ((h >> 22) & 63));
+        }
     }
 
     Ok(LinkMap {
+        bloom,
+        bloom_mask,
         shards,
-        raw_arena,
+        long_map,
+        has_long,
         canon_arena,
-        overflow_raw,
-        overflow_canon,
+        canon_spans,
         empty: false,
     })
 }
@@ -395,21 +479,32 @@ mod tests {
         }
         content.push_str("id_250,!root\n");
         content.push_str("u1,u1\n");
+        // Mix Tag 10/01 and Tag 11 long/special IDs with a Tag 11 root
+        content.push_str("chain_00000,chain_00001\n");
+        content.push_str("chain_00001,!chain_min\n");
+        content.push_str("u99,chain_00000\n");
         let p = dir.join("part-0.csv");
         fs::write(&p, content).unwrap();
 
-        let hb = DefaultHashBuilder::default();
-        let lm = build_link_map(&[p], &hb, 4).unwrap();
-        let h500 = fast_hash_bytes(b"id_500", &hb);
-        let (sref, ch) = lm.resolve(b"id_500", h500).unwrap();
-        let resolved = &lm.canon_arena[sref.off as usize..sref.off as usize + sref.len as usize];
-        assert_eq!(resolved, b"!root");
-        assert_eq!(ch, fast_hash_bytes(b"!root", &hb));
+        let lm = build_link_map(&[p], 4).unwrap();
+        // Inline root component: !root is inline Tag 01, so id_500 and !root both resolve to inline !root
+        let k500 = CompactKey64::encode_raw_inline(b"id_500").unwrap();
+        let kroot = CompactKey64::encode_raw_inline(b"!root").unwrap();
+        assert_eq!(lm.resolve_inline(k500), kroot);
+        assert_eq!(lm.resolve_inline(kroot), kroot);
 
-        let hroot = fast_hash_bytes(b"!root", &hb);
-        assert!(lm.resolve(b"!root", hroot).is_none());
-        let hu1 = fast_hash_bytes(b"u1", &hb);
-        assert!(lm.resolve(b"u1", hu1).is_none());
+        // Self-link u1,u1 changes nothing
+        let ku1 = CompactKey64::encode_raw_inline(b"u1").unwrap();
+        assert_eq!(lm.resolve_inline(ku1), ku1);
+
+        // Long root component: !chain_min is Tag 11, so all 3 resolve to the same Tag 00 comp_id
+        let kchain = lm.resolve_long(b"chain_00000").unwrap();
+        assert!(kchain.is_comp());
+        assert_eq!(lm.canon_bytes(kchain.comp_id()), b"!chain_min");
+        let kchain_min = lm.resolve_long(b"!chain_min").unwrap();
+        assert_eq!(kchain_min, kchain);
+        let ku99 = CompactKey64::encode_raw_inline(b"u99").unwrap();
+        assert_eq!(lm.resolve_inline(ku99), kchain);
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ pub fn clean_parquet_dir(dir: &Path) -> io::Result<()> {
 }
 
 pub struct UserDailyWriter {
-    writer: SerializedFileWriter<File>,
+    writer: SerializedFileWriter<BufWriter<File>>,
     uid_buf: Vec<u8>,
     uid_lens: Vec<u32>,
     uid_arrays: Vec<ByteArray>,
@@ -81,7 +81,7 @@ impl UserDailyWriter {
                 .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
                 .build(),
         );
-        let file = File::create(path)?;
+        let file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
         let writer = SerializedFileWriter::new(file, schema, props)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let cap = batch_rows.min(131_072);
@@ -240,7 +240,7 @@ pub fn write_campaign_daily(
             .set_statistics_enabled(EnabledStatistics::None)
             .build(),
     );
-    let file = File::create(path)?;
+    let file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
     let mut writer = SerializedFileWriter::new(file, schema, props)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 

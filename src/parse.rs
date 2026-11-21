@@ -95,7 +95,7 @@ fn parse_hms_swar(b: &[u8]) -> Option<i64> {
     let h = ((d & 0xFF) * 10 + ((d >> 8) & 0xFF)) as i64;
     let m = (((d >> 24) & 0xFF) * 10 + ((d >> 32) & 0xFF)) as i64;
     let s = (((d >> 48) & 0xFF) * 10 + ((d >> 56) & 0xFF)) as i64;
-    if h > 23 || m > 59 || s > 59 {
+    if (h > 23) | (m > 59) | (s > 59) {
         return None;
     }
     Some((h * 3_600 + m * 60 + s) * MS_SECOND)
@@ -121,10 +121,12 @@ fn parse_civil_datetime_19(b: &[u8]) -> Option<i64> {
 #[repr(C, align(16))]
 struct DateCacheEntry {
     hi: u64,
-    day_ms: i64,
+    day_days: i32,
     lo: u16,
-    _pad: [u16; 3],
+    _pad: u16,
 }
+
+const _: () = assert!(std::mem::size_of::<DateCacheEntry>() == 16);
 
 #[derive(Clone)]
 pub struct DateCache {
@@ -136,9 +138,9 @@ impl DateCache {
         Self {
             entries: [DateCacheEntry {
                 hi: u64::MAX,
-                day_ms: 0,
+                day_days: 0,
                 lo: 0,
-                _pad: [0; 3],
+                _pad: 0,
             }; 64],
         }
     }
@@ -157,7 +159,7 @@ impl DateCache {
             & 63;
         let e = &mut self.entries[idx];
         let base_day_ms = if e.hi == hi && e.lo == lo {
-            e.day_ms
+            (e.day_days as i64) * MS_DAY
         } else {
             if b[4] != b'-' || b[7] != b'-' {
                 return None;
@@ -169,11 +171,11 @@ impl DateCache {
             if day < 1 || day > dim {
                 return None;
             }
-            let dms = days_from_civil(year, month, day) * MS_DAY;
+            let dd = days_from_civil(year, month, day) as i32;
             e.hi = hi;
             e.lo = lo;
-            e.day_ms = dms;
-            dms
+            e.day_days = dd;
+            (dd as i64) * MS_DAY
         };
         let hms_ms = parse_hms_swar(b)?;
         Some(base_day_ms + hms_ms)
