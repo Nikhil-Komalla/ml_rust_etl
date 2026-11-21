@@ -14,7 +14,8 @@ use crate::csv::{
 };
 use crate::links::{build_link_map, LinkMap};
 use crate::parse::{
-    parse_price_cents, parse_ts_ms, DateCache, Manifest, MS_CLICK_REACH, MS_DAY, MS_SESSION_GAP,
+    parse_price_cents, parse_ts_ms, DateCache, Manifest, MS_CLICK_REACH, MS_DAY, MS_SECOND,
+    MS_SESSION_GAP,
 };
 use crate::parquet_out::{clean_parquet_dir, write_campaign_daily, CampaignRow, UserDailyWriter};
 
@@ -1410,9 +1411,10 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                 if ev_id.is_empty() {
                                     return;
                                 }
-                                let Some(ingest_ms) = dcache.parse_f1_ms(ingest_ts) else {
+                                let Some(ingest_sec) = dcache.parse_f1_sec(ingest_ts) else {
                                     return;
                                 };
+                                let ingest_ms = ingest_sec * MS_SECOND;
                                 let (ev_key, ev_hash) =
                                     if let Some(k) = CompactKey64::encode_raw_inline(ev_id) {
                                         (k, mix64(k.0))
@@ -1428,8 +1430,11 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                 let mut is_purchase = false;
 
                                 if !uid.is_empty() && !pid.is_empty() {
-                                    match etype {
-                                        b"view" | b"cart" => {
+                                    if etype.len() == 4 {
+                                        const VIEW_U32: u32 = u32::from_ne_bytes(*b"view");
+                                        const CART_U32: u32 = u32::from_ne_bytes(*b"cart");
+                                        let w = u32::from_ne_bytes(etype.try_into().unwrap());
+                                        if (w == VIEW_U32) | (w == CART_U32) {
                                             if let Some(t) = dcache.parse_ts_ms(ts) {
                                                 if t >= window_start_ms
                                                     && t < window_end_ms
@@ -1441,24 +1446,22 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                                 }
                                             }
                                         }
-                                        b"purchase" => {
-                                            if let Some(p) = parse_price_cents(price) {
-                                                if let Some(t) = dcache.parse_ts_ms(ts) {
-                                                    if t >= window_start_ms
-                                                        && t < window_end_ms
-                                                        && (ingest_ms as i128 - t as i128)
-                                                            <= MS_DAY as i128
-                                                    {
-                                                        ts_ms = t;
-                                                        price_val = p;
-                                                        cat_id = lookups_ref.get_product_cat(pid);
-                                                        is_purchase = true;
-                                                        valid = true;
-                                                    }
+                                    } else if etype == b"purchase" {
+                                        if let Some(p) = parse_price_cents(price) {
+                                            if let Some(t) = dcache.parse_ts_ms(ts) {
+                                                if t >= window_start_ms
+                                                    && t < window_end_ms
+                                                    && (ingest_ms as i128 - t as i128)
+                                                        <= MS_DAY as i128
+                                                {
+                                                    ts_ms = t;
+                                                    price_val = p;
+                                                    cat_id = lookups_ref.get_product_cat(pid);
+                                                    is_purchase = true;
+                                                    valid = true;
                                                 }
                                             }
                                         }
-                                        _ => {}
                                     }
                                 }
 
@@ -1480,8 +1483,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                 };
 
                                 if compact_mode && !is_purchase {
-                                    let ingest_sec_rel =
-                                        ingest_ms.div_euclid(1_000) - window_start_sec;
+                                    let ingest_sec_rel = ingest_sec - window_start_sec;
                                     if (-META_FAST_ING_BIAS..META_FAST_ING_BIAS)
                                         .contains(&ingest_sec_rel)
                                     {
@@ -1856,7 +1858,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     let click_src = CsvSource::open(&click_paths)?;
     let cl_chunks = click_src.chunks(CHUNK_BYTES);
     let n_cl_workers = ncpu.clamp(1, 63).min(cl_chunks.len().max(1));
-    let raw_cl_cap = (click_src.total_bytes() / 46) / (n_cl_workers * P_PERSON);
+    let raw_cl_cap = (click_src.total_bytes() / 42) / (n_cl_workers * P_PERSON);
     let est_cl_cap = if raw_cl_cap >= 64 { raw_cl_cap + 16 } else { 0 };
     let mut cl_worker_arenas: Vec<LongArena> =
         (0..n_cl_workers).map(|_| LongArena::default()).collect();

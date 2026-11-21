@@ -82,7 +82,7 @@ fn parse_8_ascii_digits(v: u64) -> u64 {
 }
 
 #[inline(always)]
-fn parse_hms_swar(b: &[u8]) -> Option<i64> {
+fn parse_hms_sec(b: &[u8]) -> Option<i64> {
     let t8 = u64::from_le_bytes(b[11..19].try_into().unwrap());
     if (t8 & 0x0000_FF00_00FF_0000) != 0x0000_3A00_003A_0000 {
         return None;
@@ -98,7 +98,12 @@ fn parse_hms_swar(b: &[u8]) -> Option<i64> {
     if (h > 23) | (m > 59) | (s > 59) {
         return None;
     }
-    Some((h * 3_600 + m * 60 + s) * MS_SECOND)
+    Some(h * 3_600 + m * 60 + s)
+}
+
+#[inline(always)]
+fn parse_hms_swar(b: &[u8]) -> Option<i64> {
+    Some(parse_hms_sec(b)? * MS_SECOND)
 }
 
 #[inline(always)]
@@ -146,20 +151,18 @@ impl DateCache {
     }
 
     #[inline(always)]
-    fn parse_civil_datetime_19(&mut self, b: &[u8]) -> Option<i64> {
+    fn parse_civil_datetime_19_sec(&mut self, b: &[u8]) -> Option<i64> {
         if b[10] != b'T' {
             return None;
         }
         let hi = u64::from_ne_bytes(b[0..8].try_into().unwrap());
         let lo = u16::from_ne_bytes(b[8..10].try_into().unwrap());
-        let idx = ((b[9] as usize)
-            ^ ((b[8] as usize) << 3)
-            ^ ((b[6] as usize) << 4)
-            ^ ((b[5] as usize) << 5))
+        let idx = (((b[8] as usize & 3) * 10 + (b[9] as usize & 15))
+            ^ ((b[6] as usize & 1) << 5))
             & 63;
         let e = &mut self.entries[idx];
-        let base_day_ms = if e.hi == hi && e.lo == lo {
-            (e.day_days as i64) * MS_DAY
+        let day_days = if e.hi == hi && e.lo == lo {
+            e.day_days
         } else {
             if b[4] != b'-' || b[7] != b'-' {
                 return None;
@@ -175,19 +178,25 @@ impl DateCache {
             e.hi = hi;
             e.lo = lo;
             e.day_days = dd;
-            (dd as i64) * MS_DAY
+            dd
         };
-        let hms_ms = parse_hms_swar(b)?;
-        Some(base_day_ms + hms_ms)
+        let hms_sec = parse_hms_sec(b)?;
+        Some((day_days as i64) * 86_400 + hms_sec)
     }
 
     #[inline(always)]
-    pub fn parse_f1_ms(&mut self, b: &[u8]) -> Option<i64> {
+    pub fn parse_f1_sec(&mut self, b: &[u8]) -> Option<i64> {
         if b.len() == 20 && b[19] == b'Z' {
-            self.parse_civil_datetime_19(b)
+            self.parse_civil_datetime_19_sec(b)
         } else {
             None
         }
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub fn parse_f1_ms(&mut self, b: &[u8]) -> Option<i64> {
+        self.parse_f1_sec(b).map(|s| s * MS_SECOND)
     }
 
     #[inline(always)]
@@ -197,7 +206,7 @@ impl DateCache {
             return None;
         }
         if len == 20 && b[19] == b'Z' {
-            return self.parse_civil_datetime_19(b);
+            return self.parse_civil_datetime_19_sec(b).map(|s| s * MS_SECOND);
         }
         if len == 13 {
             let hi8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
@@ -209,7 +218,7 @@ impl DateCache {
             return None;
         }
         if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
-            let base = self.parse_civil_datetime_19(b)?;
+            let base = self.parse_civil_datetime_19_sec(b)? * MS_SECOND;
             let oh = d2(b[20], b[21])?;
             let om = d2(b[23], b[24])?;
             if oh > 23 || om > 59 {
@@ -445,6 +454,12 @@ mod tests {
                     cache.parse_f1_ms(s),
                     parse_f1_ms(s),
                     "f1 mismatch on {:?}",
+                    String::from_utf8_lossy(s)
+                );
+                assert_eq!(
+                    cache.parse_f1_sec(s).map(|v| v * MS_SECOND),
+                    parse_f1_ms(s),
+                    "f1_sec mismatch on {:?}",
                     String::from_utf8_lossy(s)
                 );
             }
