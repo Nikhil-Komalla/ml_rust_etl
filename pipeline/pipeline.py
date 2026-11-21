@@ -472,18 +472,27 @@ def main() -> None:
             event_id,
             min(ingest_ts_ms) AS ingest_ts_ms,
             arg_min(
-                struct_pack(u := user_id, t := ts, et := event_type, p := product_id, pr := price_cents),
+                struct_pack(u := user_id, ts := ts_ms, et := et, hp := hp, p := p, pr := pr),
                 ingest_ts_ms
             ) AS rec
         FROM (
             SELECT
                 event_id,
                 user_id,
-                ts,
+                parse_ts_ms(ts) AS ts_ms,
                 parse_f1_ms(ingest_ts) AS ingest_ts_ms,
-                event_type,
-                product_id,
-                price_cents
+                CASE event_type
+                    WHEN 'view' THEN 1::TINYINT
+                    WHEN 'cart' THEN 2::TINYINT
+                    WHEN 'purchase' THEN 3::TINYINT
+                    ELSE 0::TINYINT
+                END AS et,
+                (product_id IS NOT NULL) AS hp,
+                CASE WHEN event_type = 'purchase' THEN product_id ELSE NULL END AS p,
+                CASE
+                    WHEN event_type = 'purchase' THEN parse_price_cents(price_cents)
+                    ELSE 0::BIGINT
+                END AS pr
             FROM events_raw
         ) s
         WHERE ingest_ts_ms IS NOT NULL
@@ -494,42 +503,24 @@ def main() -> None:
         f"""
         CREATE TEMP VIEW events_valid AS
         SELECT
-            COALESCE(lm.canonical_uid, v.user_id) AS person_id,
-            v.event_id,
-            v.ts_ms,
-            v.product_id,
-            v.purchase_cents,
-            v.is_purchase
-        FROM (
-            SELECT
-                event_id,
-                rec.u AS user_id,
-                ts_ms,
-                ingest_ts_ms,
-                rec.p AS product_id,
-                CASE
-                    WHEN rec.et = 'purchase' THEN parse_price_cents(rec.pr)
-                    ELSE 0::BIGINT
-                END AS purchase_cents,
-                CASE WHEN rec.et = 'purchase' THEN 1::BIGINT ELSE 0::BIGINT END AS is_purchase
-            FROM (
-                SELECT
-                    event_id,
-                    ingest_ts_ms,
-                    rec,
-                    parse_ts_ms(rec.t) AS ts_ms
-                FROM events_dedup
-                WHERE rec.u IS NOT NULL
-                  AND rec.et IN ('view', 'cart', 'purchase')
-                  AND rec.p IS NOT NULL
-                  AND (rec.et <> 'purchase' OR parse_price_cents(rec.pr) IS NOT NULL)
-            ) parsed
-            WHERE ts_ms IS NOT NULL
-              AND ts_ms >= {window_start_ms}
-              AND ts_ms < {window_end_ms}
-              AND ingest_ts_ms - ts_ms <= {MS_DAY}
-        ) v
-        LEFT JOIN link_map lm ON v.user_id = lm.raw_uid
+            COALESCE(lm.canonical_uid, d.rec.u) AS person_id,
+            d.event_id,
+            d.rec.ts AS ts_ms,
+            d.rec.p AS product_id,
+            d.rec.pr AS purchase_cents,
+            CASE WHEN d.rec.et = 3 THEN 1::BIGINT ELSE 0::BIGINT END AS is_purchase
+        FROM events_dedup d
+        LEFT JOIN link_map lm ON d.rec.u = lm.raw_uid
+        WHERE d.rec.u IS NOT NULL
+          AND d.rec.et > 0
+          AND d.rec.hp
+          AND d.rec.pr IS NOT NULL
+          AND d.rec.ts IS NOT NULL
+          AND CASE
+                  WHEN d.rec.ts >= {window_start_ms} AND d.rec.ts < {window_end_ms}
+                  THEN d.ingest_ts_ms - d.rec.ts <= {MS_DAY}
+                  ELSE false
+              END
         """
     )
     t_events_prep = time.perf_counter()
