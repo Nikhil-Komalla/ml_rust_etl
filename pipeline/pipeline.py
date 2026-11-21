@@ -242,57 +242,35 @@ def define_macros(con: duckdb.DuckDBPyConnection) -> None:
         CREATE TEMP MACRO parse_f1_ms(s) AS (
             CASE
                 WHEN s IS NOT NULL
-                     AND length(s) = 20
-                     AND regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
-                     AND try_cast(substr(s, 1, 10) AS DATE) IS NOT NULL
-                     AND try_cast(substr(s, 12, 2) AS INTEGER) <= 23
-                     AND try_cast(substr(s, 15, 2) AS INTEGER) <= 59
-                     AND try_cast(substr(s, 18, 2) AS INTEGER) <= 59
-                THEN datediff('day', DATE '1970-01-01', try_cast(substr(s, 1, 10) AS DATE))::BIGINT * 86400000
-                     + (
-                         try_cast(substr(s, 12, 2) AS BIGINT) * 3600
-                         + try_cast(substr(s, 15, 2) AS BIGINT) * 60
-                         + try_cast(substr(s, 18, 2) AS BIGINT)
-                     ) * 1000
+                     AND strlen(s) = 20
+                     AND ends_with(s, 'Z')
+                     AND strftime(try_cast(substr(s, 1, 19) AS TIMESTAMP), '%Y-%m-%dT%H:%M:%SZ') = s
+                THEN epoch_ms(try_cast(substr(s, 1, 19) AS TIMESTAMP))
                 ELSE NULL
             END
         );
 
         CREATE TEMP MACRO parse_ts_ms(s) AS (
             CASE
-                WHEN s IS NULL THEN NULL
-                WHEN length(s) = 20
-                     AND regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
-                     AND try_cast(substr(s, 1, 10) AS DATE) IS NOT NULL
-                     AND try_cast(substr(s, 12, 2) AS INTEGER) <= 23
-                     AND try_cast(substr(s, 15, 2) AS INTEGER) <= 59
-                     AND try_cast(substr(s, 18, 2) AS INTEGER) <= 59
-                THEN datediff('day', DATE '1970-01-01', try_cast(substr(s, 1, 10) AS DATE))::BIGINT * 86400000
-                     + (
-                         try_cast(substr(s, 12, 2) AS BIGINT) * 3600
-                         + try_cast(substr(s, 15, 2) AS BIGINT) * 60
-                         + try_cast(substr(s, 18, 2) AS BIGINT)
-                     ) * 1000
-                WHEN length(s) = 25
-                     AND regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}')
-                     AND try_cast(substr(s, 1, 10) AS DATE) IS NOT NULL
-                     AND try_cast(substr(s, 12, 2) AS INTEGER) <= 23
-                     AND try_cast(substr(s, 15, 2) AS INTEGER) <= 59
-                     AND try_cast(substr(s, 18, 2) AS INTEGER) <= 59
-                     AND try_cast(substr(s, 21, 2) AS INTEGER) <= 23
-                     AND try_cast(substr(s, 24, 2) AS INTEGER) <= 59
-                THEN datediff('day', DATE '1970-01-01', try_cast(substr(s, 1, 10) AS DATE))::BIGINT * 86400000
-                     + (
-                         try_cast(substr(s, 12, 2) AS BIGINT) * 3600
-                         + try_cast(substr(s, 15, 2) AS BIGINT) * 60
-                         + try_cast(substr(s, 18, 2) AS BIGINT)
-                     ) * 1000
+                WHEN s IS NULL OR s = '' THEN NULL
+                WHEN strlen(s) = 20
+                     AND ends_with(s, 'Z')
+                     AND strftime(try_cast(substr(s, 1, 19) AS TIMESTAMP), '%Y-%m-%dT%H:%M:%SZ') = s
+                THEN epoch_ms(try_cast(substr(s, 1, 19) AS TIMESTAMP))
+                WHEN ltrim(s, '0123456789') = ''
+                THEN try_cast(COALESCE(NULLIF(ltrim(s, '0'), ''), '0') AS BIGINT)
+                WHEN strlen(s) = 25
+                     AND substr(s, 20, 1) IN ('+', '-')
+                     AND substr(s, 23, 1) = ':'
+                     AND ltrim(substr(s, 21, 2) || substr(s, 24, 2), '0123456789') = ''
+                     AND substr(s, 21, 2) <= '23'
+                     AND substr(s, 24, 2) <= '59'
+                     AND strftime(try_cast(substr(s, 1, 19) AS TIMESTAMP), '%Y-%m-%dT%H:%M:%S') = substr(s, 1, 19)
+                THEN epoch_ms(try_cast(substr(s, 1, 19) AS TIMESTAMP))
                      - (CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END) * (
                          try_cast(substr(s, 21, 2) AS BIGINT) * 3600
                          + try_cast(substr(s, 24, 2) AS BIGINT) * 60
                      ) * 1000
-                WHEN regexp_full_match(s, '[0-9]+')
-                THEN try_cast(COALESCE(NULLIF(ltrim(s, '0'), ''), '0') AS BIGINT)
                 ELSE NULL
             END
         );
@@ -300,7 +278,8 @@ def define_macros(con: duckdb.DuckDBPyConnection) -> None:
         CREATE TEMP MACRO parse_price_cents(s) AS (
             CASE
                 WHEN s IS NOT NULL
-                     AND regexp_full_match(s, '[0-9]+')
+                     AND s <> ''
+                     AND ltrim(s, '0123456789') = ''
                      AND try_cast(COALESCE(NULLIF(ltrim(s, '0'), ''), '0') AS BIGINT) BETWEEN 1 AND 10000000
                 THEN try_cast(COALESCE(NULLIF(ltrim(s, '0'), ''), '0') AS BIGINT)
                 ELSE NULL
