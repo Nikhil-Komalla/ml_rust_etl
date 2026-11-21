@@ -11,52 +11,7 @@ pub const READ_BLOCK_BYTES: usize = 256 * 1024;
 
 pub const LONG_LEN_OVERFLOW: usize = 0xF_FFFF;
 pub const LONG_LEN_MASK: u64 = 0xF_FFFF;
-pub const LONG_OFF_MASK: u64 = (1u64 << 36) - 1;
-
-const fn build_enc6() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut b = b'0';
-    while b <= b'9' {
-        t[b as usize] = (b - b'0') + 1;
-        b += 1;
-    }
-    let mut b = b'A';
-    while b <= b'Z' {
-        t[b as usize] = (b - b'A') + 11;
-        b += 1;
-    }
-    t[b'_' as usize] = 37;
-    let mut b = b'a';
-    while b <= b'z' {
-        t[b as usize] = (b - b'a') + 38;
-        b += 1;
-    }
-    t
-}
-
-const fn build_dec6() -> [u8; 64] {
-    let mut t = [0u8; 64];
-    let mut i = 0u8;
-    while i < 10 {
-        t[(i + 1) as usize] = b'0' + i;
-        i += 1;
-    }
-    let mut i = 0u8;
-    while i < 26 {
-        t[(i + 11) as usize] = b'A' + i;
-        i += 1;
-    }
-    t[37] = b'_';
-    let mut i = 0u8;
-    while i < 26 {
-        t[(i + 38) as usize] = b'a' + i;
-        i += 1;
-    }
-    t
-}
-
-static ENC6: [u8; 256] = build_enc6();
-static DEC6: [u8; 64] = build_dec6();
+pub const LONG_OFF_MASK: u64 = (1u64 << 37) - 1;
 
 #[inline(always)]
 pub const fn mix64(mut x: u64) -> u64 {
@@ -65,6 +20,36 @@ pub const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 27;
     x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+#[inline(always)]
+fn pext7(tail_be: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pext_u64(tail_be, 0x7F7F_7F7F_7F7F_7F7F)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut x = tail_be & 0x7F7F_7F7F_7F7F_7F7F;
+        x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
+        x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
+        ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF)
+    }
+}
+
+#[inline(always)]
+fn pdep7(packed: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pdep_u64(packed, 0x7F7F_7F7F_7F7F_7F7F)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut x = packed & 0x00FF_FFFF_FFFF_FFFF;
+        x = ((x & 0x00FF_FFFF_F000_0000) << 4) | (x & 0x0000_0000_0FFF_FFFF);
+        x = ((x & 0x0FFF_C000_0FFF_C000) << 2) | (x & 0x0000_3FFF_0000_3FFF);
+        ((x & 0x3F80_3F80_3F80_3F80) << 1) | (x & 0x007F_007F_007F_007F)
+    }
 }
 
 #[inline(always)]
@@ -88,12 +73,12 @@ pub fn hash_bytes_fast(mut b: &[u8]) -> u64 {
     mix64(seed ^ K2)
 }
 
-/// 64-bit compact identifier with 4 disjoint canonical tags in bits 63..62 (never 0):
-/// - `0` (reserved EMPTY sentinel)
-/// - Tag `0b00`: linked `comp_id + 1` (1..=u32::MAX+1)
-/// - Tag `0b01`: raw UTF-8/bytes up to 7 bytes (`len` in bits 61..59, raw LE bytes in 0..55)
-/// - Tag `0b10`: 6-bit ASCII-ordered packed `[0-9A-Z_a-z]` of length 8..=10 (big-endian in 0..59)
-/// - Tag `0b11`: arena ref `(wid:6 << 56) | (off:36 << 20) | (len:20)`
+/// 64-bit compact identifier (never 0 when valid):
+/// - `0`: `EMPTY` sentinel
+/// - `1 ..= u32::MAX + 1` (`(val >> 56) == 0 && val != 0`): linked `comp_id + 1`
+/// - `(1u64 << 56) ..= 0x7FFF_FFFF_FFFF_FFFF` (`bit 63 == 0` and `(val >> 56) != 0`):
+///   lossless 1..=9 byte non-NUL ASCII string (`s[0]` in bits `62..56`, `pext7(s[1..])` BE in `55..0`)
+/// - `bit 63 == 1`: arena ref `(1 << 63) | (wid:6 << 57) | (off:37 << 20) | (len:20)`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct CompactKey64(pub u64);
@@ -110,7 +95,7 @@ impl CompactKey64 {
 
     #[inline(always)]
     pub const fn is_comp(self) -> bool {
-        (self.0 >> 62) == 0 && self.0 != 0
+        (self.0 >> 56) == 0 && self.0 != 0
     }
 
     #[inline(always)]
@@ -119,138 +104,52 @@ impl CompactKey64 {
     }
 
     #[inline(always)]
-    pub const fn is_pack10(self) -> bool {
-        (self.0 >> 62) == 2
+    pub const fn is_inline(self) -> bool {
+        (self.0 as i64) >= (1i64 << 56)
     }
 
     #[inline(always)]
     pub const fn is_ref(self) -> bool {
-        (self.0 >> 62) == 3
+        (self.0 as i64) < 0
     }
 
     #[inline(always)]
     pub fn encode_raw_inline(s: &[u8]) -> Option<Self> {
         let n = s.len();
-        if n <= 7 {
+        if n == 9 {
+            let b0 = unsafe { *s.get_unchecked(0) };
+            let tail = unsafe { u64::from_be_bytes(*(s.as_ptr().add(1) as *const [u8; 8])) };
+            if b0.wrapping_sub(1) > 126
+                || ((tail | tail.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080)
+                    != 0
+            {
+                return None;
+            }
+            return Some(Self(((b0 as u64) << 56) | pext7(tail)));
+        }
+        if n == 8 {
+            let w = unsafe { u64::from_be_bytes(*(s.as_ptr() as *const [u8; 8])) };
+            if ((w | w.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080) != 0 {
+                return None;
+            }
+            return Some(Self((w & 0xFF00_0000_0000_0000) | pext7(w << 8)));
+        }
+        if n >= 1 && n <= 7 {
             let mut buf = [0u8; 8];
-            buf[..n].copy_from_slice(s);
-            let raw = u64::from_le_bytes(buf);
-            return Some(Self((1u64 << 62) | ((n as u64) << 59) | raw));
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_mut_ptr(), n);
+            }
+            let w = u64::from_be_bytes(buf);
+            let mask = !0u64 << ((8 - n) * 8);
+            let w_check = w | (!mask & 0x0101_0101_0101_0101);
+            if ((w_check | w_check.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080)
+                != 0
+            {
+                return None;
+            }
+            return Some(Self((w & 0xFF00_0000_0000_0000) | pext7(w << 8)));
         }
-        match n {
-            8 => {
-                let c0 = ENC6[s[0] as usize];
-                let c1 = ENC6[s[1] as usize];
-                let c2 = ENC6[s[2] as usize];
-                let c3 = ENC6[s[3] as usize];
-                let c4 = ENC6[s[4] as usize];
-                let c5 = ENC6[s[5] as usize];
-                let c6 = ENC6[s[6] as usize];
-                let c7 = ENC6[s[7] as usize];
-                if ((c0.wrapping_sub(1)
-                    | c1.wrapping_sub(1)
-                    | c2.wrapping_sub(1)
-                    | c3.wrapping_sub(1)
-                    | c4.wrapping_sub(1)
-                    | c5.wrapping_sub(1)
-                    | c6.wrapping_sub(1)
-                    | c7.wrapping_sub(1))
-                    & 0x80)
-                    != 0
-                {
-                    return None;
-                }
-                Some(Self(
-                    (2u64 << 62)
-                        | ((c0 as u64) << 54)
-                        | ((c1 as u64) << 48)
-                        | ((c2 as u64) << 42)
-                        | ((c3 as u64) << 36)
-                        | ((c4 as u64) << 30)
-                        | ((c5 as u64) << 24)
-                        | ((c6 as u64) << 18)
-                        | ((c7 as u64) << 12),
-                ))
-            }
-            9 => {
-                let c0 = ENC6[s[0] as usize];
-                let c1 = ENC6[s[1] as usize];
-                let c2 = ENC6[s[2] as usize];
-                let c3 = ENC6[s[3] as usize];
-                let c4 = ENC6[s[4] as usize];
-                let c5 = ENC6[s[5] as usize];
-                let c6 = ENC6[s[6] as usize];
-                let c7 = ENC6[s[7] as usize];
-                let c8 = ENC6[s[8] as usize];
-                if ((c0.wrapping_sub(1)
-                    | c1.wrapping_sub(1)
-                    | c2.wrapping_sub(1)
-                    | c3.wrapping_sub(1)
-                    | c4.wrapping_sub(1)
-                    | c5.wrapping_sub(1)
-                    | c6.wrapping_sub(1)
-                    | c7.wrapping_sub(1)
-                    | c8.wrapping_sub(1))
-                    & 0x80)
-                    != 0
-                {
-                    return None;
-                }
-                Some(Self(
-                    (2u64 << 62)
-                        | ((c0 as u64) << 54)
-                        | ((c1 as u64) << 48)
-                        | ((c2 as u64) << 42)
-                        | ((c3 as u64) << 36)
-                        | ((c4 as u64) << 30)
-                        | ((c5 as u64) << 24)
-                        | ((c6 as u64) << 18)
-                        | ((c7 as u64) << 12)
-                        | ((c8 as u64) << 6),
-                ))
-            }
-            10 => {
-                let c0 = ENC6[s[0] as usize];
-                let c1 = ENC6[s[1] as usize];
-                let c2 = ENC6[s[2] as usize];
-                let c3 = ENC6[s[3] as usize];
-                let c4 = ENC6[s[4] as usize];
-                let c5 = ENC6[s[5] as usize];
-                let c6 = ENC6[s[6] as usize];
-                let c7 = ENC6[s[7] as usize];
-                let c8 = ENC6[s[8] as usize];
-                let c9 = ENC6[s[9] as usize];
-                if ((c0.wrapping_sub(1)
-                    | c1.wrapping_sub(1)
-                    | c2.wrapping_sub(1)
-                    | c3.wrapping_sub(1)
-                    | c4.wrapping_sub(1)
-                    | c5.wrapping_sub(1)
-                    | c6.wrapping_sub(1)
-                    | c7.wrapping_sub(1)
-                    | c8.wrapping_sub(1)
-                    | c9.wrapping_sub(1))
-                    & 0x80)
-                    != 0
-                {
-                    return None;
-                }
-                Some(Self(
-                    (2u64 << 62)
-                        | ((c0 as u64) << 54)
-                        | ((c1 as u64) << 48)
-                        | ((c2 as u64) << 42)
-                        | ((c3 as u64) << 36)
-                        | ((c4 as u64) << 30)
-                        | ((c5 as u64) << 24)
-                        | ((c6 as u64) << 18)
-                        | ((c7 as u64) << 12)
-                        | ((c8 as u64) << 6)
-                        | (c9 as u64),
-                ))
-            }
-            _ => None,
-        }
+        None
     }
 
     #[inline(always)]
@@ -263,24 +162,11 @@ impl CompactKey64 {
 
     #[inline(always)]
     pub fn decode_inline(self, buf: &mut [u8; 10]) -> usize {
-        if (self.0 >> 62) == 1 {
-            let len = ((self.0 >> 59) & 7) as usize;
-            let le = self.0.to_le_bytes();
-            buf[..7].copy_from_slice(&le[..7]);
-            len
-        } else {
-            debug_assert!((self.0 >> 62) == 2);
-            let mut i = 0usize;
-            while i < 10 {
-                let c = ((self.0 >> (54 - 6 * i)) & 63) as usize;
-                if c == 0 {
-                    return i;
-                }
-                buf[i] = DEC6[c];
-                i += 1;
-            }
-            10
-        }
+        debug_assert!(self.is_inline());
+        buf[0] = (self.0 >> 56) as u8;
+        let tail_be = pdep7(self.0);
+        buf[1..9].copy_from_slice(&tail_be.to_be_bytes());
+        9 - ((tail_be.trailing_zeros() >> 3) as usize)
     }
 }
 
@@ -294,18 +180,18 @@ impl LongArena {
     #[inline(always)]
     pub fn push_ref(&mut self, wid: usize, s: &[u8]) -> CompactKey64 {
         debug_assert!(wid < 64);
-        if s.len() < LONG_LEN_OVERFLOW && self.buf.len() + s.len() <= (1usize << 36) {
+        if s.len() < LONG_LEN_OVERFLOW && self.buf.len() + s.len() <= (1usize << 37) {
             let off = self.buf.len();
             self.buf.extend_from_slice(s);
             CompactKey64(
-                (3u64 << 62) | ((wid as u64) << 56) | ((off as u64) << 20) | (s.len() as u64),
+                (1u64 << 63) | ((wid as u64) << 57) | ((off as u64) << 20) | (s.len() as u64),
             )
         } else {
             let idx = self.overflow.len();
             self.overflow.push(s.to_vec().into_boxed_slice());
             CompactKey64(
-                (3u64 << 62)
-                    | ((wid as u64) << 56)
+                (1u64 << 63)
+                    | ((wid as u64) << 57)
                     | ((idx as u64) << 20)
                     | (LONG_LEN_OVERFLOW as u64),
             )
@@ -315,7 +201,7 @@ impl LongArena {
     #[inline(always)]
     pub fn resolve_in<'a>(arenas: &'a [LongArena], key: CompactKey64) -> &'a [u8] {
         debug_assert!(key.is_ref());
-        let wid = ((key.0 >> 56) & 63) as usize;
+        let wid = ((key.0 >> 57) & 63) as usize;
         let off = ((key.0 >> 20) & LONG_OFF_MASK) as usize;
         let len = (key.0 & LONG_LEN_MASK) as usize;
         let arena = &arenas[wid];
@@ -348,7 +234,7 @@ pub fn cmp_raw_keys(
     arenas_a: &[LongArena],
     arenas_b: &[LongArena],
 ) -> Ordering {
-    if a.is_pack10() && b.is_pack10() {
+    if a.is_inline() && b.is_inline() {
         return a.0.cmp(&b.0);
     }
     let mut ba = [0u8; 10];
@@ -1056,45 +942,89 @@ mod tests {
         let c0 = CompactKey64::from_comp(0);
         assert_ne!(c0, CompactKey64::EMPTY);
         assert!(c0.is_comp());
+        assert!(!c0.is_inline());
+        assert!(!c0.is_ref());
         assert_eq!(c0.comp_id(), 0);
+        let cmax = CompactKey64::from_comp(u32::MAX);
+        assert!(cmax.is_comp());
+        assert_eq!(cmax.comp_id(), u32::MAX);
 
-        let k_empty = CompactKey64::encode_raw_inline(b"").unwrap();
+        assert!(CompactKey64::encode_raw_inline(b"").is_none());
+        assert!(CompactKey64::encode_raw_inline(b"u\x00").is_none());
+        assert!(CompactKey64::encode_raw_inline(b"u\x00abcdefg").is_none());
+        assert!(CompactKey64::encode_raw_inline(b"12345678\x00").is_none());
+        assert!(CompactKey64::encode_raw_inline(b"12345678\x80").is_none());
+        assert!(CompactKey64::encode_raw_inline(b"\xff").is_none());
+        assert!(CompactKey64::encode_raw_inline(b"1234567890").is_none());
+
+        let k_empty = CompactKey64::encode_raw(b"", 0, &mut arena);
+        assert!(k_empty.is_ref());
+        let k_unul = CompactKey64::encode_raw(b"u\x00", 0, &mut arena);
+        assert!(k_unul.is_ref());
         let k_u = CompactKey64::encode_raw_inline(b"u").unwrap();
-        let k_unul = CompactKey64::encode_raw_inline(b"u\x00").unwrap();
-        let k_7 = CompactKey64::encode_raw_inline(b"a\t\r12\xffz").unwrap();
-        assert_ne!(k_u, k_unul);
-        assert_ne!(k_empty, CompactKey64::EMPTY);
-        let mut buf = [0u8; 10];
-        let n7 = k_7.decode_inline(&mut buf);
-        assert_eq!(&buf[..n7], b"a\t\r12\xffz");
-        let nunul = k_unul.decode_inline(&mut buf);
-        assert_eq!(&buf[..nunul], b"u\x00");
+        assert!(k_u.is_inline());
 
-        let ordered = [
-            b"00000000".as_slice(),
+        let mut buf = [0u8; 10];
+        let samples: &[&[u8]] = &[
+            b"\x01",
+            b"!root",
+            b"a",
+            b"a\t\r12z",
+            b"a\t\r12\x7fz",
+            b"id_500",
+            b"1234567",
+            b"u1234567",
+            b"u12345678",
+            b"~zzzzzzzz",
+        ];
+        for &s in samples {
+            let k = CompactKey64::encode_raw_inline(s).unwrap();
+            assert!(k.is_inline());
+            assert!(!k.is_comp());
+            assert!(!k.is_ref());
+            let n = k.decode_inline(&mut buf);
+            assert_eq!(&buf[..n], s, "roundtrip failed for {s:?}");
+        }
+
+        // Mixed-length 1..=9 non-NUL ASCII lexicographic ordering
+        let mut ordered: Vec<&[u8]> = vec![
+            b"\x01",
+            b"!a",
+            b"!root",
+            b"0",
+            b"00",
+            b"00000000",
             b"000000000",
-            b"0000000000",
             b"00000001",
             b"AAAAAAAA",
+            b"ZZZZZZZZZ",
+            b"_",
             b"________",
-            b"aaaaaaaa",
+            b"a",
+            b"a\t\r12z",
+            b"aa",
+            b"u",
+            b"u1",
+            b"u10",
             b"u1234567",
-            b"u12345670",
-            b"zzzzzzzzzz",
+            b"u12345678",
+            b"z",
+            b"zzzzzzzzz",
+            b"~",
         ];
-        let mut packed = Vec::new();
-        for &s in &ordered {
-            let k = CompactKey64::encode_raw_inline(s).unwrap();
-            assert!(k.is_pack10());
-            let n = k.decode_inline(&mut buf);
-            assert_eq!(&buf[..n], s);
-            packed.push(k);
-        }
-        for w in packed.windows(2) {
-            assert!(w[0].0 < w[1].0, "order failed for {:?} vs {:?}", w[0], w[1]);
+        ordered.sort();
+        for w in ordered.windows(2) {
+            let ka = CompactKey64::encode_raw_inline(w[0]).unwrap();
+            let kb = CompactKey64::encode_raw_inline(w[1]).unwrap();
+            assert_eq!(
+                ka.0.cmp(&kb.0),
+                w[0].cmp(w[1]),
+                "order mismatch for {:?} vs {:?}",
+                w[0],
+                w[1]
+            );
         }
 
-        assert!(CompactKey64::encode_raw_inline(b"!chain_min").is_none());
         let k_special = CompactKey64::encode_raw(b"!chain_min", 0, &mut arena);
         assert!(k_special.is_ref());
         let k_long = CompactKey64::encode_raw(b"chain_00000", 0, &mut arena);
