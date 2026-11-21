@@ -6,16 +6,17 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::csv::{
-    cmp_raw_keys, mix64, resolve_raw_key, CompactKey64, CsvSource, LongArena, CHUNK_BYTES,
+    cmp_raw_keys, mix64, resolve_raw_key, CompactKey64, CsvSource, LineBounds, LongArena,
+    CHUNK_BYTES,
 };
 
 const LINK_SHARDS: usize = 32;
+const BUILD_TAG_MASK: u32 = 0xFFF0_0000;
+const BUILD_IDX_MASK: u32 = 0x000F_FFFF;
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct BuildSlot {
-    key: u64,
-    val: u32,
+#[inline(always)]
+fn link_tag12(h: u64) -> u32 {
+    ((h >> 20) as u32) & BUILD_TAG_MASK
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +212,7 @@ impl LinkMap {
 #[derive(Clone, Copy)]
 struct NodeProbe {
     key: u64,
+    tag12: u32,
     shard: u16,
     slot: u32,
 }
@@ -218,15 +220,17 @@ struct NodeProbe {
 impl NodeProbe {
     const EMPTY: Self = Self {
         key: 0,
+        tag12: 0,
         shard: u16::MAX,
         slot: 0,
     };
 }
 
 #[inline(always)]
-fn prep_node_probe(k: CompactKey64, build_shards: &[(Vec<BuildSlot>, usize)]) -> NodeProbe {
+fn prep_node_probe(k: CompactKey64, build_shards: &[(Vec<u32>, usize)]) -> NodeProbe {
     if !k.is_ref() {
         let h = mix64(k.0);
+        let tag12 = link_tag12(h);
         let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
         let (ref slots, mask) = unsafe { build_shards.get_unchecked(s) };
         let slot = (h as usize) & *mask;
@@ -239,12 +243,14 @@ fn prep_node_probe(k: CompactKey64, build_shards: &[(Vec<BuildSlot>, usize)]) ->
         }
         NodeProbe {
             key: k.0,
+            tag12,
             shard: s as u16,
             slot: slot as u32,
         }
     } else {
         NodeProbe {
             key: k.0,
+            tag12: 0,
             shard: u16::MAX,
             slot: 0,
         }
@@ -254,19 +260,25 @@ fn prep_node_probe(k: CompactKey64, build_shards: &[(Vec<BuildSlot>, usize)]) ->
 #[inline(always)]
 fn resolve_node_probe(
     p: NodeProbe,
-    build_shards: &[(Vec<BuildSlot>, usize)],
+    build_shards: &[(Vec<u32>, usize)],
     offsets: &[usize; LINK_SHARDS + 1],
+    all_nodes: &[CompactKey64],
     worker_arenas: &[LongArena],
     long_build_map: &HashMap<Box<[u8]>, u32>,
 ) -> u32 {
     if p.shard != u16::MAX {
         let s = p.shard as usize;
         let (ref slots, mask) = unsafe { build_shards.get_unchecked(s) };
+        let base = unsafe { *offsets.get_unchecked(s) };
         let mut slot = p.slot as usize;
         loop {
             let cur = unsafe { *slots.get_unchecked(slot) };
-            if cur.key == p.key {
-                return (unsafe { *offsets.get_unchecked(s) } as u32) + cur.val;
+            if (cur & BUILD_TAG_MASK) == p.tag12 {
+                let local_idx = ((cur & BUILD_IDX_MASK) as usize).wrapping_sub(1);
+                let gid = base + local_idx;
+                if unsafe { all_nodes.get_unchecked(gid).0 } == p.key {
+                    return gid as u32;
+                }
             }
             slot = (slot + 1) & mask;
         }
@@ -313,43 +325,44 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             let next_ref = &next_chunk;
             scope.spawn(move |_| {
                 let mut buf = Vec::new();
+                let mut batch: Vec<LineBounds<2>> = Vec::new();
                 loop {
                     let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
                     let Some(&task) = chunks_ref.get(cidx) else {
                         break;
                     };
                     if let Err(e) =
-                        src_ref.for_each_chunk_spans::<2>(task, &mut buf, |padded, starts, ends| {
-                            let a_s = starts[0] as usize;
-                            let a_e = ends[0] as usize;
-                            let b_s = starts[1] as usize;
-                            let b_e = ends[1] as usize;
-                            if a_e <= a_s || b_e <= b_s {
-                                return;
-                            }
-                            let a = unsafe { padded.get_unchecked(a_s..a_e) };
-                            let b = unsafe { padded.get_unchecked(b_s..b_e) };
-                            if a == b {
-                                return;
-                            }
-                            let ka =
-                                CompactKey64::encode_raw_inline_padded(padded, a_s, a_e - a_s)
-                                    .unwrap_or_else(|| arena_out.push_ref(wid, a));
-                            let kb =
-                                CompactKey64::encode_raw_inline_padded(padded, b_s, b_e - b_s)
-                                    .unwrap_or_else(|| arena_out.push_ref(wid, b));
-                            edges_out.push((ka, kb));
-                            if !ka.is_ref() {
-                                let s = ((mix64(ka.0) >> 52) as usize) & (LINK_SHARDS - 1);
-                                buckets_out[s].push(ka);
-                            } else {
-                                long_out.push(ka);
-                            }
-                            if !kb.is_ref() {
-                                let s = ((mix64(kb.0) >> 52) as usize) & (LINK_SHARDS - 1);
-                                buckets_out[s].push(kb);
-                            } else {
-                                long_out.push(kb);
+                        src_ref.for_each_chunk_batch::<2>(task, &mut buf, &mut batch, |padded, lines| {
+                            for lb in lines {
+                                let (a_s, a_e) = lb.span(0);
+                                let (b_s, b_e) = lb.span(1);
+                                if a_e <= a_s || b_e <= b_s {
+                                    continue;
+                                }
+                                let a = unsafe { padded.get_unchecked(a_s..a_e) };
+                                let b = unsafe { padded.get_unchecked(b_s..b_e) };
+                                if a == b {
+                                    continue;
+                                }
+                                let ka =
+                                    CompactKey64::encode_raw_inline_padded(padded, a_s, a_e - a_s)
+                                        .unwrap_or_else(|| arena_out.push_ref(wid, a));
+                                let kb =
+                                    CompactKey64::encode_raw_inline_padded(padded, b_s, b_e - b_s)
+                                        .unwrap_or_else(|| arena_out.push_ref(wid, b));
+                                edges_out.push((ka, kb));
+                                if !ka.is_ref() {
+                                    let s = ((mix64(ka.0) >> 52) as usize) & (LINK_SHARDS - 1);
+                                    buckets_out[s].push(ka);
+                                } else {
+                                    long_out.push(ka);
+                                }
+                                if !kb.is_ref() {
+                                    let s = ((mix64(kb.0) >> 52) as usize) & (LINK_SHARDS - 1);
+                                    buckets_out[s].push(kb);
+                                } else {
+                                    long_out.push(kb);
+                                }
                             }
                         })
                     {
@@ -382,28 +395,29 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
         }
     }
 
-    // Stage L2: shard-parallel interning sized to avoid resizes on 20M.
-    let shard_results: Vec<(Vec<BuildSlot>, usize, Vec<CompactKey64>)> = shard_inputs
+    // Stage L2: shard-parallel interning with 4B tagged slots (tag12 | (local_idx + 1)).
+    let shard_results: Vec<(Vec<u32>, usize, Vec<CompactKey64>)> = shard_inputs
         .into_par_iter()
         .map(|batches| {
             let total: usize = batches.iter().map(Vec::len).sum();
             let mut cap = ((total * 10 / 9).max(16)).next_power_of_two();
             let mut mask = cap - 1;
-            let mut slots = vec![BuildSlot { key: 0, val: 0 }; cap];
-            let mut nodes = Vec::with_capacity((total / 2).max(16));
+            let mut slots = vec![0u32; cap];
+            let mut nodes: Vec<CompactKey64> = Vec::with_capacity((total / 2).max(16));
             for batch in batches {
                 for k in batch {
                     if (nodes.len() + 1) * 10 >= cap * 6 {
                         let new_cap = cap * 2;
                         let new_mask = new_cap - 1;
-                        let mut new_slots = vec![BuildSlot { key: 0, val: 0 }; new_cap];
-                        for s in &slots {
-                            if s.key != 0 {
-                                let mut p = (mix64(s.key) as usize) & new_mask;
-                                while new_slots[p].key != 0 {
+                        let mut new_slots = vec![0u32; new_cap];
+                        for &cur in &slots {
+                            if cur != 0 {
+                                let idx = ((cur & BUILD_IDX_MASK) - 1) as usize;
+                                let mut p = (mix64(nodes[idx].0) as usize) & new_mask;
+                                while new_slots[p] != 0 {
                                     p = (p + 1) & new_mask;
                                 }
-                                new_slots[p] = *s;
+                                new_slots[p] = cur;
                             }
                         }
                         slots = new_slots;
@@ -411,20 +425,22 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
                         mask = new_mask;
                     }
                     let h = mix64(k.0);
+                    let tag12 = link_tag12(h);
                     let mut slot = (h as usize) & mask;
                     loop {
                         let cur = slots[slot];
-                        if cur.key == k.0 {
+                        if cur == 0 {
+                            assert!(nodes.len() < BUILD_IDX_MASK as usize, "link shard overflow");
+                            let idx1 = (nodes.len() + 1) as u32;
+                            nodes.push(k);
+                            slots[slot] = tag12 | idx1;
                             break;
                         }
-                        if cur.key == 0 {
-                            let idx = nodes.len() as u32;
-                            nodes.push(k);
-                            slots[slot] = BuildSlot {
-                                key: k.0,
-                                val: idx,
-                            };
-                            break;
+                        if (cur & BUILD_TAG_MASK) == tag12 {
+                            let idx = ((cur & BUILD_IDX_MASK) - 1) as usize;
+                            if nodes[idx].0 == k.0 {
+                                break;
+                            }
                         }
                         slot = (slot + 1) & mask;
                     }
@@ -496,8 +512,22 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
                     prep_node_probe(kb, &build_shards),
                 );
             }
-            let u0 = resolve_node_probe(pa, &build_shards, &offsets, arenas_ref, &long_build_map);
-            let v0 = resolve_node_probe(pb, &build_shards, &offsets, arenas_ref, &long_build_map);
+            let u0 = resolve_node_probe(
+                pa,
+                &build_shards,
+                &offsets,
+                all_nodes_ref,
+                arenas_ref,
+                &long_build_map,
+            );
+            let v0 = resolve_node_probe(
+                pb,
+                &build_shards,
+                &offsets,
+                all_nodes_ref,
+                arenas_ref,
+                &long_build_map,
+            );
             loop {
                 let u = atomic_find(&parent, u0);
                 let v = atomic_find(&parent, v0);
@@ -528,27 +558,30 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     drop(build_shards);
     drop(long_build_map);
 
-    // Flatten into static u32 vector in parallel.
-    let flat_parent: Vec<u32> = (0..num_nodes)
-        .into_par_iter()
-        .map(|i| {
-            let mut r = parent[i].load(Ordering::Relaxed);
-            loop {
-                let p = parent[r as usize].load(Ordering::Relaxed);
-                if p == r {
-                    return r;
-                }
-                r = p;
+    // Flatten parent in place in parallel to true root r (parent[r] == r), skipping r == i / r == p0.
+    (0..num_nodes).into_par_iter().for_each(|i| {
+        let p0 = parent[i].load(Ordering::Relaxed);
+        if p0 as usize == i {
+            return;
+        }
+        let mut r = p0;
+        loop {
+            let p = parent[r as usize].load(Ordering::Relaxed);
+            if p == r {
+                break;
             }
-        })
-        .collect();
-    drop(parent);
+            r = p;
+        }
+        if r != p0 {
+            parent[i].store(r, Ordering::Relaxed);
+        }
+    });
 
     let has_long_nodes = num_inline < num_nodes;
     let has_long_root = has_long_nodes
-        && flat_parent
-            .par_iter()
-            .any(|&r| all_nodes[r as usize].is_ref());
+        && (0..num_nodes)
+            .into_par_iter()
+            .any(|i| all_nodes[parent[i].load(Ordering::Relaxed) as usize].is_ref());
 
     let mut canon_arena: Vec<u8> = Vec::new();
     let mut canon_spans: Vec<(u32, u32)> = Vec::new();
@@ -558,7 +591,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     if !has_long_root {
         if has_long_nodes {
             for i in num_inline..num_nodes {
-                let r = flat_parent[i] as usize;
+                let r = parent[i].load(Ordering::Relaxed) as usize;
                 let canon = all_nodes[r];
                 let bytes = LongArena::resolve_in(&worker_arenas, all_nodes[i]);
                 long_map.insert(bytes.to_vec().into_boxed_slice(), canon);
@@ -568,7 +601,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
         let mut root_canon = vec![CompactKey64::EMPTY; num_nodes];
         let mut scratch = [0u8; 10];
         for i in 0..num_nodes {
-            let r = flat_parent[i] as usize;
+            let r = parent[i].load(Ordering::Relaxed) as usize;
             if root_canon[r] == CompactKey64::EMPTY {
                 let r_key = all_nodes[r];
                 if !r_key.is_ref() {
@@ -586,7 +619,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
 
         node_canon = vec![CompactKey64::EMPTY; num_nodes];
         for i in 0..num_nodes {
-            let r = flat_parent[i] as usize;
+            let r = parent[i].load(Ordering::Relaxed) as usize;
             let canon = root_canon[r];
             let k = all_nodes[i];
             if !k.is_ref() {
@@ -602,7 +635,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     let has_long = !long_map.is_empty();
     drop(worker_arenas);
 
-    // Stage L5: parallel compact fast_range shards + parallel L2-resident 1 MB 3-bit Bloom.
+    // Stage L5: parallel 1-pass non-root collection + 80% fast_range shards + L2-resident Bloom.
     let total_words = (num_inline / 8)
         .max(64)
         .next_power_of_two()
@@ -613,7 +646,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     let mut bloom = vec![0u64; LINK_SHARDS * words_per_shard];
 
     let all_nodes_slice = &all_nodes;
-    let flat_parent_slice = &flat_parent;
+    let parent_slice = &parent;
     let node_canon_slice = &node_canon;
     let shards: Vec<FlatLinkShard> = bloom
         .par_chunks_mut(words_per_shard)
@@ -621,25 +654,24 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
         .map(|(s, bloom_slice)| {
             let lo = offsets[s];
             let hi = offsets[s + 1];
-            let canon_of = |i: usize| -> CompactKey64 {
-                if node_canon_slice.is_empty() {
-                    let r = flat_parent_slice[i] as usize;
+            let mut non_roots: Vec<(usize, CompactKey64)> = Vec::new();
+            if node_canon_slice.is_empty() {
+                for i in lo..hi {
+                    let r = parent_slice[i].load(Ordering::Relaxed) as usize;
                     if i != r {
-                        all_nodes_slice[r]
-                    } else {
-                        CompactKey64::EMPTY
+                        non_roots.push((i, all_nodes_slice[r]));
                     }
-                } else {
-                    node_canon_slice[i]
                 }
-            };
-            let mut m = 0usize;
-            for i in lo..hi {
-                if canon_of(i) != CompactKey64::EMPTY {
-                    m += 1;
+            } else {
+                for i in lo..hi {
+                    let canon = node_canon_slice[i];
+                    if canon != CompactKey64::EMPTY {
+                        non_roots.push((i, canon));
+                    }
                 }
             }
-            let cap = ((m * 10 + 6) / 7).max(m + 1).max(2);
+            let m = non_roots.len();
+            let cap = ((m * 5 + 3) / 4).max(m + 1).max(2);
             let mut slots = vec![
                 LinkSlot {
                     key: 0,
@@ -647,26 +679,24 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
                 };
                 cap
             ];
-            for i in lo..hi {
-                let canon = canon_of(i);
-                if canon != CompactKey64::EMPTY {
-                    let key = all_nodes_slice[i].0;
-                    let h = mix64(key);
-                    let widx = ((h >> 32) as usize) & bloom_sub_mask;
-                    bloom_slice[widx] |= bloom_bits(h);
-                    let mut pos = fast_range32(h, cap);
-                    while slots[pos].key != 0 {
-                        pos += 1;
-                        if pos == cap {
-                            pos = 0;
-                        }
+            for (i, canon) in non_roots {
+                let key = all_nodes_slice[i].0;
+                let h = mix64(key);
+                let widx = ((h >> 32) as usize) & bloom_sub_mask;
+                bloom_slice[widx] |= bloom_bits(h);
+                let mut pos = fast_range32(h, cap);
+                while slots[pos].key != 0 {
+                    pos += 1;
+                    if pos == cap {
+                        pos = 0;
                     }
-                    slots[pos] = LinkSlot { key, canon };
                 }
+                slots[pos] = LinkSlot { key, canon };
             }
             FlatLinkShard { slots, cap }
         })
         .collect();
+    drop(parent);
 
     Ok(LinkMap {
         bloom,

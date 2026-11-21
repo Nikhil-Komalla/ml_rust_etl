@@ -193,34 +193,12 @@ impl DateCache {
     }
 
     #[inline(always)]
-    fn parse_civil_datetime_19_sec_hint(
-        &mut self,
-        b: &[u8],
-        hint_hi: u64,
-        hint_lo: u16,
-        hint_dd: i32,
-    ) -> Option<i64> {
-        if b[10] != b'T' {
-            return None;
-        }
-        let hi = u64::from_ne_bytes(b[0..8].try_into().unwrap());
-        let lo = u16::from_ne_bytes(b[8..10].try_into().unwrap());
-        let dd = if hi == hint_hi && lo == hint_lo {
-            hint_dd
-        } else {
-            let (d, _, _) = self.parse_civil_date_days(b)?;
-            d
-        };
-        let hms_sec = parse_hms_sec(b)?;
-        Some((dd as i64) * 86_400 + hms_sec)
-    }
-
-    #[inline(always)]
-    pub fn parse_f1_sec_with_date(&mut self, b: &[u8]) -> Option<(i64, u64, u16, i32)> {
+    pub fn parse_f1_sec_with_date(&mut self, b: &[u8]) -> Option<(i64, u64, u16, i64)> {
         if b.len() == 20 && b[19] == b'Z' {
             let (dd, hi, lo) = self.parse_civil_date_days(b)?;
             let hms_sec = parse_hms_sec(b)?;
-            Some(((dd as i64) * 86_400 + hms_sec, hi, lo, dd))
+            let day_sec = (dd as i64) * 86_400;
+            Some((day_sec + hms_sec, hi, lo, day_sec))
         } else {
             None
         }
@@ -238,23 +216,37 @@ impl DateCache {
         b: &[u8],
         hint_hi: u64,
         hint_lo: u16,
-        hint_dd: i32,
+        hint_day_sec: i64,
     ) -> Option<i64> {
         let len = b.len();
-        if len == 0 {
-            return None;
-        }
         if len == 20 && b[19] == b'Z' {
-            let sec = if HAS_HINT {
-                self.parse_civil_datetime_19_sec_hint(b, hint_hi, hint_lo, hint_dd)?
-            } else {
-                self.parse_civil_datetime_19_sec(b)?
-            };
+            if HAS_HINT {
+                if b[10] != b'T' {
+                    return None;
+                }
+                let ptr = b.as_ptr();
+                let hi = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
+                let lo = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
+                let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
+                let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
+                if !hms_ok {
+                    return None;
+                }
+                let day_sec = if hi == hint_hi && lo == hint_lo {
+                    hint_day_sec
+                } else {
+                    let (d, _, _) = self.parse_civil_date_days(b)?;
+                    (d as i64) * 86_400
+                };
+                return Some((day_sec + hms_sec) * MS_SECOND);
+            }
+            let sec = self.parse_civil_datetime_19_sec(b)?;
             return Some(sec * MS_SECOND);
         }
         if len == 13 {
-            let hi8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let lo8 = u64::from_le_bytes(b[5..13].try_into().unwrap());
+            let ptr = b.as_ptr();
+            let hi8 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
+            let lo8 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
             if is_8_ascii_digits(hi8) && is_8_ascii_digits(lo8) {
                 let tail5 = parse_8_ascii_digits((lo8 & 0xFFFF_FFFF_FF00_0000) | 0x0030_3030);
                 return Some(parse_8_ascii_digits(hi8) as i64 * 100_000 + tail5 as i64);
@@ -262,22 +254,43 @@ impl DateCache {
             return None;
         }
         if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
-            let base = if HAS_HINT {
-                self.parse_civil_datetime_19_sec_hint(b, hint_hi, hint_lo, hint_dd)? * MS_SECOND
+            let ptr = b.as_ptr();
+            if b[10] != b'T' {
+                return None;
+            }
+            let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
+            let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
+            if !hms_ok {
+                return None;
+            }
+            let day_sec = if HAS_HINT {
+                let hi = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
+                let lo = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
+                if hi == hint_hi && lo == hint_lo {
+                    hint_day_sec
+                } else {
+                    let (d, _, _) = self.parse_civil_date_days(b)?;
+                    (d as i64) * 86_400
+                }
             } else {
-                self.parse_civil_datetime_19_sec(b)? * MS_SECOND
+                let (d, _, _) = self.parse_civil_date_days(b)?;
+                (d as i64) * 86_400
             };
             let oh = d2(b[20], b[21])?;
             let om = d2(b[23], b[24])?;
             if oh > 23 || om > 59 {
                 return None;
             }
+            let base = (day_sec + hms_sec) * MS_SECOND;
             let off_ms = (oh * 3_600 + om * 60) * MS_SECOND;
             return Some(if b[19] == b'+' {
                 base - off_ms
             } else {
                 base + off_ms
             });
+        }
+        if len == 0 {
+            return None;
         }
         parse_f3_ms(b)
     }
@@ -294,111 +307,93 @@ impl DateCache {
         b: &[u8],
         hint_hi: u64,
         hint_lo: u16,
-        hint_dd: i32,
+        hint_day_sec: i64,
     ) -> Option<i64> {
-        self.parse_ts_ms_inner::<true>(b, hint_hi, hint_lo, hint_dd)
+        self.parse_ts_ms_inner::<true>(b, hint_hi, hint_lo, hint_day_sec)
     }
 
     #[inline(always)]
-    pub fn parse_ts_ms_padded_hint(
+    pub fn parse_ts_ms_cached(
         &mut self,
-        padded: &[u8],
-        start: usize,
-        len: usize,
-        hint_hi: u64,
-        hint_lo: u16,
-        hint_dd: i32,
-    ) -> Option<i64> {
-        debug_assert!(padded.len() >= start + 32);
-        let ptr = unsafe { padded.as_ptr().add(start) };
-        let is_f1 = (len == 20) & (unsafe { *ptr.add(19) } == b'Z');
-        let is_f3 = len == 13;
-        if is_f1 | is_f3 {
-            let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
-            let w0_ne = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
-            let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
-            let lo2 = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
-            let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
-
-            let f3_ok = is_8_ascii_digits(w0) & is_8_ascii_digits(w5);
-            let f3_ms = (parse_8_ascii_digits(w0) as i64)
-                .wrapping_mul(100_000)
-                .wrapping_add(
-                    parse_8_ascii_digits((w5 & 0xFFFF_FFFF_FF00_0000) | 0x0030_3030) as i64,
-                );
-
-            let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
-            let f1_ok = (w0_ne == hint_hi)
-                & (lo2 == hint_lo)
-                & (unsafe { *ptr.add(10) } == b'T')
-                & hms_ok;
-            let f1_ms = ((hint_dd as i64)
-                .wrapping_mul(86_400)
-                .wrapping_add(hms_sec))
-            .wrapping_mul(MS_SECOND);
-
-            let fast_ok = if is_f1 { f1_ok } else { f3_ok };
-            if fast_ok {
-                return Some(if is_f1 { f1_ms } else { f3_ms });
-            }
-        }
-        let s = unsafe { padded.get_unchecked(start..start + len) };
-        self.parse_ts_ms_with_hint(s, hint_hi, hint_lo, hint_dd)
-    }
-
-    #[inline(always)]
-    pub fn parse_ts_ms_padded(
-        &mut self,
-        padded: &[u8],
-        start: usize,
-        len: usize,
+        b: &[u8],
         last_hi: &mut u64,
         last_lo: &mut u16,
-        last_dd: &mut i32,
+        last_day_sec: &mut i64,
     ) -> Option<i64> {
-        debug_assert!(padded.len() >= start + 32);
-        let ptr = unsafe { padded.as_ptr().add(start) };
-        let is_f1 = (len == 20) & (unsafe { *ptr.add(19) } == b'Z');
-        let is_f3 = len == 13;
-        if is_f1 | is_f3 {
-            let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
-            let w0_ne = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
-            let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
-            let lo2 = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
+        let len = b.len();
+        if len == 20 && b[19] == b'Z' {
+            if b[10] != b'T' {
+                return None;
+            }
+            let ptr = b.as_ptr();
+            let hi = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
+            let lo = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
             let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
-
-            let f3_ok = is_8_ascii_digits(w0) & is_8_ascii_digits(w5);
-            let f3_ms = (parse_8_ascii_digits(w0) as i64)
-                .wrapping_mul(100_000)
-                .wrapping_add(
-                    parse_8_ascii_digits((w5 & 0xFFFF_FFFF_FF00_0000) | 0x0030_3030) as i64,
-                );
-
             let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
-            let f1_ok = (w0_ne == *last_hi)
-                & (lo2 == *last_lo)
-                & (unsafe { *ptr.add(10) } == b'T')
-                & hms_ok;
-            let f1_ms = ((*last_dd as i64)
-                .wrapping_mul(86_400)
-                .wrapping_add(hms_sec))
-            .wrapping_mul(MS_SECOND);
-
-            let fast_ok = if is_f1 { f1_ok } else { f3_ok };
-            if fast_ok {
-                return Some(if is_f1 { f1_ms } else { f3_ms });
+            if !hms_ok {
+                return None;
             }
+            let day_sec = if hi == *last_hi && lo == *last_lo {
+                *last_day_sec
+            } else {
+                let (dd, d_hi, d_lo) = self.parse_civil_date_days(b)?;
+                let ds = (dd as i64) * 86_400;
+                *last_hi = d_hi;
+                *last_lo = d_lo;
+                *last_day_sec = ds;
+                ds
+            };
+            return Some((day_sec + hms_sec) * MS_SECOND);
         }
-        let s = unsafe { padded.get_unchecked(start..start + len) };
-        let res = self.parse_ts_ms_with_hint(s, *last_hi, *last_lo, *last_dd);
-        if res.is_some() && (len == 20 || len == 25) {
-            if let Some((dd, hi, lo)) = self.parse_civil_date_days(s) {
-                *last_hi = hi;
-                *last_lo = lo;
-                *last_dd = dd;
+        if len == 13 {
+            let ptr = b.as_ptr();
+            let hi8 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
+            let lo8 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
+            if is_8_ascii_digits(hi8) && is_8_ascii_digits(lo8) {
+                let tail5 = parse_8_ascii_digits((lo8 & 0xFFFF_FFFF_FF00_0000) | 0x0030_3030);
+                return Some(parse_8_ascii_digits(hi8) as i64 * 100_000 + tail5 as i64);
             }
+            return None;
         }
-        res
+        if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+            if b[10] != b'T' {
+                return None;
+            }
+            let ptr = b.as_ptr();
+            let hi = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
+            let lo = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
+            let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
+            let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
+            if !hms_ok {
+                return None;
+            }
+            let oh = d2(b[20], b[21])?;
+            let om = d2(b[23], b[24])?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let day_sec = if hi == *last_hi && lo == *last_lo {
+                *last_day_sec
+            } else {
+                let (dd, d_hi, d_lo) = self.parse_civil_date_days(b)?;
+                let ds = (dd as i64) * 86_400;
+                *last_hi = d_hi;
+                *last_lo = d_lo;
+                *last_day_sec = ds;
+                ds
+            };
+            let base = (day_sec + hms_sec) * MS_SECOND;
+            let off_ms = (oh * 3_600 + om * 60) * MS_SECOND;
+            return Some(if b[19] == b'+' {
+                base - off_ms
+            } else {
+                base + off_ms
+            });
+        }
+        if len == 0 {
+            return None;
+        }
+        parse_f3_ms(b)
     }
 }
 
@@ -629,60 +624,42 @@ mod tests {
                     "f1_sec mismatch on {:?}",
                     String::from_utf8_lossy(s)
                 );
-                if let Some((_, h_hi, h_lo, h_dd)) =
+                if let Some((_, h_hi, h_lo, h_day_sec)) =
                     cache.parse_f1_sec_with_date(b"2026-10-03T12:00:00Z")
                 {
                     assert_eq!(
-                        cache.parse_ts_ms_with_hint(s, h_hi, h_lo, h_dd),
+                        cache.parse_ts_ms_with_hint(s, h_hi, h_lo, h_day_sec),
                         parse_ts_ms(s),
                         "hint mismatch on {:?}",
                         String::from_utf8_lossy(s)
                     );
-                    let mut pad = vec![0xAAu8; 4 + s.len() + 40];
-                    pad[4..4 + s.len()].copy_from_slice(s);
-                    assert_eq!(
-                        cache.parse_ts_ms_padded_hint(&pad, 4, s.len(), h_hi, h_lo, h_dd),
-                        parse_ts_ms(s),
-                        "padded hint mismatch on {:?}",
-                        String::from_utf8_lossy(s)
-                    );
                 }
-                let mut click_pad = vec![0x5Au8; 4 + s.len() + 40];
-                click_pad[4..4 + s.len()].copy_from_slice(s);
                 let mut l_hi = u64::MAX;
                 let mut l_lo = 0u16;
-                let mut l_dd = 0i32;
+                let mut l_day_sec = 0i64;
                 assert_eq!(
-                    cache.parse_ts_ms_padded(
-                        &click_pad,
-                        4,
-                        s.len(),
-                        &mut l_hi,
-                        &mut l_lo,
-                        &mut l_dd
-                    ),
+                    cache.parse_ts_ms_cached(s, &mut l_hi, &mut l_lo, &mut l_day_sec),
                     parse_ts_ms(s),
-                    "padded click mismatch on {:?}",
+                    "cached click mismatch on {:?}",
                     String::from_utf8_lossy(s)
                 );
             }
         }
-        // Repeated F1 hits on padded clicks (exercise last_hi/lo fast path + day transitions)
+        // Repeated F1/F2 hits on cached clicks (exercise last_hi/lo fast path + day transitions)
         let mut l_hi = u64::MAX;
         let mut l_lo = 0u16;
-        let mut l_dd = 0i32;
+        let mut l_day_sec = 0i64;
         for s in [
             b"2026-10-03T01:02:03Z".as_slice(),
             b"2026-10-03T23:59:59Z".as_slice(),
+            b"2026-10-03T19:58:10-04:00".as_slice(),
             b"1791071890000".as_slice(),
             b"2026-10-03T12:00:00Z".as_slice(),
             b"2026-10-04T00:00:01Z".as_slice(),
             b"2026-10-04T05:06:07Z".as_slice(),
         ] {
-            let mut pad = vec![b'Z'; 2 + s.len() + 40];
-            pad[2..2 + s.len()].copy_from_slice(s);
             assert_eq!(
-                cache.parse_ts_ms_padded(&pad, 2, s.len(), &mut l_hi, &mut l_lo, &mut l_dd),
+                cache.parse_ts_ms_cached(s, &mut l_hi, &mut l_lo, &mut l_day_sec),
                 parse_ts_ms(s)
             );
         }

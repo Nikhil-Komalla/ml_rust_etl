@@ -10,7 +10,7 @@ use parquet::basic::Compression;
 
 use crate::csv::{
     cmp_raw_keys, for_each_line_fields_slice, hash_bytes_fast, hash_raw_key, list_csv_files,
-    mix64, CompactKey64, CsvSource, LongArena, CHUNK_BYTES,
+    mix64, CompactKey64, CsvSource, LineBounds, LongArena, CHUNK_BYTES,
 };
 use crate::links::{build_link_map, LinkMap};
 use crate::parse::{
@@ -249,6 +249,46 @@ impl CampDailyAcc {
             }
             Self::Sparse(map) => {
                 map.entry((camp_id, day)).or_default().assisted_sessions += cnt;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn add_assists_batch(&mut self, camps: &[u32], day: i32, cnt: u32) {
+        if camps.is_empty() {
+            return;
+        }
+        match self {
+            Self::Dense {
+                start_day,
+                num_days,
+                num_camps,
+                assists,
+                ..
+            } => {
+                let d_off = day - *start_day;
+                if d_off >= 0 && (d_off as usize) < *num_days {
+                    let n_c = *num_camps;
+                    let row_base = (d_off as usize) * n_c;
+                    for &camp_id in camps {
+                        let c = camp_id as usize;
+                        if c < n_c {
+                            unsafe {
+                                *assists.get_unchecked_mut(row_base + c) += cnt;
+                            }
+                        } else {
+                            unreachable!("assist camp {camp_id} outside dense range");
+                        }
+                    }
+                    return;
+                }
+                unreachable!("assist day {day} outside dense range");
+            }
+            Self::Sparse(map) => {
+                let c64 = cnt as i64;
+                for &camp_id in camps {
+                    map.entry((camp_id, day)).or_default().assisted_sessions += c64;
+                }
             }
         }
     }
@@ -704,6 +744,7 @@ trait Stage5Click: Copy + Send + Sync {
     fn to_grouped(&self) -> Self::Grouped;
     fn sort_grouped(slice: &mut [Self::Grouped]);
     fn unpack_full(g: &Self::Grouped) -> (i64, u32, CompactKey64);
+    fn within_reach(sess_cmp: i64, click_cmp: i64) -> bool;
 }
 
 trait ClickEmit: Stage5Click {
@@ -1386,7 +1427,328 @@ fn flush_cl_pending<C: ClickEmit, const SWCB_CL: usize>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_parse_events_and_clicks<C: ClickEmit>(
+#[inline(never)]
+fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
+    padded: &[u8],
+    lines: &[LineBounds<7>],
+    dcache: &mut DateCache,
+    lookups: &Lookups,
+    link_map: &LinkMap,
+    lm_empty: bool,
+    wid: usize,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    window_start_sec: i64,
+    ev_arena_out: &mut LongArena,
+    ext_out: &mut Vec<ExtEvent>,
+    ev_buckets: &mut [Vec<ParsedEvent>],
+    swcb: &mut [ParsedEvent],
+    swcb_cnt: &mut [u8; P_DEDUP],
+    pending_ev: &mut [ParsedEvent; 64],
+    pending_uh: &mut [u64; 64],
+    pending_ds: &mut [u8; 64],
+    n_pending: &mut usize,
+    hit_idxs: &mut [u8; 64],
+) {
+    const VIEW_U32: u32 = u32::from_ne_bytes(*b"view");
+    const CART_U32: u32 = u32::from_ne_bytes(*b"cart");
+    const PURCHASE_U64: u64 = u64::from_ne_bytes(*b"purchase");
+
+    for lb in lines {
+        let (ev_s, ev_e) = lb.span(0);
+        let ev_len = ev_e - ev_s;
+        if ev_len == 0 {
+            continue;
+        }
+        let (ing_s, ing_e) = lb.span(3);
+        let ingest_ts = unsafe { padded.get_unchecked(ing_s..ing_e) };
+        let Some((ingest_sec, hint_hi, hint_lo, hint_day_sec)) =
+            dcache.parse_f1_sec_with_date(ingest_ts)
+        else {
+            continue;
+        };
+        let ingest_ms = ingest_sec * MS_SECOND;
+        let (ev_key, ev_hash) =
+            if let Some(k) = CompactKey64::encode_raw_inline_padded(padded, ev_s, ev_len) {
+                (k, mix64(k.0))
+            } else {
+                let ev_id = unsafe { padded.get_unchecked(ev_s..ev_e) };
+                (ev_arena_out.push_ref(wid, ev_id), hash_bytes_fast(ev_id))
+            };
+        let d_shard = ((ev_hash >> 52) as usize) & (P_DEDUP - 1);
+
+        let (u_s, u_e) = lb.span(1);
+        let u_len = u_e - u_s;
+        let (ts_s, ts_e) = lb.span(2);
+        let (et_s, et_e) = lb.span(4);
+        let et_len = et_e - et_s;
+        let (p_s, p_e) = lb.span(5);
+        let p_len = p_e - p_s;
+
+        let mut valid = false;
+        let mut ts_ms = 0i64;
+        let mut price_val = 0u32;
+        let mut cat_id = 0u32;
+        let mut is_purchase = false;
+
+        if u_len > 0 && p_len > 0 {
+            if et_len == 4 {
+                let w = unsafe {
+                    u32::from_ne_bytes(*(padded.as_ptr().add(et_s) as *const [u8; 4]))
+                };
+                if (w == VIEW_U32) | (w == CART_U32) {
+                    let ts_slice = unsafe { padded.get_unchecked(ts_s..ts_e) };
+                    if let Some(t) =
+                        dcache.parse_ts_ms_with_hint(ts_slice, hint_hi, hint_lo, hint_day_sec)
+                    {
+                        let in_late = if COMPACT {
+                            (ingest_ms - t) <= MS_DAY
+                        } else {
+                            (ingest_ms as i128 - t as i128) <= MS_DAY as i128
+                        };
+                        if t >= window_start_ms && t < window_end_ms && in_late {
+                            ts_ms = t;
+                            valid = true;
+                        }
+                    }
+                }
+            } else if et_len == 8 {
+                let w8 = unsafe {
+                    u64::from_ne_bytes(*(padded.as_ptr().add(et_s) as *const [u8; 8]))
+                };
+                if w8 == PURCHASE_U64 {
+                    let (pr_s, pr_e) = lb.span(6);
+                    let price = unsafe { padded.get_unchecked(pr_s..pr_e) };
+                    if let Some(p) = parse_price_cents(price) {
+                        let ts_slice = unsafe { padded.get_unchecked(ts_s..ts_e) };
+                        if let Some(t) =
+                            dcache.parse_ts_ms_with_hint(ts_slice, hint_hi, hint_lo, hint_day_sec)
+                        {
+                            let in_late = if COMPACT {
+                                (ingest_ms - t) <= MS_DAY
+                            } else {
+                                (ingest_ms as i128 - t as i128) <= MS_DAY as i128
+                            };
+                            if t >= window_start_ms && t < window_end_ms && in_late {
+                                ts_ms = t;
+                                price_val = p;
+                                cat_id = lookups.get_product_cat_padded(padded, p_s, p_len);
+                                is_purchase = true;
+                                valid = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !valid {
+            swcb_push_nt::<ParsedEvent, SWCB_EV>(
+                swcb,
+                swcb_cnt,
+                ev_buckets,
+                d_shard,
+                ParsedEvent {
+                    ev_key,
+                    person_key: CompactKey64(ingest_ms as u64),
+                    meta: META_INVALID,
+                },
+            );
+            continue;
+        }
+
+        let meta = if COMPACT && !is_purchase {
+            let ingest_sec_rel = ingest_sec - window_start_sec;
+            if (-META_FAST_ING_BIAS..META_FAST_ING_BIAS).contains(&ingest_sec_rel) {
+                let ts_rel = (ts_ms - window_start_ms) as u64;
+                let biased = (ingest_sec_rel + META_FAST_ING_BIAS) as u64;
+                META_VALID_FAST | (biased << 31) | ts_rel
+            } else {
+                let ext_idx = ext_out.len() as u64;
+                ext_out.push(ExtEvent {
+                    ts_ms,
+                    ingest_ts_ms: ingest_ms,
+                    price_cents: price_val,
+                    cat_id,
+                });
+                META_VALID_EXT | ((wid as u64) << 40) | ext_idx
+            }
+        } else {
+            let ext_idx = ext_out.len() as u64;
+            ext_out.push(ExtEvent {
+                ts_ms,
+                ingest_ts_ms: ingest_ms,
+                price_cents: price_val,
+                cat_id,
+            });
+            META_VALID_EXT | ((wid as u64) << 40) | ext_idx
+        };
+
+        if let Some(uk) = CompactKey64::encode_raw_inline_padded(padded, u_s, u_len) {
+            if lm_empty {
+                swcb_push_nt::<ParsedEvent, SWCB_EV>(
+                    swcb,
+                    swcb_cnt,
+                    ev_buckets,
+                    d_shard,
+                    ParsedEvent {
+                        ev_key,
+                        person_key: uk,
+                        meta,
+                    },
+                );
+            } else {
+                let uh = mix64(uk.0);
+                link_map.prefetch_bloom(uh);
+                let p_idx = *n_pending;
+                pending_ev[p_idx] = ParsedEvent {
+                    ev_key,
+                    person_key: uk,
+                    meta,
+                };
+                pending_uh[p_idx] = uh;
+                pending_ds[p_idx] = d_shard as u8;
+                *n_pending = p_idx + 1;
+                if p_idx + 1 == 64 {
+                    flush_ev_pending::<SWCB_EV>(
+                        64,
+                        pending_ev,
+                        pending_uh,
+                        pending_ds,
+                        hit_idxs,
+                        link_map,
+                        swcb,
+                        swcb_cnt,
+                        ev_buckets,
+                    );
+                    *n_pending = 0;
+                }
+            }
+        } else {
+            let uid = unsafe { padded.get_unchecked(u_s..u_s + u_len) };
+            let person_key = link_map
+                .resolve_long(uid)
+                .unwrap_or_else(|| ev_arena_out.push_ref(wid, uid));
+            swcb_push_nt::<ParsedEvent, SWCB_EV>(
+                swcb,
+                swcb_cnt,
+                ev_buckets,
+                d_shard,
+                ParsedEvent {
+                    ev_key,
+                    person_key,
+                    meta,
+                },
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn process_cl_batch<C: ClickEmit, const SWCB_CL: usize>(
+    padded: &[u8],
+    lines: &[LineBounds<4>],
+    dcache: &mut DateCache,
+    last_hi: &mut u64,
+    last_lo: &mut u16,
+    last_day_sec: &mut i64,
+    lookups: &Lookups,
+    link_map: &LinkMap,
+    lm_empty: bool,
+    wid: usize,
+    click_window_start_ms: i64,
+    window_end_ms: i64,
+    cl_arena_out: &mut LongArena,
+    cl_buckets: &mut [Vec<C>],
+    swcb: &mut [C],
+    swcb_cnt: &mut [u8; P_PERSON],
+    pending_cl: &mut [C; 64],
+    pending_uh: &mut [u64; 64],
+    n_pending: &mut usize,
+    hit_idxs: &mut [u8; 64],
+) {
+    for lb in lines {
+        let (cl_s, cl_e) = lb.span(0);
+        let cl_len = cl_e - cl_s;
+        let (u_s, u_e) = lb.span(1);
+        let u_len = u_e - u_s;
+        if cl_len == 0 || u_len == 0 {
+            continue;
+        }
+        let (c_s, c_e) = lb.span(2);
+        let c_len = c_e - c_s;
+        let Some(cid) = lookups.get_campaign_padded(padded, c_s, c_len) else {
+            continue;
+        };
+        let (ts_s, ts_e) = lb.span(3);
+        let ts_slice = unsafe { padded.get_unchecked(ts_s..ts_e) };
+        let Some(ts_ms) = dcache.parse_ts_ms_cached(ts_slice, last_hi, last_lo, last_day_sec)
+        else {
+            continue;
+        };
+        if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
+            continue;
+        }
+        let click_id_key = CompactKey64::encode_raw_inline_padded(padded, cl_s, cl_len)
+            .unwrap_or_else(|| {
+                let click_id = unsafe { padded.get_unchecked(cl_s..cl_e) };
+                cl_arena_out.push_ref(wid, click_id)
+            });
+
+        if let Some(uk) = CompactKey64::encode_raw_inline_padded(padded, u_s, u_len) {
+            let uh = mix64(uk.0);
+            if lm_empty {
+                let pshard = ((uh >> 52) as usize) & (P_PERSON - 1);
+                swcb_push_nt::<C, SWCB_CL>(
+                    swcb,
+                    swcb_cnt,
+                    cl_buckets,
+                    pshard,
+                    C::from_parsed(uk, click_id_key, ts_ms, click_window_start_ms, cid),
+                );
+            } else {
+                link_map.prefetch_bloom(uh);
+                let p_idx = *n_pending;
+                pending_cl[p_idx] =
+                    C::from_parsed(uk, click_id_key, ts_ms, click_window_start_ms, cid);
+                pending_uh[p_idx] = uh;
+                *n_pending = p_idx + 1;
+                if p_idx + 1 == 64 {
+                    flush_cl_pending::<C, SWCB_CL>(
+                        64,
+                        pending_cl,
+                        pending_uh,
+                        hit_idxs,
+                        link_map,
+                        swcb,
+                        swcb_cnt,
+                        cl_buckets,
+                    );
+                    *n_pending = 0;
+                }
+            }
+        } else {
+            let uid = unsafe { padded.get_unchecked(u_s..u_e) };
+            let (pk, ph) = if let Some(pk) = link_map.resolve_long(uid) {
+                (pk, mix64(pk.0))
+            } else {
+                (cl_arena_out.push_ref(wid, uid), hash_bytes_fast(uid))
+            };
+            let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+            swcb_push_nt::<C, SWCB_CL>(
+                swcb,
+                swcb_cnt,
+                cl_buckets,
+                pshard,
+                C::from_parsed(pk, click_id_key, ts_ms, click_window_start_ms, cid),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
     event_src: &CsvSource,
     ev_chunks: &[crate::csv::ChunkTask],
     est_ev_cap: usize,
@@ -1399,7 +1761,6 @@ fn run_parse_events_and_clicks<C: ClickEmit>(
     window_end_ms: i64,
     window_start_sec: i64,
     click_window_start_ms: i64,
-    compact_mode: bool,
     n_workers: usize,
 ) -> io::Result<ParsedPoolOutput<C>> {
     const SWCB_EV: usize = 4;
@@ -1460,232 +1821,40 @@ fn run_parse_events_and_clicks<C: ClickEmit>(
                                 meta: 0,
                             }; 64];
                             let mut pending_ds = [0u8; 64];
+                            let mut ev_batch: Vec<LineBounds<7>> = Vec::new();
 
                             let mut cidx = first;
                             while let Some(&task) = ev_chunks.get(cidx) {
                                 let mut n_pending = 0usize;
-                                if let Err(e) =
-                                    event_src.for_each_chunk_spans::<7>(task, &mut buf, |padded, starts, ends| {
-                                        let ev_s = starts[0] as usize;
-                                        let ev_e = ends[0] as usize;
-                                        let ev_len = ev_e - ev_s;
-                                        if ev_len == 0 {
-                                            return;
-                                        }
-                                        let ingest_ts = unsafe {
-                                            padded.get_unchecked(
-                                                starts[3] as usize..ends[3] as usize,
-                                            )
-                                        };
-                                        let Some((ingest_sec, hint_hi, hint_lo, hint_dd)) =
-                                            dcache.parse_f1_sec_with_date(ingest_ts)
-                                        else {
-                                            return;
-                                        };
-                                        let ingest_ms = ingest_sec * MS_SECOND;
-                                        let (ev_key, ev_hash) =
-                                            if let Some(k) = CompactKey64::encode_raw_inline_padded(
-                                                padded, ev_s, ev_len,
-                                            ) {
-                                                (k, mix64(k.0))
-                                            } else {
-                                                let ev_id =
-                                                    unsafe { padded.get_unchecked(ev_s..ev_e) };
-                                                (
-                                                    ev_arena_out.push_ref(wid, ev_id),
-                                                    hash_bytes_fast(ev_id),
-                                                )
-                                            };
-                                        let d_shard = ((ev_hash >> 52) as usize) & (P_DEDUP - 1);
-
-                                        let u_s = starts[1] as usize;
-                                        let u_len = ends[1] as usize - u_s;
-                                        let ts_s = starts[2] as usize;
-                                        let ts_len = ends[2] as usize - ts_s;
-                                        let et_s = starts[4] as usize;
-                                        let et_len = ends[4] as usize - et_s;
-                                        let p_s = starts[5] as usize;
-                                        let p_len = ends[5] as usize - p_s;
-
-                                        let mut valid = false;
-                                        let mut ts_ms = 0i64;
-                                        let mut price_val = 0u32;
-                                        let mut cat_id = 0u32;
-                                        let mut is_purchase = false;
-
-                                        if u_len > 0 && p_len > 0 {
-                                            if et_len == 4 {
-                                                const VIEW_U32: u32 = u32::from_ne_bytes(*b"view");
-                                                const CART_U32: u32 = u32::from_ne_bytes(*b"cart");
-                                                let w = unsafe {
-                                                    u32::from_ne_bytes(
-                                                        *(padded.as_ptr().add(et_s)
-                                                            as *const [u8; 4]),
-                                                    )
-                                                };
-                                                if (w == VIEW_U32) | (w == CART_U32) {
-                                                    if let Some(t) = dcache.parse_ts_ms_padded_hint(
-                                                        padded, ts_s, ts_len, hint_hi, hint_lo,
-                                                        hint_dd,
-                                                    ) {
-                                                        if t >= window_start_ms
-                                                            && t < window_end_ms
-                                                            && (ingest_ms as i128 - t as i128)
-                                                                <= MS_DAY as i128
-                                                        {
-                                                            ts_ms = t;
-                                                            valid = true;
-                                                        }
-                                                    }
-                                                }
-                                            } else if et_len == 8 {
-                                                const PURCHASE_U64: u64 =
-                                                    u64::from_ne_bytes(*b"purchase");
-                                                let w8 = unsafe {
-                                                    u64::from_ne_bytes(
-                                                        *(padded.as_ptr().add(et_s)
-                                                            as *const [u8; 8]),
-                                                    )
-                                                };
-                                                if w8 == PURCHASE_U64 {
-                                                    let price = unsafe {
-                                                        padded.get_unchecked(
-                                                            starts[6] as usize..ends[6] as usize,
-                                                        )
-                                                    };
-                                                    if let Some(p) = parse_price_cents(price) {
-                                                        if let Some(t) =
-                                                            dcache.parse_ts_ms_padded_hint(
-                                                                padded, ts_s, ts_len, hint_hi,
-                                                                hint_lo, hint_dd,
-                                                            )
-                                                        {
-                                                            if t >= window_start_ms
-                                                                && t < window_end_ms
-                                                                && (ingest_ms as i128 - t as i128)
-                                                                    <= MS_DAY as i128
-                                                            {
-                                                                ts_ms = t;
-                                                                price_val = p;
-                                                                cat_id = lookups
-                                                                    .get_product_cat_padded(
-                                                                        padded, p_s, p_len,
-                                                                    );
-                                                                is_purchase = true;
-                                                                valid = true;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        if !valid {
-                                            swcb_push_nt::<ParsedEvent, SWCB_EV>(
-                                                &mut swcb,
-                                                &mut swcb_cnt,
-                                                &mut ev_buckets,
-                                                d_shard,
-                                                ParsedEvent {
-                                                    ev_key,
-                                                    person_key: CompactKey64(ingest_ms as u64),
-                                                    meta: META_INVALID,
-                                                },
-                                            );
-                                            return;
-                                        }
-
-                                        let meta = if compact_mode && !is_purchase {
-                                            let ingest_sec_rel = ingest_sec - window_start_sec;
-                                            if (-META_FAST_ING_BIAS..META_FAST_ING_BIAS)
-                                                .contains(&ingest_sec_rel)
-                                            {
-                                                let ts_rel = (ts_ms - window_start_ms) as u64;
-                                                let biased =
-                                                    (ingest_sec_rel + META_FAST_ING_BIAS) as u64;
-                                                META_VALID_FAST | (biased << 31) | ts_rel
-                                            } else {
-                                                let ext_idx = ext_out.len() as u64;
-                                                ext_out.push(ExtEvent {
-                                                    ts_ms,
-                                                    ingest_ts_ms: ingest_ms,
-                                                    price_cents: price_val,
-                                                    cat_id,
-                                                });
-                                                META_VALID_EXT | ((wid as u64) << 40) | ext_idx
-                                            }
-                                        } else {
-                                            let ext_idx = ext_out.len() as u64;
-                                            ext_out.push(ExtEvent {
-                                                ts_ms,
-                                                ingest_ts_ms: ingest_ms,
-                                                price_cents: price_val,
-                                                cat_id,
-                                            });
-                                            META_VALID_EXT | ((wid as u64) << 40) | ext_idx
-                                        };
-
-                                        if let Some(uk) = CompactKey64::encode_raw_inline_padded(
-                                            padded, u_s, u_len,
-                                        ) {
-                                            if lm_empty {
-                                                swcb_push_nt::<ParsedEvent, SWCB_EV>(
-                                                    &mut swcb,
-                                                    &mut swcb_cnt,
-                                                    &mut ev_buckets,
-                                                    d_shard,
-                                                    ParsedEvent {
-                                                        ev_key,
-                                                        person_key: uk,
-                                                        meta,
-                                                    },
-                                                );
-                                            } else {
-                                                let uh = mix64(uk.0);
-                                                link_map.prefetch_bloom(uh);
-                                                pending_ev[n_pending] = ParsedEvent {
-                                                    ev_key,
-                                                    person_key: uk,
-                                                    meta,
-                                                };
-                                                pending_uh[n_pending] = uh;
-                                                pending_ds[n_pending] = d_shard as u8;
-                                                n_pending += 1;
-                                                if n_pending == 64 {
-                                                    flush_ev_pending::<SWCB_EV>(
-                                                        64,
-                                                        &pending_ev,
-                                                        &pending_uh,
-                                                        &pending_ds,
-                                                        &mut hit_idxs,
-                                                        link_map,
-                                                        &mut swcb,
-                                                        &mut swcb_cnt,
-                                                        &mut ev_buckets,
-                                                    );
-                                                    n_pending = 0;
-                                                }
-                                            }
-                                        } else {
-                                            let uid =
-                                                unsafe { padded.get_unchecked(u_s..u_s + u_len) };
-                                            let person_key = link_map
-                                                .resolve_long(uid)
-                                                .unwrap_or_else(|| ev_arena_out.push_ref(wid, uid));
-                                            swcb_push_nt::<ParsedEvent, SWCB_EV>(
-                                                &mut swcb,
-                                                &mut swcb_cnt,
-                                                &mut ev_buckets,
-                                                d_shard,
-                                                ParsedEvent {
-                                                    ev_key,
-                                                    person_key,
-                                                    meta,
-                                                },
-                                            );
-                                        }
-                                    })
-                                {
+                                if let Err(e) = event_src.for_each_chunk_batch::<7>(
+                                    task,
+                                    &mut buf,
+                                    &mut ev_batch,
+                                    |padded, lines| {
+                                        process_ev_batch::<SWCB_EV, COMPACT>(
+                                            padded,
+                                            lines,
+                                            &mut dcache,
+                                            lookups,
+                                            link_map,
+                                            lm_empty,
+                                            wid,
+                                            window_start_ms,
+                                            window_end_ms,
+                                            window_start_sec,
+                                            ev_arena_out,
+                                            ext_out,
+                                            &mut ev_buckets,
+                                            &mut swcb,
+                                            &mut swcb_cnt,
+                                            &mut pending_ev,
+                                            &mut pending_uh,
+                                            &mut pending_ds,
+                                            &mut n_pending,
+                                            &mut hit_idxs,
+                                        );
+                                    },
+                                ) {
                                     *err_out = Some(e);
                                     return;
                                 }
@@ -1735,127 +1904,41 @@ fn run_parse_events_and_clicks<C: ClickEmit>(
                             let mut pending_cl = [tmpl; 64];
                             let mut last_hi = u64::MAX;
                             let mut last_lo = 0u16;
-                            let mut last_dd = 0i32;
+                            let mut last_day_sec = 0i64;
+                            let mut cl_batch: Vec<LineBounds<4>> = Vec::new();
 
                             let mut cidx = first;
                             while let Some(&task) = cl_chunks.get(cidx) {
                                 let mut n_pending = 0usize;
-                                if let Err(e) =
-                                    click_src.for_each_chunk_spans::<4>(task, &mut buf, |padded, starts, ends| {
-                                        let cl_s = starts[0] as usize;
-                                        let cl_len = ends[0] as usize - cl_s;
-                                        let u_s = starts[1] as usize;
-                                        let u_len = ends[1] as usize - u_s;
-                                        if cl_len == 0 || u_len == 0 {
-                                            return;
-                                        }
-                                        let c_s = starts[2] as usize;
-                                        let c_len = ends[2] as usize - c_s;
-                                        let Some(cid) = lookups.get_campaign_padded(padded, c_s, c_len) else {
-                                            return;
-                                        };
-                                        let ts_s = starts[3] as usize;
-                                        let ts_len = ends[3] as usize - ts_s;
-                                        let Some(ts_ms) = dcache.parse_ts_ms_padded(
+                                if let Err(e) = click_src.for_each_chunk_batch::<4>(
+                                    task,
+                                    &mut buf,
+                                    &mut cl_batch,
+                                    |padded, lines| {
+                                        process_cl_batch::<C, SWCB_CL>(
                                             padded,
-                                            ts_s,
-                                            ts_len,
+                                            lines,
+                                            &mut dcache,
                                             &mut last_hi,
                                             &mut last_lo,
-                                            &mut last_dd,
-                                        ) else {
-                                            return;
-                                        };
-                                        if ts_ms < click_window_start_ms
-                                            || ts_ms >= window_end_ms
-                                        {
-                                            return;
-                                        }
-                                        let click_id_key =
-                                            CompactKey64::encode_raw_inline_padded(
-                                                padded, cl_s, cl_len,
-                                            )
-                                            .unwrap_or_else(|| {
-                                                let click_id = unsafe {
-                                                    padded.get_unchecked(cl_s..cl_s + cl_len)
-                                                };
-                                                cl_arena_out.push_ref(wid, click_id)
-                                            });
-
-                                        if let Some(uk) = CompactKey64::encode_raw_inline_padded(
-                                            padded, u_s, u_len,
-                                        ) {
-                                            let uh = mix64(uk.0);
-                                            if lm_empty {
-                                                let pshard =
-                                                    ((uh >> 52) as usize) & (P_PERSON - 1);
-                                                swcb_push_nt::<C, SWCB_CL>(
-                                                    &mut swcb,
-                                                    &mut swcb_cnt,
-                                                    &mut cl_buckets,
-                                                    pshard,
-                                                    C::from_parsed(
-                                                        uk,
-                                                        click_id_key,
-                                                        ts_ms,
-                                                        click_window_start_ms,
-                                                        cid,
-                                                    ),
-                                                );
-                                            } else {
-                                                link_map.prefetch_bloom(uh);
-                                                pending_cl[n_pending] = C::from_parsed(
-                                                    uk,
-                                                    click_id_key,
-                                                    ts_ms,
-                                                    click_window_start_ms,
-                                                    cid,
-                                                );
-                                                pending_uh[n_pending] = uh;
-                                                n_pending += 1;
-                                                if n_pending == 64 {
-                                                    flush_cl_pending::<C, SWCB_CL>(
-                                                        64,
-                                                        &pending_cl,
-                                                        &pending_uh,
-                                                        &mut hit_idxs,
-                                                        link_map,
-                                                        &mut swcb,
-                                                        &mut swcb_cnt,
-                                                        &mut cl_buckets,
-                                                    );
-                                                    n_pending = 0;
-                                                }
-                                            }
-                                        } else {
-                                            let uid =
-                                                unsafe { padded.get_unchecked(u_s..u_s + u_len) };
-                                            let (pk, ph) =
-                                                if let Some(pk) = link_map.resolve_long(uid) {
-                                                    (pk, mix64(pk.0))
-                                                } else {
-                                                    (
-                                                        cl_arena_out.push_ref(wid, uid),
-                                                        hash_bytes_fast(uid),
-                                                    )
-                                                };
-                                            let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-                                            swcb_push_nt::<C, SWCB_CL>(
-                                                &mut swcb,
-                                                &mut swcb_cnt,
-                                                &mut cl_buckets,
-                                                pshard,
-                                                C::from_parsed(
-                                                    pk,
-                                                    click_id_key,
-                                                    ts_ms,
-                                                    click_window_start_ms,
-                                                    cid,
-                                                ),
-                                            );
-                                        }
-                                    })
-                                {
+                                            &mut last_day_sec,
+                                            lookups,
+                                            link_map,
+                                            lm_empty,
+                                            wid,
+                                            click_window_start_ms,
+                                            window_end_ms,
+                                            cl_arena_out,
+                                            &mut cl_buckets,
+                                            &mut swcb,
+                                            &mut swcb_cnt,
+                                            &mut pending_cl,
+                                            &mut pending_uh,
+                                            &mut n_pending,
+                                            &mut hit_idxs,
+                                        );
+                                    },
+                                ) {
                                     *err_out = Some(e);
                                     return;
                                 }
@@ -2105,14 +2188,27 @@ impl Stage5Click for PersonClick16 {
 
     #[inline(always)]
     fn sort_grouped(slice: &mut [CompactClick16]) {
-        if slice.len() > 1 {
-            slice.sort_unstable_by_key(|c| c.ts_rel_ms);
+        let n = slice.len();
+        if n <= 1 {
+            return;
         }
+        if n == 2 {
+            if slice[0].ts_rel_ms > slice[1].ts_rel_ms {
+                slice.swap(0, 1);
+            }
+            return;
+        }
+        slice.sort_unstable_by_key(|c| c.ts_rel_ms);
     }
 
     #[inline(always)]
     fn unpack_full(g: &CompactClick16) -> (i64, u32, CompactKey64) {
         (g.ts_rel_ms as i64, g.camp_id, g.click_id_key)
+    }
+
+    #[inline(always)]
+    fn within_reach(sess_cmp: i64, click_cmp: i64) -> bool {
+        (sess_cmp - click_cmp) <= MS_CLICK_REACH
     }
 }
 
@@ -2144,6 +2240,11 @@ impl Stage5Click for PersonClickWide {
     #[inline(always)]
     fn unpack_full(g: &CompactClickWide) -> (i64, u32, CompactKey64) {
         (g.ts_ms, g.camp_id, g.click_id_key)
+    }
+
+    #[inline(always)]
+    fn within_reach(sess_cmp: i64, click_cmp: i64) -> bool {
+        (sess_cmp as i128 - click_cmp as i128) <= MS_CLICK_REACH as i128
     }
 }
 
@@ -2625,58 +2726,75 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                         }
 
                         let clks = &mut grouped_clicks[c_lo..c_hi];
-                        C::sort_grouped(clks);
-
-                        // Primary credit: two-pointer sweep over sorted sessions and sorted clicks
-                        let mut p = 0usize;
-                        let mut has_click = false;
-                        let mut best_ts = i64::MIN;
-                        let mut best_camp = 0u32;
-                        let mut best_ckey = CompactKey64::EMPTY;
-                        for s in &sessions {
-                            while p < clks.len() {
-                                let (cts, ccamp, ckey) = C::unpack_full(&clks[p]);
-                                if cts > s.start_cmp {
-                                    break;
+                        if clks.len() == 1 {
+                            let (cts, ccamp, _) = C::unpack_full(&clks[0]);
+                            let mut a_day = sessions[0].day;
+                            let mut a_cnt = 0i64;
+                            for s in &sessions {
+                                if cts <= s.start_cmp && C::within_reach(s.start_cmp, cts) {
+                                    acc.add_credit(ccamp, s.day, s.has_purchase, s.revenue_cents);
+                                    if s.day == a_day {
+                                        a_cnt += 1;
+                                    } else {
+                                        if a_cnt > 0 {
+                                            acc.add_assist(ccamp, a_day, a_cnt);
+                                        }
+                                        a_day = s.day;
+                                        a_cnt = 1;
+                                    }
+                                } else {
+                                    acc.add_credit(
+                                        organic_camp,
+                                        s.day,
+                                        s.has_purchase,
+                                        s.revenue_cents,
+                                    );
                                 }
-                                if !has_click || cts > best_ts {
-                                    has_click = true;
-                                    best_ts = cts;
-                                    best_camp = ccamp;
-                                    best_ckey = ckey;
-                                } else if cts == best_ts
-                                    && cmp_raw_keys(ckey, best_ckey, cl_arenas, cl_arenas)
-                                        == std::cmp::Ordering::Less
-                                {
-                                    best_camp = ccamp;
-                                    best_ckey = ckey;
-                                }
-                                p += 1;
                             }
-                            let camp = if has_click
-                                && (s.start_cmp as i128 - best_ts as i128) <= MS_CLICK_REACH as i128
-                            {
-                                best_camp
-                            } else {
-                                organic_camp
-                            };
-                            acc.add_credit(camp, s.day, s.has_purchase, s.revenue_cents);
+                            if a_cnt > 0 {
+                                acc.add_assist(ccamp, a_day, a_cnt);
+                            }
+                            continue;
                         }
 
-                        // Assisting campaigns
+                        C::sort_grouped(clks);
+
                         if sessions.len() <= 32 && clks.len() <= 64 {
                             let mut left = 0usize;
                             let mut right = 0usize;
+                            let mut has_click = false;
+                            let mut best_ts = i64::MIN;
+                            let mut best_camp = 0u32;
+                            let mut best_ckey = CompactKey64::EMPTY;
+                            let mut batch_day = sessions[0].day;
+                            let mut batch_cnt = 0u32;
+
                             for s in &sessions {
                                 while right < clks.len() {
-                                    let (cts, ccamp, _) = C::unpack_full(&clks[right]);
+                                    let (cts, ccamp, ckey) = C::unpack_full(&clks[right]);
                                     if cts > s.start_cmp {
                                         break;
+                                    }
+                                    if !has_click || cts > best_ts {
+                                        has_click = true;
+                                        best_ts = cts;
+                                        best_camp = ccamp;
+                                        best_ckey = ckey;
+                                    } else if cts == best_ts
+                                        && cmp_raw_keys(ckey, best_ckey, cl_arenas, cl_arenas)
+                                            == std::cmp::Ordering::Less
+                                    {
+                                        best_camp = ccamp;
+                                        best_ckey = ckey;
                                     }
                                     let cid = ccamp as usize;
                                     let cnt = active_count[cid];
                                     active_count[cid] = cnt + 1;
                                     if cnt == 0 {
+                                        if batch_cnt > 0 {
+                                            acc.add_assists_batch(&active_list, batch_day, batch_cnt);
+                                            batch_cnt = 0;
+                                        }
                                         active_pos[cid] = active_list.len() as u32;
                                         active_list.push(ccamp);
                                     }
@@ -2684,15 +2802,17 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                 }
                                 while left < right {
                                     let (cts, ccamp, _) = C::unpack_full(&clks[left]);
-                                    if (s.start_cmp as i128 - cts as i128)
-                                        <= MS_CLICK_REACH as i128
-                                    {
+                                    if C::within_reach(s.start_cmp, cts) {
                                         break;
                                     }
                                     let cid = ccamp as usize;
                                     let cnt = active_count[cid] - 1;
                                     active_count[cid] = cnt;
                                     if cnt == 0 {
+                                        if batch_cnt > 0 {
+                                            acc.add_assists_batch(&active_list, batch_day, batch_cnt);
+                                            batch_cnt = 0;
+                                        }
                                         let pos = active_pos[cid] as usize;
                                         let last = *active_list.last().unwrap();
                                         active_list[pos] = last;
@@ -2701,15 +2821,67 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                     }
                                     left += 1;
                                 }
-                                for &camp in &active_list {
-                                    acc.add_assist(camp, s.day, 1);
+                                let camp = if has_click && C::within_reach(s.start_cmp, best_ts) {
+                                    best_camp
+                                } else {
+                                    organic_camp
+                                };
+                                acc.add_credit(camp, s.day, s.has_purchase, s.revenue_cents);
+                                if !active_list.is_empty() {
+                                    if s.day != batch_day {
+                                        if batch_cnt > 0 {
+                                            acc.add_assists_batch(&active_list, batch_day, batch_cnt);
+                                        }
+                                        batch_day = s.day;
+                                        batch_cnt = 1;
+                                    } else {
+                                        batch_cnt += 1;
+                                    }
                                 }
+                            }
+                            if batch_cnt > 0 {
+                                acc.add_assists_batch(&active_list, batch_day, batch_cnt);
                             }
                             for &camp in &active_list {
                                 active_count[camp as usize] = 0;
                             }
                             active_list.clear();
                         } else {
+                            // Primary credit: two-pointer sweep over sorted sessions and sorted clicks
+                            let mut p = 0usize;
+                            let mut has_click = false;
+                            let mut best_ts = i64::MIN;
+                            let mut best_camp = 0u32;
+                            let mut best_ckey = CompactKey64::EMPTY;
+                            for s in &sessions {
+                                while p < clks.len() {
+                                    let (cts, ccamp, ckey) = C::unpack_full(&clks[p]);
+                                    if cts > s.start_cmp {
+                                        break;
+                                    }
+                                    if !has_click || cts > best_ts {
+                                        has_click = true;
+                                        best_ts = cts;
+                                        best_camp = ccamp;
+                                        best_ckey = ckey;
+                                    } else if cts == best_ts
+                                        && cmp_raw_keys(ckey, best_ckey, cl_arenas, cl_arenas)
+                                            == std::cmp::Ordering::Less
+                                    {
+                                        best_camp = ccamp;
+                                        best_ckey = ckey;
+                                    }
+                                    p += 1;
+                                }
+                                let camp = if has_click && C::within_reach(s.start_cmp, best_ts) {
+                                    best_camp
+                                } else {
+                                    organic_camp
+                                };
+                                acc.add_credit(camp, s.day, s.has_purchase, s.revenue_cents);
+                            }
+
+                            // Assisting campaigns via interval merging
                             day_ranges.clear();
                             let mut d_lo = 0usize;
                             let mut d_cur = sessions[0].day;
@@ -2840,7 +3012,8 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
 
     let window_span_ms = window_end_ms.saturating_sub(window_start_ms);
     let click_span_ms = window_end_ms.saturating_sub(click_window_start_ms);
-    let compact_mode = window_span_ms >= 0
+    let compact_mode = window_start_ms.unsigned_abs() < 1_000_000_000_000_000
+        && window_span_ms >= 0
         && window_span_ms <= ((1i64 << 31) - 1)
         && click_span_ms >= 0
         && click_span_ms <= (u32::MAX as i64)
@@ -2872,7 +3045,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
         person_click_counts,
         cl_worker_arenas,
     ) = if compact_mode {
-        let out = run_parse_events_and_clicks::<PersonClick16>(
+        let out = run_parse_events_and_clicks::<PersonClick16, true>(
             &event_src,
             &ev_chunks,
             est_ev_cap,
@@ -2885,7 +3058,6 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             window_end_ms,
             window_start_sec,
             click_window_start_ms,
-            compact_mode,
             n_ev_workers,
         )?;
         (
@@ -2898,7 +3070,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             out.cl_worker_arenas,
         )
     } else {
-        let out = run_parse_events_and_clicks::<PersonClickWide>(
+        let out = run_parse_events_and_clicks::<PersonClickWide, false>(
             &event_src,
             &ev_chunks,
             est_ev_cap,
@@ -2911,7 +3083,6 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             window_end_ms,
             window_start_sec,
             click_window_start_ms,
-            compact_mode,
             n_ev_workers,
         )?;
         (
@@ -3160,11 +3331,17 @@ mod tests {
         };
 
         let num_camps = 12usize;
+        let organic_camp = 0u32;
         let base_day = 20_000i32;
         let base_ms = (base_day as i64) * MS_DAY;
+        let empty_arenas: [LongArena; 0] = [];
 
-        for _case in 0..200 {
-            let n_sess = ((next_u64() % 45) + 1) as usize;
+        for case in 0..250usize {
+            let n_sess = if case < 32 {
+                ((next_u64() % 32) + 1) as usize
+            } else {
+                ((next_u64() % 45) + 1) as usize
+            };
             let mut starts = Vec::with_capacity(n_sess);
             let mut t = base_ms;
             for _ in 0..n_sess {
@@ -3173,18 +3350,32 @@ mod tests {
             }
             let sessions: Vec<SessionInfo> = starts
                 .iter()
-                .map(|&st| SessionInfo {
-                    start_cmp: st,
-                    day: st.div_euclid(MS_DAY) as i32,
-                    has_purchase: 0,
-                    revenue_cents: 0,
+                .map(|&st| {
+                    let hp = (next_u64() % 2) as i64;
+                    let rev = if hp != 0 {
+                        ((next_u64() % 10_000) + 1) as i64
+                    } else {
+                        0
+                    };
+                    SessionInfo {
+                        start_cmp: st,
+                        day: st.div_euclid(MS_DAY) as i32,
+                        has_purchase: hp,
+                        revenue_cents: rev,
+                    }
                 })
                 .collect();
 
-            let n_clks = (next_u64() % 70) as usize;
-            let mut clks = Vec::with_capacity(n_clks);
-            for _ in 0..n_clks {
-                let camp_id = (next_u64() % (num_camps as u64)) as u32;
+            let n_clks = if case % 5 == 0 {
+                1usize
+            } else if case % 7 == 0 {
+                0usize
+            } else {
+                (next_u64() % 64) as usize
+            };
+            let mut clks: Vec<(i64, u32, CompactKey64)> = Vec::with_capacity(n_clks);
+            for clk_i in 0..n_clks {
+                let camp_id = 1 + (next_u64() % ((num_camps - 1) as u64)) as u32;
                 let s_pick = starts[(next_u64() as usize) % starts.len()];
                 let offset = match next_u64() % 6 {
                     0 => MS_CLICK_REACH,
@@ -3193,49 +3384,159 @@ mod tests {
                     3 => -1,
                     _ => (next_u64() % (10 * MS_DAY as u64)) as i64,
                 };
-                clks.push((s_pick - offset, camp_id));
+                let ckey = CompactKey64::from_comp((clk_i as u32) ^ ((next_u64() & 0xFF) as u32));
+                clks.push((s_pick - offset, camp_id, ckey));
             }
-            clks.sort_unstable();
+            clks.sort_unstable_by_key(|c| c.0);
 
             let min_d = sessions.first().unwrap().day;
             let max_d = sessions.last().unwrap().day;
-            let mut acc_slide = CampDailyAcc::new(num_camps, min_d, max_d, 1000);
-            let mut acc_iv = CampDailyAcc::new(num_camps, min_day_helper(min_d), max_d, 1000);
+            let mut acc_fused = CampDailyAcc::new(num_camps, min_d, max_d, 1000);
+            let mut acc_ref = CampDailyAcc::new(num_camps, min_day_helper(min_d), max_d, 1000);
 
-            let mut active_count = vec![0u32; num_camps];
-            let mut active_pos = vec![0u32; num_camps];
-            let mut active_list: Vec<u32> = Vec::new();
-            let mut left = 0usize;
-            let mut right = 0usize;
+            // Production fused paths under test (0, 1, or general batched sliding window)
+            if clks.is_empty() {
+                for s in &sessions {
+                    acc_fused.add_credit(organic_camp, s.day, s.has_purchase, s.revenue_cents);
+                }
+            } else if clks.len() == 1 {
+                let (cts, ccamp, _) = clks[0];
+                let mut a_day = sessions[0].day;
+                let mut a_cnt = 0i64;
+                for s in &sessions {
+                    if cts <= s.start_cmp
+                        && (s.start_cmp as i128 - cts as i128) <= MS_CLICK_REACH as i128
+                    {
+                        acc_fused.add_credit(ccamp, s.day, s.has_purchase, s.revenue_cents);
+                        if s.day == a_day {
+                            a_cnt += 1;
+                        } else {
+                            if a_cnt > 0 {
+                                acc_fused.add_assist(ccamp, a_day, a_cnt);
+                            }
+                            a_day = s.day;
+                            a_cnt = 1;
+                        }
+                    } else {
+                        acc_fused.add_credit(organic_camp, s.day, s.has_purchase, s.revenue_cents);
+                    }
+                }
+                if a_cnt > 0 {
+                    acc_fused.add_assist(ccamp, a_day, a_cnt);
+                }
+            } else {
+                let mut active_count = vec![0u32; num_camps];
+                let mut active_pos = vec![0u32; num_camps];
+                let mut active_list: Vec<u32> = Vec::new();
+                let mut left = 0usize;
+                let mut right = 0usize;
+                let mut has_click = false;
+                let mut best_ts = i64::MIN;
+                let mut best_camp = 0u32;
+                let mut best_ckey = CompactKey64::EMPTY;
+                let mut batch_day = sessions[0].day;
+                let mut batch_cnt = 0u32;
+
+                for s in &sessions {
+                    while right < clks.len() {
+                        let (cts, ccamp, ckey) = clks[right];
+                        if cts > s.start_cmp {
+                            break;
+                        }
+                        if !has_click || cts > best_ts {
+                            has_click = true;
+                            best_ts = cts;
+                            best_camp = ccamp;
+                            best_ckey = ckey;
+                        } else if cts == best_ts
+                            && cmp_raw_keys(ckey, best_ckey, &empty_arenas, &empty_arenas)
+                                == std::cmp::Ordering::Less
+                        {
+                            best_camp = ccamp;
+                            best_ckey = ckey;
+                        }
+                        let cid = ccamp as usize;
+                        let cnt = active_count[cid];
+                        active_count[cid] = cnt + 1;
+                        if cnt == 0 {
+                            if batch_cnt > 0 {
+                                acc_fused.add_assists_batch(&active_list, batch_day, batch_cnt);
+                                batch_cnt = 0;
+                            }
+                            active_pos[cid] = active_list.len() as u32;
+                            active_list.push(ccamp);
+                        }
+                        right += 1;
+                    }
+                    while left < right {
+                        let (cts, ccamp, _) = clks[left];
+                        if (s.start_cmp as i128 - cts as i128) <= MS_CLICK_REACH as i128 {
+                            break;
+                        }
+                        let cid = ccamp as usize;
+                        let cnt = active_count[cid] - 1;
+                        active_count[cid] = cnt;
+                        if cnt == 0 {
+                            if batch_cnt > 0 {
+                                acc_fused.add_assists_batch(&active_list, batch_day, batch_cnt);
+                                batch_cnt = 0;
+                            }
+                            let pos = active_pos[cid] as usize;
+                            let last = *active_list.last().unwrap();
+                            active_list[pos] = last;
+                            active_pos[last as usize] = pos as u32;
+                            active_list.pop();
+                        }
+                        left += 1;
+                    }
+                    let camp = if has_click
+                        && (s.start_cmp as i128 - best_ts as i128) <= MS_CLICK_REACH as i128
+                    {
+                        best_camp
+                    } else {
+                        organic_camp
+                    };
+                    acc_fused.add_credit(camp, s.day, s.has_purchase, s.revenue_cents);
+                    if !active_list.is_empty() {
+                        if s.day != batch_day {
+                            if batch_cnt > 0 {
+                                acc_fused.add_assists_batch(&active_list, batch_day, batch_cnt);
+                            }
+                            batch_day = s.day;
+                            batch_cnt = 1;
+                        } else {
+                            batch_cnt += 1;
+                        }
+                    }
+                }
+                if batch_cnt > 0 {
+                    acc_fused.add_assists_batch(&active_list, batch_day, batch_cnt);
+                }
+            }
+
+            // Reference: independent per-session credit + merged-interval assists
             for s in &sessions {
-                while right < clks.len() && clks[right].0 <= s.start_cmp {
-                    let cid = clks[right].1 as usize;
-                    let cnt = active_count[cid];
-                    active_count[cid] = cnt + 1;
-                    if cnt == 0 {
-                        active_pos[cid] = active_list.len() as u32;
-                        active_list.push(clks[right].1);
+                let mut best: Option<(i64, CompactKey64, u32)> = None;
+                for &(cts, ccamp, ckey) in &clks {
+                    if cts <= s.start_cmp
+                        && (s.start_cmp as i128 - cts as i128) <= MS_CLICK_REACH as i128
+                    {
+                        best = match best {
+                            None => Some((cts, ckey, ccamp)),
+                            Some((bts, bkey, _))
+                                if cts > bts
+                                    || (cts == bts
+                                        && cmp_raw_keys(ckey, bkey, &empty_arenas, &empty_arenas)
+                                            == std::cmp::Ordering::Less) =>
+                            {
+                                Some((cts, ckey, ccamp))
+                            }
+                            Some(cur) => Some(cur),
+                        };
                     }
-                    right += 1;
                 }
-                while left < right
-                    && (s.start_cmp as i128 - clks[left].0 as i128) > MS_CLICK_REACH as i128
-                {
-                    let cid = clks[left].1 as usize;
-                    let cnt = active_count[cid] - 1;
-                    active_count[cid] = cnt;
-                    if cnt == 0 {
-                        let pos = active_pos[cid] as usize;
-                        let last = *active_list.last().unwrap();
-                        active_list[pos] = last;
-                        active_pos[last as usize] = pos as u32;
-                        active_list.pop();
-                    }
-                    left += 1;
-                }
-                for &camp in &active_list {
-                    acc_slide.add_assist(camp, s.day, 1);
-                }
+                let camp = best.map_or(organic_camp, |v| v.2);
+                acc_ref.add_credit(camp, s.day, s.has_purchase, s.revenue_cents);
             }
 
             let mut day_ranges = Vec::new();
@@ -3257,7 +3558,7 @@ mod tests {
                 lo_idx: d_lo as u32,
                 hi_idx: sessions.len() as u32,
             });
-            let mut camp_clicks: Vec<(u32, i64)> = clks.iter().map(|&(t, c)| (c, t)).collect();
+            let mut camp_clicks: Vec<(u32, i64)> = clks.iter().map(|&(t, c, _)| (c, t)).collect();
             camp_clicks.sort_unstable();
             let mut i = 0usize;
             while i < camp_clicks.len() {
@@ -3271,7 +3572,7 @@ mod tests {
                         iv_end = t.saturating_add(MS_CLICK_REACH);
                     } else {
                         emit_interval_assists(
-                            &mut acc_iv,
+                            &mut acc_ref,
                             camp,
                             iv_start,
                             iv_end,
@@ -3284,7 +3585,7 @@ mod tests {
                     i += 1;
                 }
                 emit_interval_assists(
-                    &mut acc_iv,
+                    &mut acc_ref,
                     camp,
                     iv_start,
                     iv_end,
@@ -3293,9 +3594,28 @@ mod tests {
                 );
             }
 
-            match (&acc_slide, &acc_iv) {
-                (CampDailyAcc::Dense { assists: a, .. }, CampDailyAcc::Dense { assists: b, .. }) => {
-                    assert_eq!(a, b);
+            match (&acc_fused, &acc_ref) {
+                (
+                    CampDailyAcc::Dense {
+                        assists: a1,
+                        credits: c1,
+                        ..
+                    },
+                    CampDailyAcc::Dense {
+                        assists: a2,
+                        credits: c2,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(a1, a2, "assists mismatch on case {case}");
+                    assert_eq!(c1.len(), c2.len());
+                    for (x, y) in c1.iter().zip(c2.iter()) {
+                        assert_eq!(
+                            (x.sessions, x.purchasing_sessions, x.revenue_cents),
+                            (y.sessions, y.purchasing_sessions, y.revenue_cents),
+                            "credits mismatch on case {case}"
+                        );
+                    }
                 }
                 _ => panic!("expected dense accumulators in test"),
             }
