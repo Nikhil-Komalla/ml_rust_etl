@@ -3,15 +3,9 @@ FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /src
 
-# Cache dependency compilation independently from src/ changes.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs \
-    && RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release --locked \
-    && rm -rf src
-
 COPY src/ ./src/
-RUN touch src/main.rs \
-    && RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release --locked
+RUN RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release --locked
 
 FROM debian:bookworm-slim
 
