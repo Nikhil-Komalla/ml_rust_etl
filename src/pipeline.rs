@@ -137,6 +137,16 @@ struct DayRange {
 }
 
 #[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct CampCredit {
+    sessions: u32,
+    purchasing_sessions: u32,
+    revenue_cents: i64,
+}
+
+const _: () = assert!(std::mem::size_of::<CampCredit>() == 16);
+
+#[derive(Clone, Copy, Default)]
 struct CampDayAgg {
     sessions: i64,
     purchasing_sessions: i64,
@@ -159,20 +169,27 @@ enum CampDailyAcc {
         start_day: i32,
         num_days: usize,
         num_camps: usize,
-        cells: Vec<CampDayAgg>,
+        assists: Vec<u32>,
+        credits: Vec<CampCredit>,
     },
     Sparse(HashMap<(u32, i32), CampDayAgg>),
 }
 
 impl CampDailyAcc {
-    fn new(num_camps: usize, min_day: i32, max_day: i32) -> Self {
+    fn new(num_camps: usize, min_day: i32, max_day: i32, total_events: usize) -> Self {
         let span = (max_day as i64 - min_day as i64 + 1).max(1) as usize;
-        if span <= 4096 && num_camps <= 16_384 && span.saturating_mul(num_camps) <= 1_048_576 {
+        if span <= 4096
+            && num_camps <= 16_384
+            && span.saturating_mul(num_camps) <= 1_048_576
+            && total_events < (u32::MAX as usize)
+        {
+            let total_cells = span * num_camps;
             Self::Dense {
                 start_day: min_day,
                 num_days: span,
                 num_camps,
-                cells: vec![CampDayAgg::default(); span * num_camps],
+                assists: vec![0u32; total_cells],
+                credits: vec![CampCredit::default(); total_cells],
             }
         } else {
             Self::Sparse(HashMap::with_capacity(4096))
@@ -186,13 +203,15 @@ impl CampDailyAcc {
                 start_day,
                 num_days,
                 num_camps,
-                cells,
+                credits,
+                ..
             } => {
                 let d_off = day - *start_day;
                 if d_off >= 0 && (d_off as usize) < *num_days && (camp_id as usize) < *num_camps {
-                    let c = &mut cells[(camp_id as usize) * (*num_days) + (d_off as usize)];
+                    let idx = (d_off as usize) * (*num_camps) + (camp_id as usize);
+                    let c = unsafe { credits.get_unchecked_mut(idx) };
                     c.sessions += 1;
-                    c.purchasing_sessions += has_purchase;
+                    c.purchasing_sessions += has_purchase as u32;
                     c.revenue_cents += rev;
                     return;
                 }
@@ -214,12 +233,15 @@ impl CampDailyAcc {
                 start_day,
                 num_days,
                 num_camps,
-                cells,
+                assists,
+                ..
             } => {
                 let d_off = day - *start_day;
                 if d_off >= 0 && (d_off as usize) < *num_days && (camp_id as usize) < *num_camps {
-                    cells[(camp_id as usize) * (*num_days) + (d_off as usize)].assisted_sessions +=
-                        cnt;
+                    let idx = (d_off as usize) * (*num_camps) + (camp_id as usize);
+                    unsafe {
+                        *assists.get_unchecked_mut(idx) += cnt as u32;
+                    }
                     return;
                 }
                 unreachable!("assist day {day} or camp {camp_id} outside dense range");
@@ -232,9 +254,25 @@ impl CampDailyAcc {
 
     fn merge_into(&mut self, other: CampDailyAcc) {
         match (self, other) {
-            (Self::Dense { cells: dst, .. }, Self::Dense { cells: src, .. }) => {
-                for (d, s) in dst.iter_mut().zip(src.iter()) {
-                    d.add_assign(s);
+            (
+                Self::Dense {
+                    assists: dst_a,
+                    credits: dst_c,
+                    ..
+                },
+                Self::Dense {
+                    assists: src_a,
+                    credits: src_c,
+                    ..
+                },
+            ) => {
+                for (da, sa) in dst_a.iter_mut().zip(src_a.iter()) {
+                    *da += *sa;
+                }
+                for (dc, sc) in dst_c.iter_mut().zip(src_c.iter()) {
+                    dc.sessions += sc.sessions;
+                    dc.purchasing_sessions += sc.purchasing_sessions;
+                    dc.revenue_cents += sc.revenue_cents;
                 }
             }
             (Self::Sparse(dst), Self::Sparse(src)) => {
@@ -606,7 +644,7 @@ trait Stage5Event: Copy + Send + Sync {
     type Grouped: Copy + Send;
     fn person_key(&self) -> CompactKey64;
     fn to_grouped(&self) -> Self::Grouped;
-    fn sort_grouped(slice: &mut [Self::Grouped]);
+    fn sort_grouped(slice: &mut [Self::Grouped], scratch: &mut Vec<u64>);
     fn unpack(g: Self::Grouped, ws_day: i32, ws_rem: u64) -> (i64, i32, u32, u32);
     fn gap_exceeds(cur_cmp: i64, prev_cmp: i64) -> bool;
 }
@@ -1648,6 +1686,112 @@ fn run_parse_events_and_clicks<C: ClickEmit>(
     })
 }
 
+fn sort_u64_radix(slice: &mut [u64], scratch: &mut Vec<u64>) {
+    let n = slice.len();
+    if scratch.len() < n {
+        scratch.resize(n, 0);
+    }
+    let tmp = &mut scratch[..n];
+
+    let mut c0 = [0u32; 2048];
+    let mut c1 = [0u32; 1024];
+    let mut c2 = [0u32; 1024];
+    for &x in slice.iter() {
+        let k = (x >> 32) as usize;
+        c0[k & 0x7FF] += 1;
+        c1[(k >> 11) & 0x3FF] += 1;
+        c2[(k >> 21) & 0x3FF] += 1;
+    }
+
+    let k0_first = ((slice[0] >> 32) as usize) & 0x7FF;
+    let k1_first = ((slice[0] >> 43) as usize) & 0x3FF;
+    let k2_first = ((slice[0] >> 53) as usize) & 0x3FF;
+    let skip0 = c0[k0_first] as usize == n;
+    let skip1 = c1[k1_first] as usize == n;
+    let skip2 = c2[k2_first] as usize == n;
+
+    let mut in_tmp = false;
+    if !skip0 {
+        let mut acc = 0u32;
+        for c in &mut c0 {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        for &x in slice.iter() {
+            let b = ((x >> 32) as usize) & 0x7FF;
+            let pos = c0[b] as usize;
+            c0[b] += 1;
+            unsafe {
+                *tmp.get_unchecked_mut(pos) = x;
+            }
+        }
+        in_tmp = true;
+    }
+
+    if !skip1 {
+        let mut acc = 0u32;
+        for c in &mut c1 {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        if in_tmp {
+            for &x in tmp.iter() {
+                let b = ((x >> 43) as usize) & 0x3FF;
+                let pos = c1[b] as usize;
+                c1[b] += 1;
+                unsafe {
+                    *slice.get_unchecked_mut(pos) = x;
+                }
+            }
+        } else {
+            for &x in slice.iter() {
+                let b = ((x >> 43) as usize) & 0x3FF;
+                let pos = c1[b] as usize;
+                c1[b] += 1;
+                unsafe {
+                    *tmp.get_unchecked_mut(pos) = x;
+                }
+            }
+        }
+        in_tmp = !in_tmp;
+    }
+
+    if !skip2 {
+        let mut acc = 0u32;
+        for c in &mut c2 {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        if in_tmp {
+            for &x in tmp.iter() {
+                let b = ((x >> 53) as usize) & 0x3FF;
+                let pos = c2[b] as usize;
+                c2[b] += 1;
+                unsafe {
+                    *slice.get_unchecked_mut(pos) = x;
+                }
+            }
+        } else {
+            for &x in slice.iter() {
+                let b = ((x >> 53) as usize) & 0x3FF;
+                let pos = c2[b] as usize;
+                c2[b] += 1;
+                unsafe {
+                    *tmp.get_unchecked_mut(pos) = x;
+                }
+            }
+        }
+        in_tmp = !in_tmp;
+    }
+
+    if in_tmp {
+        slice.copy_from_slice(tmp);
+    }
+}
+
 impl Stage5Event for PersonEvent16 {
     type Grouped = u64;
 
@@ -1662,9 +1806,13 @@ impl Stage5Event for PersonEvent16 {
     }
 
     #[inline(always)]
-    fn sort_grouped(slice: &mut [u64]) {
-        if slice.len() > 1 {
-            slice.sort_unstable();
+    fn sort_grouped(slice: &mut [u64], scratch: &mut Vec<u64>) {
+        if slice.len() < 256 {
+            if slice.len() > 1 {
+                slice.sort_unstable();
+            }
+        } else {
+            sort_u64_radix(slice, scratch);
         }
     }
 
@@ -1702,7 +1850,7 @@ impl Stage5Event for PersonEventWide {
     }
 
     #[inline(always)]
-    fn sort_grouped(slice: &mut [CompactEventWide]) {
+    fn sort_grouped(slice: &mut [CompactEventWide], _scratch: &mut Vec<u64>) {
         if slice.len() > 1 {
             slice.sort_unstable_by_key(|e| e.ts_ms);
         }
@@ -1823,9 +1971,10 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
     let num_camps = lookups.camp_entries.len();
     let num_cats = lookups.categories.len();
     let organic_camp = lookups.organic_camp_id;
+    let total_events: usize = person_event_counts.iter().sum();
 
     let mut worker_accs: Vec<CampDailyAcc> = (0..n_out_workers)
-        .map(|_| CampDailyAcc::new(num_camps, min_day, max_day))
+        .map(|_| CampDailyAcc::new(num_camps, min_day, max_day, total_events))
         .collect();
     let mut worker_ud_rows = vec![0usize; n_out_workers];
     let err_lock = Mutex::new(None::<io::Error>);
@@ -1869,6 +2018,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                 let mut cl_offsets: Vec<u32> = Vec::new();
                 let mut cl_fill: Vec<u32> = Vec::new();
                 let mut grouped_clicks: Vec<C::Grouped> = Vec::new();
+                let mut radix_scratch: Vec<u64> = Vec::new();
 
                 let mut cat_rev = vec![0i64; num_cats];
                 let mut touched_cats: Vec<u32> = Vec::with_capacity(32);
@@ -1907,7 +2057,19 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     ev_pids.reserve(ev_total);
 
                     for batch in &evs_batches {
-                        for ev in batch {
+                        let blen = batch.len();
+                        for (ridx, ev) in batch.iter().enumerate() {
+                            #[cfg(target_arch = "x86_64")]
+                            if ridx + 16 < blen {
+                                let pk_ahead = unsafe { batch.get_unchecked(ridx + 16).person_key() };
+                                let npos = (mix64(pk_ahead.0) as usize) & p_mask;
+                                unsafe {
+                                    std::arch::x86_64::_mm_prefetch(
+                                        p_slots.as_ptr().add(npos) as *const i8,
+                                        std::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
+                            }
                             let pk = ev.person_key();
                             let pid = if !pk.is_ref() {
                                 if persons.len() >= p_thresh {
@@ -1931,14 +2093,17 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                 }
                                 let mut pos = (mix64(pk.0) as usize) & p_mask;
                                 loop {
-                                    let s = p_slots[pos];
+                                    let s = unsafe { *p_slots.get_unchecked(pos) };
                                     if s.key == pk.0 {
                                         break s.pid;
                                     }
                                     if s.key == 0 {
                                         let id = persons.len() as u32;
                                         persons.push(pk);
-                                        p_slots[pos] = PersonSlot { key: pk.0, pid: id };
+                                        unsafe {
+                                            *p_slots.get_unchecked_mut(pos) =
+                                                PersonSlot { key: pk.0, pid: id };
+                                        }
                                         break id;
                                     }
                                     pos = (pos + 1) & p_mask;
@@ -1969,10 +2134,15 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     ev_offsets.clear();
                     ev_offsets.resize(num_p + 1, 0);
                     for &pid in &ev_pids {
-                        ev_offsets[pid as usize + 1] += 1;
+                        unsafe {
+                            *ev_offsets.get_unchecked_mut(pid as usize + 1) += 1;
+                        }
                     }
                     for i in 1..=num_p {
-                        ev_offsets[i] += ev_offsets[i - 1];
+                        unsafe {
+                            let prev = *ev_offsets.get_unchecked(i - 1);
+                            *ev_offsets.get_unchecked_mut(i) += prev;
+                        }
                     }
                     ev_fill.clear();
                     ev_fill.extend_from_slice(&ev_offsets[..num_p]);
@@ -1980,19 +2150,21 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     if grouped_events.capacity() < ev_total {
                         grouped_events.reserve(ev_total - grouped_events.capacity());
                     }
-                    // Resize with first element template (safe, Copy)
-                    let ev_zero = evs_batches[0][0].to_grouped();
-                    grouped_events.resize(ev_total, ev_zero);
-
+                    let ev_ptr = grouped_events.as_mut_ptr();
                     let mut pid_idx = 0usize;
                     for batch in evs_batches {
                         for ev in batch {
-                            let pid = ev_pids[pid_idx] as usize;
+                            let pid = unsafe { *ev_pids.get_unchecked(pid_idx) } as usize;
                             pid_idx += 1;
-                            let pos = ev_fill[pid] as usize;
-                            ev_fill[pid] += 1;
-                            grouped_events[pos] = ev.to_grouped();
+                            let pos = unsafe { *ev_fill.get_unchecked(pid) } as usize;
+                            unsafe {
+                                *ev_fill.get_unchecked_mut(pid) = (pos + 1) as u32;
+                                std::ptr::write(ev_ptr.add(pos), ev.to_grouped());
+                            }
                         }
+                    }
+                    unsafe {
+                        grouped_events.set_len(ev_total);
                     }
 
                     // 2. Group matching clicks into CSR by pid (skip clicks for event-less persons).
@@ -2001,12 +2173,24 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     cl_pids.clear();
                     cl_pids.reserve(cl_total);
                     for batch in &cls_batches {
-                        for c in batch {
+                        let blen = batch.len();
+                        for (ridx, c) in batch.iter().enumerate() {
+                            #[cfg(target_arch = "x86_64")]
+                            if ridx + 16 < blen {
+                                let ck_ahead = unsafe { batch.get_unchecked(ridx + 16).person_key() };
+                                let npos = (mix64(ck_ahead.0) as usize) & p_mask;
+                                unsafe {
+                                    std::arch::x86_64::_mm_prefetch(
+                                        p_slots.as_ptr().add(npos) as *const i8,
+                                        std::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
+                            }
                             let ck = c.person_key();
                             let pid = if !ck.is_ref() {
                                 let mut pos = (mix64(ck.0) as usize) & p_mask;
                                 loop {
-                                    let s = p_slots[pos];
+                                    let s = unsafe { *p_slots.get_unchecked(pos) };
                                     if s.key == ck.0 {
                                         break s.pid;
                                     }
@@ -2028,7 +2212,9 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                 u32::MAX
                             };
                             if pid != u32::MAX {
-                                cl_counts[pid as usize] += 1;
+                                unsafe {
+                                    *cl_counts.get_unchecked_mut(pid as usize) += 1;
+                                }
                             }
                             cl_pids.push(pid);
                         }
@@ -2037,32 +2223,37 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     cl_offsets.clear();
                     cl_offsets.resize(num_p + 1, 0);
                     for i in 0..num_p {
-                        cl_offsets[i + 1] = cl_offsets[i] + cl_counts[i];
+                        unsafe {
+                            let cur = *cl_offsets.get_unchecked(i);
+                            let cnt = *cl_counts.get_unchecked(i);
+                            *cl_offsets.get_unchecked_mut(i + 1) = cur + cnt;
+                        }
                     }
                     let total_matched_cl = cl_offsets[num_p] as usize;
                     if total_matched_cl > 0 {
                         cl_fill.clear();
                         cl_fill.extend_from_slice(&cl_offsets[..num_p]);
-                        let mut first_cl_tmpl = None;
-                        for b in &cls_batches {
-                            if let Some(first) = b.first() {
-                                first_cl_tmpl = Some(first.to_grouped());
-                                break;
-                            }
-                        }
                         grouped_clicks.clear();
-                        grouped_clicks.resize(total_matched_cl, first_cl_tmpl.unwrap());
+                        if grouped_clicks.capacity() < total_matched_cl {
+                            grouped_clicks.reserve(total_matched_cl - grouped_clicks.capacity());
+                        }
+                        let cl_ptr = grouped_clicks.as_mut_ptr();
                         let mut cpid_idx = 0usize;
                         for batch in cls_batches {
                             for c in batch {
-                                let pid = cl_pids[cpid_idx];
+                                let pid = unsafe { *cl_pids.get_unchecked(cpid_idx) };
                                 cpid_idx += 1;
                                 if pid != u32::MAX {
-                                    let pos = cl_fill[pid as usize] as usize;
-                                    cl_fill[pid as usize] += 1;
-                                    grouped_clicks[pos] = c.to_grouped();
+                                    let pos = unsafe { *cl_fill.get_unchecked(pid as usize) } as usize;
+                                    unsafe {
+                                        *cl_fill.get_unchecked_mut(pid as usize) = (pos + 1) as u32;
+                                        std::ptr::write(cl_ptr.add(pos), c.to_grouped());
+                                    }
                                 }
                             }
+                        }
+                        unsafe {
+                            grouped_clicks.set_len(total_matched_cl);
                         }
                     }
 
@@ -2071,7 +2262,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                         let e_lo = ev_offsets[pid] as usize;
                         let e_hi = ev_offsets[pid + 1] as usize;
                         let evs = &mut grouped_events[e_lo..e_hi];
-                        E::sort_grouped(evs);
+                        E::sort_grouped(evs, &mut radix_scratch);
 
                         let person_bytes =
                             resolve_person_bytes(persons[pid], link_map, ev_arenas, &mut pbuf);
@@ -2581,23 +2772,25 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             start_day,
             num_days,
             num_camps,
-            cells,
+            assists,
+            credits,
         } => {
             for c in 0..*num_camps {
                 let c_name = lookups.camp_name(c);
                 let ch_name = lookups.camp_channel(c);
-                let base = c * (*num_days);
                 for d_off in 0..*num_days {
-                    let agg = &cells[base + d_off];
-                    if agg.sessions > 0 || agg.assisted_sessions > 0 {
+                    let idx = d_off * (*num_camps) + c;
+                    let cr = credits[idx];
+                    let asst = assists[idx] as i64;
+                    if cr.sessions > 0 || asst > 0 {
                         cd_rows.push(CampaignRow {
                             campaign_id: c_name,
                             channel: ch_name,
                             day: *start_day + d_off as i32,
-                            sessions: agg.sessions,
-                            purchasing_sessions: agg.purchasing_sessions,
-                            revenue_cents: agg.revenue_cents,
-                            assisted_sessions: agg.assisted_sessions,
+                            sessions: cr.sessions as i64,
+                            purchasing_sessions: cr.purchasing_sessions as i64,
+                            revenue_cents: cr.revenue_cents,
+                            assisted_sessions: asst,
                         });
                     }
                 }
@@ -2745,8 +2938,8 @@ mod tests {
 
             let min_d = sessions.first().unwrap().day;
             let max_d = sessions.last().unwrap().day;
-            let mut acc_slide = CampDailyAcc::new(num_camps, min_d, max_d);
-            let mut acc_iv = CampDailyAcc::new(num_camps, min_day_helper(min_d), max_d);
+            let mut acc_slide = CampDailyAcc::new(num_camps, min_d, max_d, 1000);
+            let mut acc_iv = CampDailyAcc::new(num_camps, min_day_helper(min_d), max_d, 1000);
 
             let mut active_count = vec![0u32; num_camps];
             let mut active_pos = vec![0u32; num_camps];
@@ -2840,13 +3033,39 @@ mod tests {
             }
 
             match (&acc_slide, &acc_iv) {
-                (CampDailyAcc::Dense { cells: a, .. }, CampDailyAcc::Dense { cells: b, .. }) => {
-                    assert_eq!(a.len(), b.len());
-                    for (ca, cb) in a.iter().zip(b.iter()) {
-                        assert_eq!(ca.assisted_sessions, cb.assisted_sessions);
-                    }
+                (CampDailyAcc::Dense { assists: a, .. }, CampDailyAcc::Dense { assists: b, .. }) => {
+                    assert_eq!(a, b);
                 }
                 _ => panic!("expected dense accumulators in test"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_radix_sort_u64_matches_std() {
+        let mut seed: u64 = 0xCAFE_BABE_1234_5678;
+        let mut next_u64 = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed
+        };
+        let mut scratch = Vec::new();
+        for &n in &[256usize, 500, 5000] {
+            for narrow in [false, true] {
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let ts_rel = if narrow {
+                        next_u64() % 200_000
+                    } else {
+                        next_u64() % 1_209_600_000
+                    };
+                    let low = next_u64() & 0xFFFF_FFFF;
+                    v.push((ts_rel << 32) | low);
+                }
+                let mut expected: Vec<u32> = v.iter().map(|x| (x >> 32) as u32).collect();
+                expected.sort_unstable();
+                sort_u64_radix(&mut v, &mut scratch);
+                let got: Vec<u32> = v.iter().map(|x| (x >> 32) as u32).collect();
+                assert_eq!(got, expected, "radix mismatch n={n} narrow={narrow}");
             }
         }
     }
