@@ -87,6 +87,132 @@ fn parse_civil_datetime_19(b: &[u8]) -> Option<i64> {
     Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * MS_SECOND)
 }
 
+#[derive(Clone)]
+pub struct DateCache {
+    keys_hi: [u64; 64],
+    keys_lo: [u16; 64],
+    day_ms: [i64; 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        Self {
+            keys_hi: [0; 64],
+            keys_lo: [0; 64],
+            day_ms: [0; 64],
+        }
+    }
+
+    #[inline(always)]
+    fn parse_civil_datetime_19(&mut self, b: &[u8]) -> Option<i64> {
+        let hi = u64::from_ne_bytes(b[0..8].try_into().unwrap());
+        let lo = u16::from_ne_bytes(b[8..10].try_into().unwrap());
+        let idx = (((b[8] as usize) * 10 + (b[9] as usize)) ^ ((b[6] as usize) << 4)) & 63;
+        let base_day_ms = if self.keys_hi[idx] == hi && self.keys_lo[idx] == lo {
+            if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+                return None;
+            }
+            self.day_ms[idx]
+        } else {
+            if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+                return None;
+            }
+            let year = d4(&b[0..4])?;
+            let month = d2(b[5], b[6])?;
+            let day = d2(b[8], b[9])?;
+            let dim = days_in_month(year, month);
+            if day < 1 || day > dim {
+                return None;
+            }
+            let dms = days_from_civil(year, month, day) * MS_DAY;
+            self.keys_hi[idx] = hi;
+            self.keys_lo[idx] = lo;
+            self.day_ms[idx] = dms;
+            dms
+        };
+
+        let hour = d2(b[11], b[12])?;
+        let minute = d2(b[14], b[15])?;
+        let second = d2(b[17], b[18])?;
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some(base_day_ms + (hour * 3_600 + minute * 60 + second) * MS_SECOND)
+    }
+
+    #[inline(always)]
+    pub fn parse_f1_ms(&mut self, b: &[u8]) -> Option<i64> {
+        if b.len() == 20 && b[19] == b'Z' {
+            self.parse_civil_datetime_19(b)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn parse_ts_ms(&mut self, b: &[u8]) -> Option<i64> {
+        let len = b.len();
+        if len == 0 {
+            return None;
+        }
+        if len == 20 && b[19] == b'Z' {
+            return self.parse_civil_datetime_19(b);
+        }
+        if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+            let base = self.parse_civil_datetime_19(b)?;
+            let oh = d2(b[20], b[21])?;
+            let om = d2(b[23], b[24])?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off_ms = (oh * 3_600 + om * 60) * MS_SECOND;
+            return Some(if b[19] == b'+' {
+                base - off_ms
+            } else {
+                base + off_ms
+            });
+        }
+        parse_f3_ms(b)
+    }
+}
+
+#[inline(always)]
+fn parse_f3_ms(b: &[u8]) -> Option<i64> {
+    let len = b.len();
+    // F3: non-empty ASCII digits [0-9]+. Fast path <= 18 digits cannot overflow i64.
+    if len <= 18 {
+        let mut acc: i64 = 0;
+        for &ch in b {
+            let d = ch.wrapping_sub(b'0');
+            if d >= 10 {
+                return None;
+            }
+            acc = acc * 10 + d as i64;
+        }
+        return Some(acc);
+    }
+    let mut acc: i64 = 0;
+    let mut overflow = false;
+    for &ch in b {
+        let d = ch.wrapping_sub(b'0');
+        if d >= 10 {
+            return None;
+        }
+        if !overflow {
+            match acc.checked_mul(10).and_then(|v| v.checked_add(d as i64)) {
+                Some(v) => acc = v,
+                None => overflow = true,
+            }
+        }
+    }
+    if overflow {
+        None
+    } else {
+        Some(acc)
+    }
+}
+
+#[cfg(test)]
 #[inline(always)]
 pub fn parse_f1_ms(b: &[u8]) -> Option<i64> {
     if b.len() == 20 && b[19] == b'Z' {
@@ -119,37 +245,7 @@ pub fn parse_ts_ms(b: &[u8]) -> Option<i64> {
             base + off_ms
         });
     }
-    // F3: non-empty ASCII digits [0-9]+. Fast path <= 18 digits cannot overflow i64.
-    if len <= 18 {
-        let mut acc: i64 = 0;
-        for &ch in b {
-            let d = ch.wrapping_sub(b'0');
-            if d >= 10 {
-                return None;
-            }
-            acc = acc * 10 + d as i64;
-        }
-        return Some(acc);
-    }
-    let mut acc: i64 = 0;
-    let mut overflow = false;
-    for &ch in b {
-        let d = ch.wrapping_sub(b'0');
-        if d >= 10 {
-            return None;
-        }
-        if !overflow {
-            match acc.checked_mul(10).and_then(|v| v.checked_add(d as i64)) {
-                Some(v) => acc = v,
-                None => overflow = true,
-            }
-        }
-    }
-    if overflow {
-        None
-    } else {
-        Some(acc)
-    }
+    parse_f3_ms(b)
 }
 
 #[inline(always)]
@@ -244,6 +340,33 @@ mod tests {
         let huge = vec![b'9'; 500];
         assert_eq!(parse_ts_ms(&huge), None);
         assert_eq!(parse_ts_ms(&vec![b'0'; 300]), Some(0));
+
+        // Verify DateCache matches uncached parsing across interleaved valid/invalid/leap/F1/F2/F3
+        let mut cache = DateCache::new();
+        let samples: &[&[u8]] = &[
+            b"2026-10-03T23:58:10Z",
+            b"2026-10-03T12:00:00Z",
+            b"2026-10-03t12:00:00Z",
+            b"2026-10-03T24:00:00Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2028-02-29T00:00:00Z",
+            b"2028-02-29T23:59:59+02:00",
+            b"2027-02-29T00:00:00Z",
+            b"2026-02-30T01:02:03Z",
+            b"2026-13-01T01:02:03Z",
+            b"2028-02-29T23:59:60Z",
+            b"1969-12-31T23:59:59Z",
+            b"0000-01-01T00:00:00Z",
+            b"1791071890000",
+            b"2026-10-03T00:00:00Z",
+            b"2026-10-03T00:00:00+24:00",
+        ];
+        for _pass in 0..3 {
+            for &s in samples {
+                assert_eq!(cache.parse_ts_ms(s), parse_ts_ms(s), "mismatch on {:?}", String::from_utf8_lossy(s));
+                assert_eq!(cache.parse_f1_ms(s), parse_f1_ms(s), "f1 mismatch on {:?}", String::from_utf8_lossy(s));
+            }
+        }
     }
 
     #[test]

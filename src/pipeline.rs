@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
+use parquet::basic::Compression;
 use rayon::prelude::*;
 
 use crate::csv::{
@@ -14,7 +15,7 @@ use crate::csv::{
 };
 use crate::links::{build_link_map, LinkMap};
 use crate::parse::{
-    parse_f1_ms, parse_price_cents, parse_ts_ms, Manifest, MS_CLICK_REACH, MS_DAY, MS_SESSION_GAP,
+    parse_price_cents, parse_ts_ms, DateCache, Manifest, MS_CLICK_REACH, MS_DAY, MS_SESSION_GAP,
 };
 use crate::parquet_out::{clean_parquet_dir, write_campaign_daily, CampaignRow, UserDailyWriter};
 
@@ -524,36 +525,38 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                 let next_ref = &next_chunk;
                 let lookups_ref = &lookups;
                 let hb_ref = &hash_builder;
-                scope.spawn(move || loop {
-                    let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks_ref.get(cidx) else {
-                        break;
-                    };
-                    let slice = &files_ref.file_bytes(chunk.file_idx)[chunk.start..chunk.end];
-                    for_each_line_fields::<7>(slice, |[ev_id, uid, ts, ingest_ts, etype, pid, price]| {
-                        if ev_id.is_empty() || !is_valid_utf8(ev_id) {
-                            return;
-                        }
-                        let Some(ingest_ms) = parse_f1_ms(ingest_ts) else {
-                            return;
+                scope.spawn(move || {
+                    let mut dcache = DateCache::new();
+                    loop {
+                        let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
+                        let Some(chunk) = chunks_ref.get(cidx) else {
+                            break;
                         };
-                        let ev_hash = hb_ref.hash_one(ev_id);
-                        let ev_ref = files_ref.make_ref(chunk.file_idx, ev_id, ov_out, wid);
-                        let d_shard = ((ev_hash >> 28) as usize) & (P_DEDUP - 1);
+                        let slice = &files_ref.file_bytes(chunk.file_idx)[chunk.start..chunk.end];
+                        for_each_line_fields::<7>(slice, |[ev_id, uid, ts, ingest_ts, etype, pid, price]| {
+                            if ev_id.is_empty() || !is_valid_utf8(ev_id) {
+                                return;
+                            }
+                            let Some(ingest_ms) = dcache.parse_f1_ms(ingest_ts) else {
+                                return;
+                            };
+                            let ev_hash = hb_ref.hash_one(ev_id);
+                            let ev_ref = files_ref.make_ref(chunk.file_idx, ev_id, ov_out, wid);
+                            let d_shard = ((ev_hash >> 28) as usize) & (P_DEDUP - 1);
 
-                        let mut valid = true;
-                        let mut ts_ms = 0i64;
-                        let mut price_val = 0u32;
-                        let mut cat_id = 0u32;
-                        let mut uid_ref = SliceRef {
-                            file_idx: 0,
-                            len: 0,
-                            off: 0,
-                        };
+                            let mut valid = true;
+                            let mut ts_ms = 0i64;
+                            let mut price_val = 0u32;
+                            let mut cat_id = 0u32;
+                            let mut uid_ref = SliceRef {
+                                file_idx: 0,
+                                len: 0,
+                                off: 0,
+                            };
 
-                        if uid.is_empty() || pid.is_empty() || !is_valid_utf8(uid) {
-                            valid = false;
-                        } else if let Some(t) = parse_ts_ms(ts) {
+                            if uid.is_empty() || pid.is_empty() || !is_valid_utf8(uid) {
+                                valid = false;
+                            } else if let Some(t) = dcache.parse_ts_ms(ts) {
                             if t < window_start_ms
                                 || t >= window_end_ms
                                 || (ingest_ms as i128 - t as i128) > MS_DAY as i128
@@ -594,6 +597,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                             cat_id,
                         });
                     });
+                    }
                 });
             }
         });
@@ -735,26 +739,28 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                 let lookups_ref = &lookups;
                 let lm_ref = &link_map;
                 let hb_ref = &hash_builder;
-                scope.spawn(move || loop {
-                    let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks_ref.get(cidx) else {
-                        break;
-                    };
-                    let slice = &files_ref.file_bytes(chunk.file_idx)[chunk.start..chunk.end];
-                    for_each_line_fields::<4>(slice, |[click_id, uid, camp_id, ts]| {
-                        if click_id.is_empty()
-                            || uid.is_empty()
-                            || !is_valid_utf8(click_id)
-                            || !is_valid_utf8(uid)
-                        {
-                            return;
-                        }
-                        let Some(cid) = lookups_ref.get_campaign(camp_id, hb_ref) else {
-                            return;
+                scope.spawn(move || {
+                    let mut dcache = DateCache::new();
+                    loop {
+                        let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
+                        let Some(chunk) = chunks_ref.get(cidx) else {
+                            break;
                         };
-                        let Some(ts_ms) = parse_ts_ms(ts) else {
-                            return;
-                        };
+                        let slice = &files_ref.file_bytes(chunk.file_idx)[chunk.start..chunk.end];
+                        for_each_line_fields::<4>(slice, |[click_id, uid, camp_id, ts]| {
+                            if click_id.is_empty()
+                                || uid.is_empty()
+                                || !is_valid_utf8(click_id)
+                                || !is_valid_utf8(uid)
+                            {
+                                return;
+                            }
+                            let Some(cid) = lookups_ref.get_campaign(camp_id, hb_ref) else {
+                                return;
+                            };
+                            let Some(ts_ms) = dcache.parse_ts_ms(ts) else {
+                                return;
+                            };
                         if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
                             return;
                         }
@@ -783,6 +789,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                             _pad: 0,
                         });
                     });
+                    }
                 });
             }
         });
@@ -861,7 +868,12 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             let err_lock_ref = &err_lock;
 
             scope.spawn(move || {
-                let mut writer = match UserDailyWriter::create(&ud_path, USER_DAILY_BATCH_ROWS) {
+                let mut writer = match UserDailyWriter::create(
+                    &ud_path,
+                    USER_DAILY_BATCH_ROWS,
+                    &lookups_ref.categories,
+                    Compression::SNAPPY,
+                ) {
                     Ok(w) => w,
                     Err(e) => {
                         *err_lock_ref.lock().unwrap() = Some(e);
@@ -1066,11 +1078,8 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                                 sess_rev = 0;
 
                                 if sess_day != cur_day {
-                                    let top_cat = pick_and_reset_top_cat(
-                                        &mut cat_rev,
-                                        &mut touched_cats,
-                                        &lookups_ref.categories,
-                                    );
+                                    let top_cat =
+                                        pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats);
                                     if let Err(err) = writer.push(
                                         person_bytes,
                                         cur_day,
@@ -1110,11 +1119,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
                             has_purchase: sess_has_purch,
                             revenue_cents: sess_rev,
                         });
-                        let top_cat = pick_and_reset_top_cat(
-                            &mut cat_rev,
-                            &mut touched_cats,
-                            &lookups_ref.categories,
-                        );
+                        let top_cat = pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats);
                         if let Err(err) = writer.push(
                             person_bytes,
                             cur_day,
@@ -1310,9 +1315,15 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
 
     let total_ud_rows: usize = worker_ud_rows.iter().sum();
     if total_ud_rows == 0 {
-        let empty_ud = UserDailyWriter::create(&ud_dir.join("part-0.parquet"), 1)?;
+        let empty_ud = UserDailyWriter::create(
+            &ud_dir.join("part-0.parquet"),
+            1,
+            &lookups.categories,
+            Compression::SNAPPY,
+        )?;
         empty_ud.close()?;
     }
+    let t_stage5 = Instant::now();
 
     let mut acc_iter = worker_accs.into_iter();
     let mut final_acc = acc_iter.next().unwrap();
@@ -1364,20 +1375,21 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             }
         }
     }
-    write_campaign_daily(&cd_dir.join("part-0.parquet"), &cd_rows)?;
+    write_campaign_daily(&cd_dir.join("part-0.parquet"), &cd_rows, Compression::SNAPPY)?;
     let t_done = Instant::now();
 
     if profile {
         let vm_hwm = read_vm_hwm_kb();
         println!(
-            "PROFILE startup={:.4}s lookups={:.4}s links={:.4}s events_parse={:.4}s events_dedup={:.4}s clicks={:.4}s sessionize_attr_write={:.4}s total={:.4}s vm_hwm_kb={}",
+            "PROFILE startup={:.4}s lookups={:.4}s links={:.4}s events_parse={:.4}s events_dedup={:.4}s clicks={:.4}s sessionize_attr_ud={:.4}s camp_write={:.4}s total={:.4}s vm_hwm_kb={}",
             (t_startup - t0).as_secs_f64(),
             (t_lookups - t_startup).as_secs_f64(),
             (t_links - t_lookups).as_secs_f64(),
             (t_events_parse - t_links).as_secs_f64(),
             (t_events_dedup - t_events_parse).as_secs_f64(),
             (t_clicks - t_events_dedup).as_secs_f64(),
-            (t_done - t_clicks).as_secs_f64(),
+            (t_stage5 - t_clicks).as_secs_f64(),
+            (t_done - t_stage5).as_secs_f64(),
             (t_done - t0).as_secs_f64(),
             vm_hwm
         );
@@ -1387,11 +1399,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
 }
 
 #[inline(always)]
-fn pick_and_reset_top_cat<'a>(
-    cat_rev: &mut [i64],
-    touched_cats: &mut Vec<u32>,
-    categories: &'a [Box<[u8]>],
-) -> Option<&'a [u8]> {
+fn pick_and_reset_top_cat_id(cat_rev: &mut [i64], touched_cats: &mut Vec<u32>) -> Option<u32> {
     if touched_cats.is_empty() {
         return None;
     }
@@ -1407,7 +1415,7 @@ fn pick_and_reset_top_cat<'a>(
         }
     }
     touched_cats.clear();
-    Some(categories[best_id as usize].as_ref())
+    Some(best_id)
 }
 
 #[inline(always)]

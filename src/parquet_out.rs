@@ -3,6 +3,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use parquet::basic::Compression;
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
@@ -48,7 +49,10 @@ pub fn clean_parquet_dir(dir: &Path) -> io::Result<()> {
 
 pub struct UserDailyWriter {
     writer: SerializedFileWriter<File>,
-    user_ids: Vec<ByteArray>,
+    uid_buf: Vec<u8>,
+    uid_lens: Vec<u32>,
+    uid_arrays: Vec<ByteArray>,
+    cat_arrays: Vec<ByteArray>,
     days: Vec<i32>,
     sessions: Vec<i64>,
     events: Vec<i64>,
@@ -60,14 +64,19 @@ pub struct UserDailyWriter {
 }
 
 impl UserDailyWriter {
-    pub fn create(path: &Path, batch_rows: usize) -> io::Result<Self> {
+    pub fn create(
+        path: &Path,
+        batch_rows: usize,
+        categories: &[Box<[u8]>],
+        compression: Compression,
+    ) -> io::Result<Self> {
         let schema = Arc::new(
             parse_message_type(USER_DAILY_SCHEMA)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
         );
         let props = Arc::new(
             WriterProperties::builder()
-                .set_compression(Compression::SNAPPY)
+                .set_compression(compression)
                 .set_statistics_enabled(EnabledStatistics::None)
                 .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
                 .build(),
@@ -75,21 +84,29 @@ impl UserDailyWriter {
         let file = File::create(path)?;
         let writer = SerializedFileWriter::new(file, schema, props)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let cap = batch_rows.min(131_072);
+        let cat_arrays = categories
+            .iter()
+            .map(|c| ByteArray::from(Bytes::copy_from_slice(c.as_ref())))
+            .collect();
         Ok(Self {
             writer,
-            user_ids: Vec::with_capacity(batch_rows.min(65536)),
-            days: Vec::with_capacity(batch_rows.min(65536)),
-            sessions: Vec::with_capacity(batch_rows.min(65536)),
-            events: Vec::with_capacity(batch_rows.min(65536)),
-            revenues: Vec::with_capacity(batch_rows.min(65536)),
-            top_cats: Vec::with_capacity(batch_rows.min(65536)),
-            top_cat_defs: Vec::with_capacity(batch_rows.min(65536)),
+            uid_buf: Vec::with_capacity(cap * 12),
+            uid_lens: Vec::with_capacity(cap),
+            uid_arrays: Vec::with_capacity(cap),
+            cat_arrays,
+            days: Vec::with_capacity(cap),
+            sessions: Vec::with_capacity(cap),
+            events: Vec::with_capacity(cap),
+            revenues: Vec::with_capacity(cap),
+            top_cats: Vec::with_capacity(cap),
+            top_cat_defs: Vec::with_capacity(cap),
             total_rows: 0,
             batch_rows,
         })
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push(
         &mut self,
         user_id: &[u8],
@@ -97,15 +114,16 @@ impl UserDailyWriter {
         sessions: i64,
         events: i64,
         revenue: i64,
-        top_category: Option<&[u8]>,
+        top_cat_id: Option<u32>,
     ) -> io::Result<()> {
-        self.user_ids.push(ByteArray::from(user_id));
+        self.uid_buf.extend_from_slice(user_id);
+        self.uid_lens.push(user_id.len() as u32);
         self.days.push(day);
         self.sessions.push(sessions);
         self.events.push(events);
         self.revenues.push(revenue);
-        if let Some(cat) = top_category {
-            self.top_cats.push(ByteArray::from(cat));
+        if let Some(cid) = top_cat_id {
+            self.top_cats.push(self.cat_arrays[cid as usize].clone());
             self.top_cat_defs.push(1);
         } else {
             self.top_cat_defs.push(0);
@@ -121,6 +139,17 @@ impl UserDailyWriter {
         if self.days.is_empty() {
             return Ok(());
         }
+        let next_cap = self.uid_buf.len();
+        let buf = std::mem::replace(&mut self.uid_buf, Vec::with_capacity(next_cap));
+        let shared = Bytes::from(buf);
+        self.uid_arrays.clear();
+        let mut off = 0usize;
+        for &len in &self.uid_lens {
+            let end = off + len as usize;
+            self.uid_arrays.push(ByteArray::from(shared.slice(off..end)));
+            off = end;
+        }
+
         let mut rg = self
             .writer
             .next_row_group()
@@ -133,7 +162,7 @@ impl UserDailyWriter {
         {
             match (col_idx, col.untyped()) {
                 (0, ColumnWriter::ByteArrayColumnWriter(w)) => {
-                    w.write_batch(&self.user_ids, None, None)
+                    w.write_batch(&self.uid_arrays, None, None)
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 }
                 (1, ColumnWriter::Int32ColumnWriter(w)) => {
@@ -165,7 +194,8 @@ impl UserDailyWriter {
         rg.close()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        self.user_ids.clear();
+        self.uid_lens.clear();
+        self.uid_arrays.clear();
         self.days.clear();
         self.sessions.clear();
         self.events.clear();
@@ -195,14 +225,18 @@ pub struct CampaignRow<'a> {
     pub assisted_sessions: i64,
 }
 
-pub fn write_campaign_daily(path: &Path, rows: &[CampaignRow<'_>]) -> io::Result<()> {
+pub fn write_campaign_daily(
+    path: &Path,
+    rows: &[CampaignRow<'_>],
+    compression: Compression,
+) -> io::Result<()> {
     let schema = Arc::new(
         parse_message_type(CAMPAIGN_DAILY_SCHEMA)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
     );
     let props = Arc::new(
         WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(compression)
             .set_statistics_enabled(EnabledStatistics::None)
             .build(),
     );
