@@ -9,6 +9,7 @@ bytes = "1"
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more", "raw-entry", "allocator-api2"] }
 memchr = "2.7"
 memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
 parquet = { version = "54", default-features = false, features = ["snap"] }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
