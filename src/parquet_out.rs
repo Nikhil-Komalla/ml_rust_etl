@@ -244,6 +244,7 @@ pub struct UserDailyWriter {
     sessions: Vec<i32>,
     events: Vec<i32>,
     revenues: Vec<i64>,
+    rg_len: usize,
     cat_def_bits: Vec<u8>,
     cat_def_rle: Vec<u8>,
     cat_plain: Vec<u8>,
@@ -282,6 +283,7 @@ impl UserDailyWriter {
             sessions: Vec::with_capacity(cap),
             events: Vec::with_capacity(cap),
             revenues: Vec::with_capacity(cap),
+            rg_len: 0,
             cat_def_bits: vec![0u8; (cap + 7) >> 3],
             cat_def_rle: Vec::with_capacity(((cap + 7) >> 3) + 64),
             cat_plain: Vec::with_capacity(cap * 12),
@@ -290,6 +292,12 @@ impl UserDailyWriter {
             total_rows: 0,
             batch_rows,
         })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_plain_buf(buf: &mut Vec<u8>, additional: usize) {
+        buf.reserve(additional);
     }
 
     #[inline(always)]
@@ -302,10 +310,12 @@ impl UserDailyWriter {
         revenue: i64,
         top_cat_id: Option<u32>,
     ) -> io::Result<()> {
-        let rg_idx = self.days.len();
+        let rg_idx = self.rg_len;
         let uid_len = user_id.len();
         let cur_uid_len = self.uid_plain.len();
-        self.uid_plain.reserve(4 + uid_len);
+        if cur_uid_len + 4 + uid_len > self.uid_plain.capacity() {
+            Self::grow_plain_buf(&mut self.uid_plain, 4 + uid_len);
+        }
         unsafe {
             let dst = self.uid_plain.as_mut_ptr().add(cur_uid_len);
             std::ptr::write_unaligned(dst as *mut u32, (uid_len as u32).to_le());
@@ -317,36 +327,48 @@ impl UserDailyWriter {
             debug_assert!(rg_idx < self.events.capacity());
             debug_assert!(rg_idx < self.revenues.capacity());
             std::ptr::write(self.days.as_mut_ptr().add(rg_idx), day);
-            self.days.set_len(rg_idx + 1);
             std::ptr::write(self.sessions.as_mut_ptr().add(rg_idx), sessions as i32);
-            self.sessions.set_len(rg_idx + 1);
             std::ptr::write(self.events.as_mut_ptr().add(rg_idx), events as i32);
-            self.events.set_len(rg_idx + 1);
             std::ptr::write(self.revenues.as_mut_ptr().add(rg_idx), revenue);
-            self.revenues.set_len(rg_idx + 1);
         }
 
         let byte_idx = rg_idx >> 3;
         debug_assert!(byte_idx < self.cat_def_bits.len());
         if let Some(cid) = top_cat_id {
+            let enc = unsafe { self.cat_encoded.get_unchecked(cid as usize) };
+            let cur_clen = self.cat_plain.len();
+            if cur_clen + enc.len() > self.cat_plain.capacity() {
+                Self::grow_plain_buf(&mut self.cat_plain, enc.len());
+            }
             unsafe {
                 *self.cat_def_bits.get_unchecked_mut(byte_idx) |= 1u8 << (rg_idx & 7);
+                std::ptr::copy_nonoverlapping(
+                    enc.as_ptr(),
+                    self.cat_plain.as_mut_ptr().add(cur_clen),
+                    enc.len(),
+                );
+                self.cat_plain.set_len(cur_clen + enc.len());
             }
-            let enc = unsafe { self.cat_encoded.get_unchecked(cid as usize) };
-            self.cat_plain.extend_from_slice(enc);
         }
 
+        self.rg_len = rg_idx + 1;
         self.total_rows += 1;
-        if self.days.len() >= self.batch_rows {
+        if self.rg_len >= self.batch_rows {
             self.flush_row_group()?;
         }
         Ok(())
     }
 
     pub fn flush_row_group(&mut self) -> io::Result<()> {
-        let n = self.days.len();
+        let n = self.rg_len;
         if n == 0 {
             return Ok(());
+        }
+        unsafe {
+            self.days.set_len(n);
+            self.sessions.set_len(n);
+            self.events.set_len(n);
+            self.revenues.set_len(n);
         }
         let n_i32 = n as i32;
         let n_i64 = n as i64;
@@ -445,6 +467,7 @@ impl UserDailyWriter {
         self.sessions.clear();
         self.events.clear();
         self.revenues.clear();
+        self.rg_len = 0;
         self.cat_def_bits[..(n + 7) >> 3].fill(0);
         self.cat_plain.clear();
         Ok(())
@@ -923,7 +946,12 @@ mod tests {
 
             let rdr = SerializedFileReader::new(File::open(&p).unwrap()).unwrap();
             assert_eq!(rdr.metadata().file_metadata().num_rows(), n as i64);
-            let schema_fields = rdr.metadata().file_metadata().schema_descr().root_schema().get_fields();
+            let schema_fields = rdr
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .root_schema()
+                .get_fields();
             assert_eq!(schema_fields.len(), 7);
             let mut got = Vec::with_capacity(n);
             for r in rdr.get_row_iter(None).unwrap() {

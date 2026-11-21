@@ -6,8 +6,7 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::csv::{
-    cmp_raw_keys, mix64, resolve_raw_key, CompactKey64, CsvSource, LineBounds, LongArena,
-    CHUNK_BYTES,
+    cmp_raw_keys, mix64, resolve_raw_key, CompactKey64, CsvSource, LongArena, CHUNK_BYTES,
 };
 
 const LINK_SHARDS: usize = 32;
@@ -24,11 +23,6 @@ fn link_tag12(h: u64) -> u32 {
 struct LinkSlot {
     key: u64,
     canon: CompactKey64,
-}
-
-struct FlatLinkShard {
-    slots: Vec<LinkSlot>,
-    cap: usize,
 }
 
 #[inline(always)]
@@ -68,7 +62,8 @@ pub struct LinkMap {
     bloom: Vec<u64>,
     bloom_shift: u32,
     bloom_sub_mask: usize,
-    shards: Vec<FlatLinkShard>,
+    slots: Vec<LinkSlot>,
+    seg_cap: usize,
     long_map: HashMap<Box<[u8]>, CompactKey64>,
     has_long: bool,
     canon_arena: Vec<u8>,
@@ -82,7 +77,8 @@ impl LinkMap {
             bloom: Vec::new(),
             bloom_shift: 0,
             bloom_sub_mask: 0,
-            shards: Vec::new(),
+            slots: Vec::new(),
+            seg_cap: 0,
             long_map: HashMap::new(),
             has_long: false,
             canon_arena: Vec::new(),
@@ -136,10 +132,10 @@ impl LinkMap {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
-            let shard = self.shards.get_unchecked(s);
-            let slot = fast_range32(h, shard.cap);
+            let seg_cap = self.seg_cap;
+            let pos = fast_range32(h, seg_cap);
             std::arch::x86_64::_mm_prefetch(
-                shard.slots.as_ptr().add(slot) as *const i8,
+                self.slots.as_ptr().add(s * seg_cap + pos) as *const i8,
                 std::arch::x86_64::_MM_HINT_T0,
             );
         }
@@ -149,11 +145,11 @@ impl LinkMap {
     pub fn probe_inline_with_hash(&self, k: CompactKey64, h: u64) -> CompactKey64 {
         debug_assert!(!self.empty && k.is_inline());
         let s = ((h >> 52) as usize) & (LINK_SHARDS - 1);
-        let shard = unsafe { self.shards.get_unchecked(s) };
-        let cap = shard.cap;
-        let mut slot = fast_range32(h, cap);
+        let seg_cap = self.seg_cap;
+        let base = s * seg_cap;
+        let mut slot = fast_range32(h, seg_cap);
         loop {
-            let cur = unsafe { *shard.slots.get_unchecked(slot) };
+            let cur = unsafe { *self.slots.get_unchecked(base + slot) };
             if cur.key == k.0 {
                 return cur.canon;
             }
@@ -161,7 +157,7 @@ impl LinkMap {
                 return k;
             }
             slot += 1;
-            if slot == cap {
+            if slot == seg_cap {
                 slot = 0;
             }
         }
@@ -202,7 +198,8 @@ impl LinkMap {
 
     pub fn drop_lookup_tables(&mut self) {
         self.bloom = Vec::new();
-        self.shards = Vec::new();
+        self.slots = Vec::new();
+        self.seg_cap = 0;
         self.long_map = HashMap::new();
         self.has_long = false;
         self.empty = true;
@@ -325,14 +322,13 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             let next_ref = &next_chunk;
             scope.spawn(move |_| {
                 let mut buf = Vec::new();
-                let mut batch: Vec<LineBounds<2>> = Vec::new();
                 loop {
                     let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
                     let Some(&task) = chunks_ref.get(cidx) else {
                         break;
                     };
                     if let Err(e) =
-                        src_ref.for_each_chunk_batch::<2>(task, &mut buf, &mut batch, |padded, lines| {
+                        src_ref.for_each_chunk_l1_batch::<2>(task, &mut buf, |padded, lines| {
                             for lb in lines {
                                 let (a_s, a_e) = lb.span(0);
                                 let (b_s, b_e) = lb.span(1);
@@ -648,61 +644,96 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     let all_nodes_slice = &all_nodes;
     let parent_slice = &parent;
     let node_canon_slice = &node_canon;
-    let shards: Vec<FlatLinkShard> = bloom
-        .par_chunks_mut(words_per_shard)
-        .enumerate()
-        .map(|(s, bloom_slice)| {
-            let lo = offsets[s];
-            let hi = offsets[s + 1];
-            let mut non_roots: Vec<(usize, CompactKey64)> = Vec::new();
+    let offsets_ref = &offsets;
+    let max_m = (0..LINK_SHARDS)
+        .into_par_iter()
+        .map(|s| {
+            let lo = offsets_ref[s];
+            let hi = offsets_ref[s + 1];
+            let mut cnt = 0usize;
             if node_canon_slice.is_empty() {
                 for i in lo..hi {
-                    let r = parent_slice[i].load(Ordering::Relaxed) as usize;
-                    if i != r {
-                        non_roots.push((i, all_nodes_slice[r]));
+                    if parent_slice[i].load(Ordering::Relaxed) as usize != i {
+                        cnt += 1;
                     }
                 }
             } else {
                 for i in lo..hi {
-                    let canon = node_canon_slice[i];
-                    if canon != CompactKey64::EMPTY {
-                        non_roots.push((i, canon));
+                    if node_canon_slice[i] != CompactKey64::EMPTY {
+                        cnt += 1;
                     }
                 }
             }
-            let m = non_roots.len();
-            let cap = ((m * 5 + 3) / 4).max(m + 1).max(2);
-            let mut slots = vec![
-                LinkSlot {
-                    key: 0,
-                    canon: CompactKey64::EMPTY,
-                };
-                cap
-            ];
-            for (i, canon) in non_roots {
-                let key = all_nodes_slice[i].0;
-                let h = mix64(key);
-                let widx = ((h >> 32) as usize) & bloom_sub_mask;
-                bloom_slice[widx] |= bloom_bits(h);
-                let mut pos = fast_range32(h, cap);
-                while slots[pos].key != 0 {
-                    pos += 1;
-                    if pos == cap {
-                        pos = 0;
-                    }
-                }
-                slots[pos] = LinkSlot { key, canon };
-            }
-            FlatLinkShard { slots, cap }
+            cnt
         })
-        .collect();
+        .max()
+        .unwrap_or(0);
+
+    let seg_cap = ((max_m * 5 + 3) / 4).max(max_m + 1).max(2);
+    let mut slots = vec![
+        LinkSlot {
+            key: 0,
+            canon: CompactKey64::EMPTY,
+        };
+        LINK_SHARDS * seg_cap
+    ];
+
+    slots
+        .par_chunks_mut(seg_cap)
+        .zip(bloom.par_chunks_mut(words_per_shard))
+        .enumerate()
+        .for_each(|(s, (seg_slots, bloom_slice))| {
+            let lo = offsets_ref[s];
+            let hi = offsets_ref[s + 1];
+            if node_canon_slice.is_empty() {
+                for i in lo..hi {
+                    let r = parent_slice[i].load(Ordering::Relaxed) as usize;
+                    if i == r {
+                        continue;
+                    }
+                    let canon = all_nodes_slice[r];
+                    let key = all_nodes_slice[i].0;
+                    let h = mix64(key);
+                    let widx = ((h >> 32) as usize) & bloom_sub_mask;
+                    bloom_slice[widx] |= bloom_bits(h);
+                    let mut pos = fast_range32(h, seg_cap);
+                    while seg_slots[pos].key != 0 {
+                        pos += 1;
+                        if pos == seg_cap {
+                            pos = 0;
+                        }
+                    }
+                    seg_slots[pos] = LinkSlot { key, canon };
+                }
+            } else {
+                for i in lo..hi {
+                    let canon = node_canon_slice[i];
+                    if canon == CompactKey64::EMPTY {
+                        continue;
+                    }
+                    let key = all_nodes_slice[i].0;
+                    let h = mix64(key);
+                    let widx = ((h >> 32) as usize) & bloom_sub_mask;
+                    bloom_slice[widx] |= bloom_bits(h);
+                    let mut pos = fast_range32(h, seg_cap);
+                    while seg_slots[pos].key != 0 {
+                        pos += 1;
+                        if pos == seg_cap {
+                            pos = 0;
+                        }
+                    }
+                    seg_slots[pos] = LinkSlot { key, canon };
+                }
+            }
+        });
     drop(parent);
 
     Ok(LinkMap {
         bloom,
         bloom_shift,
         bloom_sub_mask,
-        shards,
+        slots,
+        seg_cap,
         long_map,
         has_long,
         canon_arena,

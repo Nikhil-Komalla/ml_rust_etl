@@ -127,15 +127,15 @@ fn parse_civil_datetime_19(b: &[u8]) -> Option<i64> {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
+#[repr(C)]
 struct DateCacheEntry {
     hi: u64,
-    day_days: i32,
+    day_sec: i64,
     lo: u16,
-    _pad: u16,
+    _pad: [u16; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<DateCacheEntry>() == 16);
+const _: () = assert!(std::mem::size_of::<DateCacheEntry>() == 24);
 
 #[derive(Clone)]
 pub struct DateCache {
@@ -147,15 +147,15 @@ impl DateCache {
         Self {
             entries: [DateCacheEntry {
                 hi: u64::MAX,
-                day_days: 0,
+                day_sec: 0,
                 lo: 0,
-                _pad: 0,
+                _pad: [0; 3],
             }; 64],
         }
     }
 
     #[inline(always)]
-    fn parse_civil_date_days(&mut self, b: &[u8]) -> Option<(i32, u64, u16)> {
+    fn parse_civil_date_sec(&mut self, b: &[u8]) -> Option<(i64, u64, u16)> {
         if b[10] != b'T' {
             return None;
         }
@@ -163,8 +163,8 @@ impl DateCache {
         let lo = u16::from_ne_bytes(b[8..10].try_into().unwrap());
         let idx = (((lo as usize & 3) << 4) + (((lo >> 8) as usize) & 15)) & 63;
         let e = &mut self.entries[idx];
-        let dd = if e.hi == hi && e.lo == lo {
-            e.day_days
+        let day_sec = if e.hi == hi && e.lo == lo {
+            e.day_sec
         } else {
             if b[4] != b'-' || b[7] != b'-' {
                 return None;
@@ -176,29 +176,28 @@ impl DateCache {
             if day < 1 || day > dim {
                 return None;
             }
-            let dd = days_from_civil(year, month, day) as i32;
+            let ds = days_from_civil(year, month, day) * 86_400;
             e.hi = hi;
             e.lo = lo;
-            e.day_days = dd;
-            dd
+            e.day_sec = ds;
+            ds
         };
-        Some((dd, hi, lo))
+        Some((day_sec, hi, lo))
     }
 
     #[inline(always)]
     fn parse_civil_datetime_19_sec(&mut self, b: &[u8]) -> Option<i64> {
-        let (day_days, _, _) = self.parse_civil_date_days(b)?;
+        let (day_sec, _, _) = self.parse_civil_date_sec(b)?;
         let hms_sec = parse_hms_sec(b)?;
-        Some((day_days as i64) * 86_400 + hms_sec)
+        Some(day_sec + hms_sec)
     }
 
     #[cfg(test)]
     #[inline(always)]
     pub fn parse_f1_sec_with_date(&mut self, b: &[u8]) -> Option<(i64, u64, u16, i64)> {
         if b.len() == 20 && b[19] == b'Z' {
-            let (dd, hi, lo) = self.parse_civil_date_days(b)?;
+            let (day_sec, hi, lo) = self.parse_civil_date_sec(b)?;
             let hms_sec = parse_hms_sec(b)?;
-            let day_sec = (dd as i64) * 86_400;
             Some((day_sec + hms_sec, hi, lo, day_sec))
         } else {
             None
@@ -207,13 +206,22 @@ impl DateCache {
 
     #[cold]
     #[inline(never)]
-    fn parse_f1_sec_slow(&mut self, b: &[u8], hms_sec: i64) -> Option<i64> {
-        let (dd, _, _) = self.parse_civil_date_days(b)?;
-        Some((dd as i64) * 86_400 + hms_sec)
+    fn parse_f1_sec_hint_slow(
+        &mut self,
+        b: &[u8],
+        hms_sec: i64,
+    ) -> Option<(i64, u64, u16, i64)> {
+        let (day_sec, hi, lo) = self.parse_civil_date_sec(b)?;
+        Some((day_sec + hms_sec, hi, lo, day_sec))
     }
 
     #[inline(always)]
-    pub fn parse_f1_sec_padded(&mut self, padded: &[u8], start: usize, len: usize) -> Option<i64> {
+    pub fn parse_f1_sec_padded_with_hint(
+        &mut self,
+        padded: &[u8],
+        start: usize,
+        len: usize,
+    ) -> Option<(i64, u64, u16, i64)> {
         debug_assert!(padded.len() >= start + 32);
         if len != 20 {
             return None;
@@ -227,13 +235,13 @@ impl DateCache {
         let idx = (((lo2 as usize & 3) << 4) + (((lo2 >> 8) as usize) & 15)) & 63;
         let e = unsafe { *self.entries.get_unchecked(idx) };
         if (e.hi == w0_ne) & (e.lo == lo2) & sep_ok & hms_ok {
-            return Some((e.day_days as i64) * 86_400 + hms_sec);
+            return Some((e.day_sec + hms_sec, w0_ne, lo2, e.day_sec));
         }
         if !sep_ok || !hms_ok {
             return None;
         }
         let s = unsafe { padded.get_unchecked(start..start + 20) };
-        self.parse_f1_sec_slow(s, hms_sec)
+        self.parse_f1_sec_hint_slow(s, hms_sec)
     }
 
     #[cfg(test)]
@@ -267,8 +275,8 @@ impl DateCache {
                 let day_sec = if hi == hint_hi && lo == hint_lo {
                     hint_day_sec
                 } else {
-                    let (d, _, _) = self.parse_civil_date_days(b)?;
-                    (d as i64) * 86_400
+                    let (ds, _, _) = self.parse_civil_date_sec(b)?;
+                    ds
                 };
                 return Some((day_sec + hms_sec) * MS_SECOND);
             }
@@ -301,12 +309,12 @@ impl DateCache {
                 if hi == hint_hi && lo == hint_lo {
                     hint_day_sec
                 } else {
-                    let (d, _, _) = self.parse_civil_date_days(b)?;
-                    (d as i64) * 86_400
+                    let (ds, _, _) = self.parse_civil_date_sec(b)?;
+                    ds
                 }
             } else {
-                let (d, _, _) = self.parse_civil_date_days(b)?;
-                (d as i64) * 86_400
+                let (ds, _, _) = self.parse_civil_date_sec(b)?;
+                ds
             };
             let oh = d2(b[20], b[21])?;
             let om = d2(b[23], b[24])?;
@@ -345,7 +353,18 @@ impl DateCache {
         self.parse_ts_ms_inner::<true>(b, hint_hi, hint_lo, hint_day_sec)
     }
 
-    #[cfg(test)]
+    #[cold]
+    #[inline(never)]
+    fn parse_ts_ms_with_hint_slow(
+        &mut self,
+        b: &[u8],
+        hint_hi: u64,
+        hint_lo: u16,
+        hint_day_sec: i64,
+    ) -> Option<i64> {
+        self.parse_ts_ms_inner::<true>(b, hint_hi, hint_lo, hint_day_sec)
+    }
+
     #[inline(always)]
     pub fn parse_ts_ms_padded_hint(
         &mut self,
@@ -385,7 +404,7 @@ impl DateCache {
             }
         }
         let s = unsafe { padded.get_unchecked(start..start + len) };
-        self.parse_ts_ms_with_hint(s, hint_hi, hint_lo, hint_day_sec)
+        self.parse_ts_ms_with_hint_slow(s, hint_hi, hint_lo, hint_day_sec)
     }
 
     #[cold]
@@ -403,11 +422,9 @@ impl DateCache {
     ) -> Option<i64> {
         debug_assert!(padded.len() >= start + 32);
         let ptr = unsafe { padded.as_ptr().add(start) };
-        let b19 = unsafe { *ptr.add(19) };
-        let is_f1 = (len == 20) & (b19 == b'Z');
-        let is_f2 = (len == 25) & ((b19 == b'+') | (b19 == b'-')) & (unsafe { *ptr.add(22) } == b':');
+        let is_f1 = (len == 20) & (unsafe { *ptr.add(19) } == b'Z');
         let is_f3 = len == 13;
-        if is_f1 | is_f2 | is_f3 {
+        if is_f1 | is_f3 {
             let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
             let w0_ne = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
             let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
@@ -424,31 +441,13 @@ impl DateCache {
             let idx = (((lo2 as usize & 3) << 4) + (((lo2 >> 8) as usize) & 15)) & 63;
             let e = unsafe { *self.entries.get_unchecked(idx) };
             let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
-            let iso_ok =
+            let f1_ok =
                 (e.hi == w0_ne) & (e.lo == lo2) & (unsafe { *ptr.add(10) } == b'T') & hms_ok;
-            let iso_sec = (e.day_days as i64).wrapping_mul(86_400).wrapping_add(hms_sec);
+            let f1_ms = e.day_sec.wrapping_add(hms_sec).wrapping_mul(MS_SECOND);
 
-            let d20 = (unsafe { *ptr.add(20) }).wrapping_sub(b'0');
-            let d21 = (unsafe { *ptr.add(21) }).wrapping_sub(b'0');
-            let d23 = (unsafe { *ptr.add(23) }).wrapping_sub(b'0');
-            let d24 = (unsafe { *ptr.add(24) }).wrapping_sub(b'0');
-            let oh = (d20 as i64) * 10 + (d21 as i64);
-            let om = (d23 as i64) * 10 + (d24 as i64);
-            let off_ok = (d20 <= 9) & (d21 <= 9) & (d23 <= 9) & (d24 <= 9) & (oh <= 23) & (om <= 59);
-            let off_sec = (oh * 3_600 + om * 60) * if b19 == b'+' { -1 } else { 1 };
-            let iso_ms = iso_sec
-                .wrapping_add(if is_f2 { off_sec } else { 0 })
-                .wrapping_mul(MS_SECOND);
-
-            let fast_ok = if is_f3 {
-                f3_ok
-            } else if is_f1 {
-                iso_ok
-            } else {
-                iso_ok & off_ok
-            };
+            let fast_ok = if is_f1 { f1_ok } else { f3_ok };
             if fast_ok {
-                return Some(if is_f3 { f3_ms } else { iso_ms });
+                return Some(if is_f1 { f1_ms } else { f3_ms });
             }
         }
         let s = unsafe { padded.get_unchecked(start..start + len) };
@@ -480,8 +479,7 @@ impl DateCache {
             let day_sec = if hi == *last_hi && lo == *last_lo {
                 *last_day_sec
             } else {
-                let (dd, d_hi, d_lo) = self.parse_civil_date_days(b)?;
-                let ds = (dd as i64) * 86_400;
+                let (ds, d_hi, d_lo) = self.parse_civil_date_sec(b)?;
                 *last_hi = d_hi;
                 *last_lo = d_lo;
                 *last_day_sec = ds;
@@ -519,8 +517,7 @@ impl DateCache {
             let day_sec = if hi == *last_hi && lo == *last_lo {
                 *last_day_sec
             } else {
-                let (dd, d_hi, d_lo) = self.parse_civil_date_days(b)?;
-                let ds = (dd as i64) * 86_400;
+                let (ds, d_hi, d_lo) = self.parse_civil_date_sec(b)?;
                 *last_hi = d_hi;
                 *last_lo = d_lo;
                 *last_day_sec = ds;
@@ -845,11 +842,11 @@ mod tests {
                 None
             };
             assert_eq!(
-                cache.parse_f1_sec_padded(&pad, 4, s.len()),
+                cache.parse_f1_sec_padded_with_hint(&pad, 4, s.len()).map(|v| v.0),
                 expected_f1_sec
             );
         }
-        // Cold DateCache miss -> warm DateCache hit specifically on F2 timestamps
+        // Cold DateCache miss -> warm DateCache hit on F2 timestamps + padded_hint cross-midnight miss
         let mut f2_cache = DateCache::new();
         for s in [
             b"2027-07-04T01:02:03+05:30".as_slice(),
@@ -858,6 +855,32 @@ mod tests {
             let mut pad = vec![0x5Au8; 4 + s.len() + 40];
             pad[4..4 + s.len()].copy_from_slice(s);
             assert_eq!(f2_cache.parse_ts_ms_padded_dc(&pad, 4, s.len()), parse_ts_ms(s));
+        }
+        let ing = b"2026-10-03T00:05:00Z";
+        let mut ing_pad = vec![0x5Au8; 4 + ing.len() + 40];
+        ing_pad[4..4 + ing.len()].copy_from_slice(ing);
+        let (_, h_hi, h_lo, h_day_sec) = f2_cache
+            .parse_f1_sec_padded_with_hint(&ing_pad, 4, ing.len())
+            .unwrap();
+        for ev_s in [
+            b"2026-10-03T00:01:00Z".as_slice(),       // same-day hint hit
+            b"2026-10-02T23:59:59Z".as_slice(),       // cross-midnight hint miss
+            b"2026-10-02T20:01:00-04:00".as_slice(),  // F2 offset
+            b"2026-10-03T01:31:00+01:30".as_slice(),  // F2 offset
+            b"1791071890000".as_slice(),              // F3 13 digits
+            b"bad_ts".as_slice(),                     // invalid
+            b"2026-10-02T25:00:00Z".as_slice(),       // invalid hour
+        ] {
+            let mut ev_pad = vec![0x5Au8; 4 + ev_s.len() + 40];
+            ev_pad[4..4 + ev_s.len()].copy_from_slice(ev_s);
+            assert_eq!(
+                f2_cache.parse_ts_ms_padded_hint(&ev_pad, 4, ev_s.len(), h_hi, h_lo, h_day_sec),
+                parse_ts_ms(ev_s)
+            );
+            assert_eq!(
+                f2_cache.parse_ts_ms_padded_dc(&ev_pad, 4, ev_s.len()),
+                parse_ts_ms(ev_s)
+            );
         }
     }
 
