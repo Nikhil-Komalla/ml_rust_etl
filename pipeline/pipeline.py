@@ -219,12 +219,12 @@ def define_macros(con: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE TEMP MACRO valid_csv_field(s) AS (
             s IS NOT NULL AND (
-                strpos(s, '"') = 0
+                NOT contains(s, '"')
                 OR (
-                    length(s) >= 2
-                    AND substr(s, 1, 1) = '"'
-                    AND substr(s, length(s), 1) = '"'
-                    AND strpos(substr(s, 2, length(s) - 2), '"') = 0
+                    strlen(s) >= 2
+                    AND starts_with(s, '"')
+                    AND ends_with(s, '"')
+                    AND strlen(s) - strlen(replace(s, '"', '')) = 2
                 )
             )
         );
@@ -232,7 +232,7 @@ def define_macros(con: duckdb.DuckDBPyConnection) -> None:
         CREATE TEMP MACRO unquote_csv_field(s) AS (
             NULLIF(
                 CASE
-                    WHEN length(s) >= 2 AND substr(s, 1, 1) = '"' THEN substr(s, 2, length(s) - 2)
+                    WHEN starts_with(s, '"') THEN substr(s, 2, length(s) - 2)
                     ELSE s
                 END,
                 ''
