@@ -902,16 +902,16 @@ fn run_events_dedup<E: DedupEmit>(
     n_dedup_workers: usize,
     est_p_cap: usize,
 ) -> (Vec<Vec<Vec<E>>>, Vec<usize>) {
-    const SWCB_DEDUP: usize = 4;
+    const SWCB_DEDUP: usize = 8;
     const RING: usize = 16;
 
     let mut dedup_worker_outs: Vec<Vec<Vec<E>>> = (0..n_dedup_workers).map(|_| Vec::new()).collect();
     let next_d_shard = AtomicUsize::new(0);
 
-    std::thread::scope(|scope| {
+    rayon::scope(|scope| {
         for out_slot in &mut dedup_worker_outs {
             let next_ref = &next_d_shard;
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 let mut person_out: Vec<Vec<E>> = Vec::new();
                 let mut swcb: Vec<E> = Vec::new();
                 let mut swcb_cnt = [0u8; P_PERSON];
@@ -1461,8 +1461,7 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
             continue;
         }
         let (ing_s, ing_e) = lb.span(3);
-        let ingest_ts = unsafe { padded.get_unchecked(ing_s..ing_e) };
-        let Some((ingest_sec, _, _, _)) = dcache.parse_f1_sec_with_date(ingest_ts) else {
+        let Some(ingest_sec) = dcache.parse_f1_sec_padded(padded, ing_s, ing_e - ing_s) else {
             continue;
         };
         let ingest_ms = ingest_sec * MS_SECOND;
@@ -1744,8 +1743,8 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
     click_window_start_ms: i64,
     n_workers: usize,
 ) -> io::Result<ParsedPoolOutput<C>> {
-    const SWCB_EV: usize = 4;
-    const SWCB_CL: usize = 4;
+    const SWCB_EV: usize = 8;
+    const SWCB_CL: usize = 8;
 
     let mut ev_worker_shards: Vec<Vec<Vec<ParsedEvent>>> =
         (0..n_workers).map(|_| Vec::new()).collect();
@@ -1760,7 +1759,7 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
         let next_cl = AtomicUsize::new(0);
         let lm_empty = link_map.is_empty();
 
-        std::thread::scope(|scope| {
+        rayon::scope(|scope| {
             for (
                 wid,
                 (((((ev_buckets_slot, ev_arena_out), ext_out), cl_buckets_slot), cl_arena_out), err_out),
@@ -1775,7 +1774,7 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
             {
                 let next_ev_ref = &next_ev;
                 let next_cl_ref = &next_cl;
-                scope.spawn(move || {
+                scope.spawn(move |_| {
                     let mut dcache = DateCache::new();
                     let mut buf = Vec::new();
                     let mut hit_idxs = [0u8; 64];
@@ -2072,10 +2071,18 @@ impl Stage5Event for PersonEvent16 {
 
     #[inline(always)]
     fn sort_grouped(slice: &mut [u64], scratch: &mut Vec<u64>) {
-        if slice.len() < 384 {
-            if slice.len() > 1 {
-                slice.sort_unstable();
+        let n = slice.len();
+        if n <= 1 {
+            return;
+        }
+        if n == 2 {
+            if slice[0] > slice[1] {
+                slice.swap(0, 1);
             }
+            return;
+        }
+        if n < 384 {
+            slice.sort_unstable();
         } else {
             sort_u64_radix(slice, scratch);
         }
@@ -2266,6 +2273,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
     let num_cats = lookups.categories.len();
     let organic_camp = lookups.organic_camp_id;
     let total_events: usize = person_event_counts.iter().sum();
+    let ud_batch_rows = (total_events / (8 * n_out_workers).max(1)).clamp(4096, USER_DAILY_BATCH_ROWS);
 
     let mut worker_accs: Vec<CampDailyAcc> = (0..n_out_workers)
         .map(|_| CampDailyAcc::new(num_camps, min_day, max_day, total_events))
@@ -2273,7 +2281,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
     let mut worker_ud_rows = vec![0usize; n_out_workers];
     let err_lock = Mutex::new(None::<io::Error>);
 
-    std::thread::scope(|scope| {
+    rayon::scope(|scope| {
         for (wid, (acc, ud_rows_out)) in worker_accs
             .iter_mut()
             .zip(worker_ud_rows.iter_mut())
@@ -2285,10 +2293,10 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
             let err_lock_ref = &err_lock;
             let ud_path = ud_dir.join(format!("part-{wid}.parquet"));
 
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 let mut writer = match UserDailyWriter::create(
                     &ud_path,
-                    USER_DAILY_BATCH_ROWS,
+                    ud_batch_rows,
                     &lookups.categories,
                     Compression::UNCOMPRESSED,
                 ) {
@@ -2302,6 +2310,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                 // Hoisted per-worker reusable buffers (zero per-shard malloc/free).
                 let mut p_slots: Vec<PersonSlot> = Vec::new();
                 let mut persons: Vec<CompactKey64> = Vec::new();
+                let mut ev_counts: Vec<u32> = Vec::new();
                 let mut long_p_table: HashTable<u32> = HashTable::new();
                 let mut ev_pids: Vec<u32> = Vec::new();
                 let mut ev_offsets: Vec<u32> = Vec::new();
@@ -2347,10 +2356,13 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     p_slots.clear();
                     p_slots.resize(p_cap, PersonSlot::EMPTY);
                     persons.clear();
+                    ev_counts.clear();
                     long_p_table.clear();
                     let mut has_long_p = false;
                     ev_pids.clear();
                     ev_pids.reserve(ev_total);
+                    let ev_pids_ptr = ev_pids.as_mut_ptr();
+                    let mut ev_pid_pos = 0usize;
 
                     for batch in &evs_batches {
                         let blen = batch.len();
@@ -2413,11 +2425,15 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                 loop {
                                     let s = unsafe { *p_slots.get_unchecked(pos) };
                                     if s.key == pk.0 {
+                                        unsafe {
+                                            *ev_counts.get_unchecked_mut(s.pid as usize) += 1;
+                                        }
                                         break s.pid;
                                     }
                                     if s.key == 0 {
                                         let id = persons.len() as u32;
                                         persons.push(pk);
+                                        ev_counts.push(1);
                                         unsafe {
                                             *p_slots.get_unchecked_mut(pos) =
                                                 PersonSlot { key: pk.0, pid: id };
@@ -2435,31 +2451,42 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                                     |&id| LongArena::resolve_in(ev_arenas, persons[id as usize]) == pb,
                                     |&id| hash_bytes_fast(LongArena::resolve_in(ev_arenas, persons[id as usize])),
                                 ) {
-                                    hashbrown::hash_table::Entry::Occupied(occ) => *occ.get(),
+                                    hashbrown::hash_table::Entry::Occupied(occ) => {
+                                        let id = *occ.get();
+                                        unsafe {
+                                            *ev_counts.get_unchecked_mut(id as usize) += 1;
+                                        }
+                                        id
+                                    }
                                     hashbrown::hash_table::Entry::Vacant(vac) => {
                                         let id = persons.len() as u32;
                                         persons.push(pk);
+                                        ev_counts.push(1);
                                         vac.insert(id);
                                         id
                                     }
                                 }
                             };
-                            ev_pids.push(pid);
+                            unsafe {
+                                ev_pids_ptr.add(ev_pid_pos).write(pid);
+                            }
+                            ev_pid_pos += 1;
                         }
+                    }
+                    debug_assert_eq!(ev_pid_pos, ev_total);
+                    unsafe {
+                        ev_pids.set_len(ev_total);
                     }
 
                     let num_p = persons.len();
+                    debug_assert_eq!(ev_counts.len(), num_p);
                     ev_offsets.clear();
                     ev_offsets.resize(num_p + 1, 0);
-                    for &pid in &ev_pids {
+                    for i in 0..num_p {
                         unsafe {
-                            *ev_offsets.get_unchecked_mut(pid as usize + 1) += 1;
-                        }
-                    }
-                    for i in 1..=num_p {
-                        unsafe {
-                            let prev = *ev_offsets.get_unchecked(i - 1);
-                            *ev_offsets.get_unchecked_mut(i) += prev;
+                            let cur = *ev_offsets.get_unchecked(i);
+                            let cnt = *ev_counts.get_unchecked(i);
+                            *ev_offsets.get_unchecked_mut(i + 1) = cur + cnt;
                         }
                     }
                     ev_fill.clear();
@@ -2959,7 +2986,18 @@ fn read_vm_hwm_kb() -> isize {
     -1
 }
 
+#[cfg(test)]
 pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool) -> io::Result<()> {
+    run_pipeline_with_exit(data_dir, out_dir, ncpu, profile, false)
+}
+
+pub fn run_pipeline_with_exit(
+    data_dir: &Path,
+    out_dir: &Path,
+    ncpu: usize,
+    profile: bool,
+    fast_exit: bool,
+) -> io::Result<()> {
     let t0 = Instant::now();
 
     let manifest_bytes = fs::read(data_dir.join("manifest.json"))?;
@@ -3237,6 +3275,13 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             (t_done - t0).as_secs_f64(),
             vm_hwm
         );
+    }
+
+    if fast_exit {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        std::process::exit(0);
     }
 
     Ok(())

@@ -192,6 +192,7 @@ impl DateCache {
         Some((day_days as i64) * 86_400 + hms_sec)
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn parse_f1_sec_with_date(&mut self, b: &[u8]) -> Option<(i64, u64, u16, i64)> {
         if b.len() == 20 && b[19] == b'Z' {
@@ -202,6 +203,37 @@ impl DateCache {
         } else {
             None
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn parse_f1_sec_slow(&mut self, b: &[u8], hms_sec: i64) -> Option<i64> {
+        let (dd, _, _) = self.parse_civil_date_days(b)?;
+        Some((dd as i64) * 86_400 + hms_sec)
+    }
+
+    #[inline(always)]
+    pub fn parse_f1_sec_padded(&mut self, padded: &[u8], start: usize, len: usize) -> Option<i64> {
+        debug_assert!(padded.len() >= start + 32);
+        if len != 20 {
+            return None;
+        }
+        let ptr = unsafe { padded.as_ptr().add(start) };
+        let w0_ne = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
+        let lo2 = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
+        let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
+        let sep_ok = (unsafe { *ptr.add(10) } == b'T') & (unsafe { *ptr.add(19) } == b'Z');
+        let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
+        let idx = (((lo2 as usize & 3) << 4) + (((lo2 >> 8) as usize) & 15)) & 63;
+        let e = unsafe { *self.entries.get_unchecked(idx) };
+        if (e.hi == w0_ne) & (e.lo == lo2) & sep_ok & hms_ok {
+            return Some((e.day_days as i64) * 86_400 + hms_sec);
+        }
+        if !sep_ok || !hms_ok {
+            return None;
+        }
+        let s = unsafe { padded.get_unchecked(start..start + 20) };
+        self.parse_f1_sec_slow(s, hms_sec)
     }
 
     #[cfg(test)]
@@ -356,6 +388,12 @@ impl DateCache {
         self.parse_ts_ms_with_hint(s, hint_hi, hint_lo, hint_day_sec)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn parse_ts_ms_slow(&mut self, b: &[u8]) -> Option<i64> {
+        self.parse_ts_ms_inner::<false>(b, 0, 0, 0)
+    }
+
     #[inline(always)]
     pub fn parse_ts_ms_padded_dc(
         &mut self,
@@ -365,9 +403,11 @@ impl DateCache {
     ) -> Option<i64> {
         debug_assert!(padded.len() >= start + 32);
         let ptr = unsafe { padded.as_ptr().add(start) };
-        let is_f1 = (len == 20) & (unsafe { *ptr.add(19) } == b'Z');
+        let b19 = unsafe { *ptr.add(19) };
+        let is_f1 = (len == 20) & (b19 == b'Z');
+        let is_f2 = (len == 25) & ((b19 == b'+') | (b19 == b'-')) & (unsafe { *ptr.add(22) } == b':');
         let is_f3 = len == 13;
-        if is_f1 | is_f3 {
+        if is_f1 | is_f2 | is_f3 {
             let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
             let w0_ne = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
             let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
@@ -384,20 +424,35 @@ impl DateCache {
             let idx = (((lo2 as usize & 3) << 4) + (((lo2 >> 8) as usize) & 15)) & 63;
             let e = unsafe { *self.entries.get_unchecked(idx) };
             let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
-            let f1_ok =
+            let iso_ok =
                 (e.hi == w0_ne) & (e.lo == lo2) & (unsafe { *ptr.add(10) } == b'T') & hms_ok;
-            let f1_ms = (e.day_days as i64)
-                .wrapping_mul(86_400)
-                .wrapping_add(hms_sec)
+            let iso_sec = (e.day_days as i64).wrapping_mul(86_400).wrapping_add(hms_sec);
+
+            let d20 = (unsafe { *ptr.add(20) }).wrapping_sub(b'0');
+            let d21 = (unsafe { *ptr.add(21) }).wrapping_sub(b'0');
+            let d23 = (unsafe { *ptr.add(23) }).wrapping_sub(b'0');
+            let d24 = (unsafe { *ptr.add(24) }).wrapping_sub(b'0');
+            let oh = (d20 as i64) * 10 + (d21 as i64);
+            let om = (d23 as i64) * 10 + (d24 as i64);
+            let off_ok = (d20 <= 9) & (d21 <= 9) & (d23 <= 9) & (d24 <= 9) & (oh <= 23) & (om <= 59);
+            let off_sec = (oh * 3_600 + om * 60) * if b19 == b'+' { -1 } else { 1 };
+            let iso_ms = iso_sec
+                .wrapping_add(if is_f2 { off_sec } else { 0 })
                 .wrapping_mul(MS_SECOND);
 
-            let fast_ok = if is_f1 { f1_ok } else { f3_ok };
+            let fast_ok = if is_f3 {
+                f3_ok
+            } else if is_f1 {
+                iso_ok
+            } else {
+                iso_ok & off_ok
+            };
             if fast_ok {
-                return Some(if is_f1 { f1_ms } else { f3_ms });
+                return Some(if is_f3 { f3_ms } else { iso_ms });
             }
         }
         let s = unsafe { padded.get_unchecked(start..start + len) };
-        self.parse_ts_ms_inner::<false>(s, 0, 0, 0)
+        self.parse_ts_ms_slow(s)
     }
 
     #[cfg(test)]
@@ -760,17 +815,49 @@ mod tests {
             b"2026-10-03T12:00:00Z".as_slice(),
             b"2026-10-04T00:00:01Z".as_slice(),
             b"2026-10-04T05:06:07Z".as_slice(),
+            b"2026-10-04T05:06:07Q".as_slice(),
+            b"2026-02-29T00:00:00Z".as_slice(),
+            b"short".as_slice(),
+            b"2027-03-15T12:34:56+00:00".as_slice(),
+            b"2027-03-15T12:34:56-00:00".as_slice(),
+            b"2027-03-15T12:34:56+23:59".as_slice(),
+            b"2027-03-15T12:34:56-23:59".as_slice(),
+            b"2027-03-15T12:34:56+24:00".as_slice(),
+            b"2027-03-15T12:34:56+05:60".as_slice(),
+            b"2027-03-15T12:34:56+0200".as_slice(),
+            b"2027-03-15T12:34:56+0a:00".as_slice(),
+            b"2027-03-15T12:34:56+\xef\xbc\x90\xef\xbc\x95:00".as_slice(),
         ] {
+            let expected = parse_ts_ms(s);
             assert_eq!(
                 cache.parse_ts_ms_cached(s, &mut l_hi, &mut l_lo, &mut l_day_sec),
-                parse_ts_ms(s)
+                expected
             );
             let mut pad = vec![0x5Au8; 4 + s.len() + 40];
             pad[4..4 + s.len()].copy_from_slice(s);
             assert_eq!(
                 cache.parse_ts_ms_padded_dc(&pad, 4, s.len()),
-                parse_ts_ms(s)
+                expected
             );
+            let expected_f1_sec = if s.len() == 20 && s[19] == b'Z' {
+                expected.map(|ms| ms / MS_SECOND)
+            } else {
+                None
+            };
+            assert_eq!(
+                cache.parse_f1_sec_padded(&pad, 4, s.len()),
+                expected_f1_sec
+            );
+        }
+        // Cold DateCache miss -> warm DateCache hit specifically on F2 timestamps
+        let mut f2_cache = DateCache::new();
+        for s in [
+            b"2027-07-04T01:02:03+05:30".as_slice(),
+            b"2027-07-04T23:59:59-04:00".as_slice(),
+        ] {
+            let mut pad = vec![0x5Au8; 4 + s.len() + 40];
+            pad[4..4 + s.len()].copy_from_slice(s);
+            assert_eq!(f2_cache.parse_ts_ms_padded_dc(&pad, 4, s.len()), parse_ts_ms(s));
         }
     }
 
