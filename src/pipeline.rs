@@ -20,7 +20,7 @@ use crate::parse::{
 use crate::parquet_out::{clean_parquet_dir, write_campaign_daily, CampaignRow, UserDailyWriter};
 
 const P_DEDUP: usize = 256;
-const P_PERSON: usize = 256;
+const P_PERSON: usize = 128;
 const USE_NT_STORES: bool = true;
 const USER_DAILY_BATCH_ROWS: usize = 131_072;
 
@@ -908,10 +908,10 @@ fn run_events_dedup<E: DedupEmit>(
     let mut dedup_worker_outs: Vec<Vec<Vec<E>>> = (0..n_dedup_workers).map(|_| Vec::new()).collect();
     let next_d_shard = AtomicUsize::new(0);
 
-    rayon::scope(|scope| {
+    std::thread::scope(|scope| {
         for out_slot in &mut dedup_worker_outs {
             let next_ref = &next_d_shard;
-            scope.spawn(move |_| {
+            scope.spawn(move || {
                 let mut person_out: Vec<Vec<E>> = Vec::new();
                 let mut swcb: Vec<E> = Vec::new();
                 let mut swcb_cnt = [0u8; P_PERSON];
@@ -1462,9 +1462,7 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
         }
         let (ing_s, ing_e) = lb.span(3);
         let ingest_ts = unsafe { padded.get_unchecked(ing_s..ing_e) };
-        let Some((ingest_sec, hint_hi, hint_lo, hint_day_sec)) =
-            dcache.parse_f1_sec_with_date(ingest_ts)
-        else {
+        let Some((ingest_sec, _, _, _)) = dcache.parse_f1_sec_with_date(ingest_ts) else {
             continue;
         };
         let ingest_ms = ingest_sec * MS_SECOND;
@@ -1492,26 +1490,12 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
         let mut is_purchase = false;
 
         if u_len > 0 && p_len > 0 {
+            let mut need_ts = false;
             if et_len == 4 {
                 let w = unsafe {
                     u32::from_ne_bytes(*(padded.as_ptr().add(et_s) as *const [u8; 4]))
                 };
-                if (w == VIEW_U32) | (w == CART_U32) {
-                    let ts_slice = unsafe { padded.get_unchecked(ts_s..ts_e) };
-                    if let Some(t) =
-                        dcache.parse_ts_ms_with_hint(ts_slice, hint_hi, hint_lo, hint_day_sec)
-                    {
-                        let in_late = if COMPACT {
-                            (ingest_ms - t) <= MS_DAY
-                        } else {
-                            (ingest_ms as i128 - t as i128) <= MS_DAY as i128
-                        };
-                        if t >= window_start_ms && t < window_end_ms && in_late {
-                            ts_ms = t;
-                            valid = true;
-                        }
-                    }
-                }
+                need_ts = (w == VIEW_U32) | (w == CART_U32);
             } else if et_len == 8 {
                 let w8 = unsafe {
                     u64::from_ne_bytes(*(padded.as_ptr().add(et_s) as *const [u8; 8]))
@@ -1520,23 +1504,25 @@ fn process_ev_batch<const SWCB_EV: usize, const COMPACT: bool>(
                     let (pr_s, pr_e) = lb.span(6);
                     let price = unsafe { padded.get_unchecked(pr_s..pr_e) };
                     if let Some(p) = parse_price_cents(price) {
-                        let ts_slice = unsafe { padded.get_unchecked(ts_s..ts_e) };
-                        if let Some(t) =
-                            dcache.parse_ts_ms_with_hint(ts_slice, hint_hi, hint_lo, hint_day_sec)
-                        {
-                            let in_late = if COMPACT {
-                                (ingest_ms - t) <= MS_DAY
-                            } else {
-                                (ingest_ms as i128 - t as i128) <= MS_DAY as i128
-                            };
-                            if t >= window_start_ms && t < window_end_ms && in_late {
-                                ts_ms = t;
-                                price_val = p;
-                                cat_id = lookups.get_product_cat_padded(padded, p_s, p_len);
-                                is_purchase = true;
-                                valid = true;
-                            }
+                        price_val = p;
+                        is_purchase = true;
+                        need_ts = true;
+                    }
+                }
+            }
+            if need_ts {
+                if let Some(t) = dcache.parse_ts_ms_padded_dc(padded, ts_s, ts_e - ts_s) {
+                    let in_late = if COMPACT {
+                        (ingest_ms - t) <= MS_DAY
+                    } else {
+                        (ingest_ms as i128 - t as i128) <= MS_DAY as i128
+                    };
+                    if t >= window_start_ms && t < window_end_ms && in_late {
+                        ts_ms = t;
+                        if is_purchase {
+                            cat_id = lookups.get_product_cat_padded(padded, p_s, p_len);
                         }
+                        valid = true;
                     }
                 }
             }
@@ -1650,9 +1636,6 @@ fn process_cl_batch<C: ClickEmit, const SWCB_CL: usize>(
     padded: &[u8],
     lines: &[LineBounds<4>],
     dcache: &mut DateCache,
-    last_hi: &mut u64,
-    last_lo: &mut u16,
-    last_day_sec: &mut i64,
     lookups: &Lookups,
     link_map: &LinkMap,
     lm_empty: bool,
@@ -1682,9 +1665,7 @@ fn process_cl_batch<C: ClickEmit, const SWCB_CL: usize>(
             continue;
         };
         let (ts_s, ts_e) = lb.span(3);
-        let ts_slice = unsafe { padded.get_unchecked(ts_s..ts_e) };
-        let Some(ts_ms) = dcache.parse_ts_ms_cached(ts_slice, last_hi, last_lo, last_day_sec)
-        else {
+        let Some(ts_ms) = dcache.parse_ts_ms_padded_dc(padded, ts_s, ts_e - ts_s) else {
             continue;
         };
         if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
@@ -1779,7 +1760,7 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
         let next_cl = AtomicUsize::new(0);
         let lm_empty = link_map.is_empty();
 
-        rayon::scope(|scope| {
+        std::thread::scope(|scope| {
             for (
                 wid,
                 (((((ev_buckets_slot, ev_arena_out), ext_out), cl_buckets_slot), cl_arena_out), err_out),
@@ -1794,7 +1775,7 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
             {
                 let next_ev_ref = &next_ev;
                 let next_cl_ref = &next_cl;
-                scope.spawn(move |_| {
+                scope.spawn(move || {
                     let mut dcache = DateCache::new();
                     let mut buf = Vec::new();
                     let mut hit_idxs = [0u8; 64];
@@ -1902,9 +1883,6 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
                             let mut swcb = vec![tmpl; P_PERSON * SWCB_CL];
                             let mut swcb_cnt = [0u8; P_PERSON];
                             let mut pending_cl = [tmpl; 64];
-                            let mut last_hi = u64::MAX;
-                            let mut last_lo = 0u16;
-                            let mut last_day_sec = 0i64;
                             let mut cl_batch: Vec<LineBounds<4>> = Vec::new();
 
                             let mut cidx = first;
@@ -1919,9 +1897,6 @@ fn run_parse_events_and_clicks<C: ClickEmit, const COMPACT: bool>(
                                             padded,
                                             lines,
                                             &mut dcache,
-                                            &mut last_hi,
-                                            &mut last_lo,
-                                            &mut last_day_sec,
                                             lookups,
                                             link_map,
                                             lm_empty,
@@ -2298,7 +2273,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
     let mut worker_ud_rows = vec![0usize; n_out_workers];
     let err_lock = Mutex::new(None::<io::Error>);
 
-    rayon::scope(|scope| {
+    std::thread::scope(|scope| {
         for (wid, (acc, ud_rows_out)) in worker_accs
             .iter_mut()
             .zip(worker_ud_rows.iter_mut())
@@ -2310,7 +2285,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
             let err_lock_ref = &err_lock;
             let ud_path = ud_dir.join(format!("part-{wid}.parquet"));
 
-            scope.spawn(move |_| {
+            scope.spawn(move || {
                 let mut writer = match UserDailyWriter::create(
                     &ud_path,
                     USER_DAILY_BATCH_ROWS,

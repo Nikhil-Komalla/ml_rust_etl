@@ -156,35 +156,27 @@ impl CompactKey64 {
     pub fn encode_raw_inline_padded(padded: &[u8], start: usize, len: usize) -> Option<Self> {
         debug_assert!(padded.len() >= start + 16);
         let ptr = unsafe { padded.as_ptr().add(start) };
-        if len == 9 {
+        if len.wrapping_sub(2) <= 7 {
             let b0 = unsafe { *ptr };
-            let tail = unsafe { u64::from_be_bytes(*(ptr.add(1) as *const [u8; 8])) };
+            let tail_raw = unsafe { u64::from_be_bytes(*(ptr.add(1) as *const [u8; 8])) };
+            let mask = !0u64 << ((9 - len) * 8);
+            let tail = tail_raw & mask;
+            let tail_check = tail | (!mask & 0x0101_0101_0101_0101);
             if b0.wrapping_sub(1) > 126
-                || ((tail | tail.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080)
+                || ((tail_check | tail_check.wrapping_sub(0x0101_0101_0101_0101))
+                    & 0x8080_8080_8080_8080)
                     != 0
             {
                 return None;
             }
             return Some(Self(((b0 as u64) << 56) | pext7(tail)));
         }
-        if len == 8 {
-            let w = unsafe { u64::from_be_bytes(*(ptr as *const [u8; 8])) };
-            if ((w | w.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080) != 0 {
+        if len == 1 {
+            let b0 = unsafe { *ptr };
+            if b0.wrapping_sub(1) > 126 {
                 return None;
             }
-            return Some(Self((w & 0xFF00_0000_0000_0000) | pext7(w << 8)));
-        }
-        if (1..=7).contains(&len) {
-            let w_raw = unsafe { u64::from_be_bytes(*(ptr as *const [u8; 8])) };
-            let mask = !0u64 << ((8 - len) * 8);
-            let w = w_raw & mask;
-            let w_check = w | (!mask & 0x0101_0101_0101_0101);
-            if ((w_check | w_check.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080)
-                != 0
-            {
-                return None;
-            }
-            return Some(Self((w & 0xFF00_0000_0000_0000) | pext7(w << 8)));
+            return Some(Self((b0 as u64) << 56));
         }
         None
     }
@@ -625,15 +617,6 @@ fn push_line_bounds_if_valid<const K: usize>(
         return;
     }
     if non_ascii != 0 && std::str::from_utf8(&padded_buf[line_start..line_end]).is_err() {
-        return;
-    }
-    if total_quotes == 0 {
-        let mut commas_and_end = *commas;
-        commas_and_end[K - 1] = line_end as u32;
-        batch.push(LineBounds {
-            line_start: line_start as u32,
-            commas_and_end,
-        });
         return;
     }
     let ptr = padded_buf.as_ptr();
