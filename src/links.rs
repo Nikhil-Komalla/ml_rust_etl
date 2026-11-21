@@ -87,7 +87,6 @@ impl LinkMap {
         }
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.empty
@@ -99,7 +98,6 @@ impl LinkMap {
         (s << self.bloom_shift) | (((h >> 32) as usize) & self.bloom_sub_mask)
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub fn prefetch_bloom(&self, h: u64) {
         if self.empty {
@@ -126,7 +124,6 @@ impl LinkMap {
         (w & need) == need
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub fn prefetch_slot(&self, h: u64) {
         if self.empty {
@@ -166,6 +163,7 @@ impl LinkMap {
         }
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn resolve_inline_with_hash(&self, k: CompactKey64, h: u64) -> CompactKey64 {
         if !self.bloom_may_contain(h) {
@@ -174,6 +172,7 @@ impl LinkMap {
         self.probe_inline_with_hash(k, h)
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn resolve_inline(&self, k: CompactKey64) -> CompactKey64 {
         debug_assert!(!k.is_ref() && k != CompactKey64::EMPTY);
@@ -197,7 +196,6 @@ impl LinkMap {
         &self.canon_arena[off as usize..off as usize + len as usize]
     }
 
-    #[allow(dead_code)]
     pub fn drop_lookup_tables(&mut self) {
         self.bloom = Vec::new();
         self.shards = Vec::new();

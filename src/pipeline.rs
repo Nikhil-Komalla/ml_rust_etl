@@ -619,6 +619,654 @@ trait Stage5Click: Copy + Send + Sync {
     fn unpack_full(g: &Self::Grouped) -> (i64, u32, CompactKey64);
 }
 
+trait ClickEmit: Stage5Click {
+    fn set_person_key(&mut self, pk: CompactKey64);
+    fn from_parsed(
+        person_key: CompactKey64,
+        click_id_key: CompactKey64,
+        ts_ms: i64,
+        click_window_start_ms: i64,
+        camp_id: u32,
+    ) -> Self;
+}
+
+impl ClickEmit for PersonClick16 {
+    #[inline(always)]
+    fn set_person_key(&mut self, pk: CompactKey64) {
+        self.person_key = pk;
+    }
+
+    #[inline(always)]
+    fn from_parsed(
+        person_key: CompactKey64,
+        click_id_key: CompactKey64,
+        ts_ms: i64,
+        click_window_start_ms: i64,
+        camp_id: u32,
+    ) -> Self {
+        Self {
+            person_key,
+            click_id_key,
+            ts_rel_ms: (ts_ms - click_window_start_ms) as u32,
+            camp_id,
+        }
+    }
+}
+
+impl ClickEmit for PersonClickWide {
+    #[inline(always)]
+    fn set_person_key(&mut self, pk: CompactKey64) {
+        self.person_key = pk;
+    }
+
+    #[inline(always)]
+    fn from_parsed(
+        person_key: CompactKey64,
+        click_id_key: CompactKey64,
+        ts_ms: i64,
+        _click_window_start_ms: i64,
+        camp_id: u32,
+    ) -> Self {
+        Self {
+            person_key,
+            click_id_key,
+            ts_ms,
+            camp_id,
+            _pad: 0,
+        }
+    }
+}
+
+#[inline(always)]
+fn swcb_push<T: Copy, const W: usize>(
+    swcb: &mut [T],
+    cnts: &mut [u8],
+    buckets: &mut [Vec<T>],
+    shard: usize,
+    val: T,
+) {
+    let base = shard * W;
+    let c = unsafe { *cnts.get_unchecked(shard) } as usize;
+    unsafe {
+        *swcb.get_unchecked_mut(base + c) = val;
+    }
+    let c = c + 1;
+    if c < W {
+        unsafe {
+            *cnts.get_unchecked_mut(shard) = c as u8;
+        }
+    } else {
+        unsafe {
+            buckets
+                .get_unchecked_mut(shard)
+                .extend_from_slice(swcb.get_unchecked(base..base + W));
+            *cnts.get_unchecked_mut(shard) = 0;
+        }
+    }
+}
+
+struct ParsedPoolOutput<C> {
+    dedup_inputs: Vec<Vec<Vec<ParsedEvent>>>,
+    ev_worker_arenas: Vec<LongArena>,
+    ev_worker_ext: Vec<Vec<ExtEvent>>,
+    person_click_batches: Vec<Vec<Vec<C>>>,
+    person_click_counts: Vec<usize>,
+    cl_worker_arenas: Vec<LongArena>,
+}
+
+fn run_parse_events_and_clicks<C: ClickEmit>(
+    event_src: &CsvSource,
+    ev_chunks: &[crate::csv::ChunkTask],
+    est_ev_cap: usize,
+    click_src: &CsvSource,
+    cl_chunks: &[crate::csv::ChunkTask],
+    est_cl_cap: usize,
+    lookups: &Lookups,
+    link_map: &LinkMap,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    window_start_sec: i64,
+    click_window_start_ms: i64,
+    compact_mode: bool,
+    n_workers: usize,
+) -> io::Result<ParsedPoolOutput<C>> {
+    const SWCB_EV: usize = 8;
+    const SWCB_CL: usize = 8;
+
+    let mut ev_worker_shards: Vec<Vec<Vec<ParsedEvent>>> =
+        (0..n_workers).map(|_| Vec::new()).collect();
+    let mut ev_worker_arenas: Vec<LongArena> = (0..n_workers).map(|_| LongArena::default()).collect();
+    let mut ev_worker_ext: Vec<Vec<ExtEvent>> = (0..n_workers).map(|_| Vec::new()).collect();
+    let mut cl_worker_shards: Vec<Vec<Vec<C>>> = (0..n_workers).map(|_| Vec::new()).collect();
+    let mut cl_worker_arenas: Vec<LongArena> = (0..n_workers).map(|_| LongArena::default()).collect();
+    let mut worker_errs: Vec<Option<io::Error>> = (0..n_workers).map(|_| None).collect();
+
+    if !ev_chunks.is_empty() || !cl_chunks.is_empty() {
+        let next_ev = AtomicUsize::new(0);
+        let next_cl = AtomicUsize::new(0);
+        let lm_empty = link_map.is_empty();
+
+        std::thread::scope(|scope| {
+            for (
+                wid,
+                (((((ev_buckets_slot, ev_arena_out), ext_out), cl_buckets_slot), cl_arena_out), err_out),
+            ) in ev_worker_shards
+                .iter_mut()
+                .zip(ev_worker_arenas.iter_mut())
+                .zip(ev_worker_ext.iter_mut())
+                .zip(cl_worker_shards.iter_mut())
+                .zip(cl_worker_arenas.iter_mut())
+                .zip(worker_errs.iter_mut())
+                .enumerate()
+            {
+                let next_ev_ref = &next_ev;
+                let next_cl_ref = &next_cl;
+                scope.spawn(move || {
+                    let mut dcache = DateCache::new();
+                    let mut buf = Vec::new();
+                    let mut hit_idxs = [0u8; 64];
+                    let mut pending_uh = [0u64; 64];
+
+                    // Events phase
+                    if !ev_chunks.is_empty() {
+                        let first = next_ev_ref.fetch_add(1, Ordering::Relaxed);
+                        if first < ev_chunks.len() {
+                            let mut ev_buckets: Vec<Vec<ParsedEvent>> =
+                                (0..P_DEDUP).map(|_| Vec::with_capacity(est_ev_cap)).collect();
+                            let mut swcb = vec![
+                                ParsedEvent {
+                                    ev_key: CompactKey64::EMPTY,
+                                    person_key: CompactKey64::EMPTY,
+                                    meta: 0,
+                                };
+                                P_DEDUP * SWCB_EV
+                            ];
+                            let mut swcb_cnt = [0u8; P_DEDUP];
+                            let mut pending_ev = [ParsedEvent {
+                                ev_key: CompactKey64::EMPTY,
+                                person_key: CompactKey64::EMPTY,
+                                meta: 0,
+                            }; 64];
+                            let mut pending_ds = [0u8; 64];
+
+                            let mut cidx = first;
+                            while let Some(&task) = ev_chunks.get(cidx) {
+                                if let Err(e) =
+                                    event_src.for_each_chunk_batch::<7>(task, &mut buf, |data, spans| {
+                                        let mut n_pending = 0usize;
+
+                                        for sp in spans {
+                                            let ev_id = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[0] as usize..sp.ends[0] as usize,
+                                                )
+                                            };
+                                            if ev_id.is_empty() {
+                                                continue;
+                                            }
+                                            let ingest_ts = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[3] as usize..sp.ends[3] as usize,
+                                                )
+                                            };
+                                            let Some((ingest_sec, hint_hi, hint_lo, hint_dd)) =
+                                                dcache.parse_f1_sec_with_date(ingest_ts)
+                                            else {
+                                                continue;
+                                            };
+                                            let ingest_ms = ingest_sec * MS_SECOND;
+                                            let (ev_key, ev_hash) =
+                                                if let Some(k) = CompactKey64::encode_raw_inline(ev_id)
+                                                {
+                                                    (k, mix64(k.0))
+                                                } else {
+                                                    (
+                                                        ev_arena_out.push_ref(wid, ev_id),
+                                                        hash_bytes_fast(ev_id),
+                                                    )
+                                                };
+                                            let d_shard =
+                                                ((ev_hash >> 52) as usize) & (P_DEDUP - 1);
+
+                                            let uid = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[1] as usize..sp.ends[1] as usize,
+                                                )
+                                            };
+                                            let ts = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[2] as usize..sp.ends[2] as usize,
+                                                )
+                                            };
+                                            let etype = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[4] as usize..sp.ends[4] as usize,
+                                                )
+                                            };
+                                            let pid = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[5] as usize..sp.ends[5] as usize,
+                                                )
+                                            };
+                                            let price = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[6] as usize..sp.ends[6] as usize,
+                                                )
+                                            };
+
+                                            let mut valid = false;
+                                            let mut ts_ms = 0i64;
+                                            let mut price_val = 0u32;
+                                            let mut cat_id = 0u32;
+                                            let mut is_purchase = false;
+
+                                            if !uid.is_empty() && !pid.is_empty() {
+                                                if etype.len() == 4 {
+                                                    const VIEW_U32: u32 =
+                                                        u32::from_ne_bytes(*b"view");
+                                                    const CART_U32: u32 =
+                                                        u32::from_ne_bytes(*b"cart");
+                                                    let w = unsafe {
+                                                        u32::from_ne_bytes(
+                                                            *(etype.as_ptr() as *const [u8; 4]),
+                                                        )
+                                                    };
+                                                    if (w == VIEW_U32) | (w == CART_U32) {
+                                                        if let Some(t) = dcache
+                                                            .parse_ts_ms_with_hint(
+                                                                ts, hint_hi, hint_lo, hint_dd,
+                                                            )
+                                                        {
+                                                            if t >= window_start_ms
+                                                                && t < window_end_ms
+                                                                && (ingest_ms as i128 - t as i128)
+                                                                    <= MS_DAY as i128
+                                                            {
+                                                                ts_ms = t;
+                                                                valid = true;
+                                                            }
+                                                        }
+                                                    }
+                                                } else if etype == b"purchase" {
+                                                    if let Some(p) = parse_price_cents(price) {
+                                                        if let Some(t) = dcache
+                                                            .parse_ts_ms_with_hint(
+                                                                ts, hint_hi, hint_lo, hint_dd,
+                                                            )
+                                                        {
+                                                            if t >= window_start_ms
+                                                                && t < window_end_ms
+                                                                && (ingest_ms as i128 - t as i128)
+                                                                    <= MS_DAY as i128
+                                                            {
+                                                                ts_ms = t;
+                                                                price_val = p;
+                                                                cat_id =
+                                                                    lookups.get_product_cat(pid);
+                                                                is_purchase = true;
+                                                                valid = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            if !valid {
+                                                swcb_push::<ParsedEvent, SWCB_EV>(
+                                                    &mut swcb,
+                                                    &mut swcb_cnt,
+                                                    &mut ev_buckets,
+                                                    d_shard,
+                                                    ParsedEvent {
+                                                        ev_key,
+                                                        person_key: CompactKey64(ingest_ms as u64),
+                                                        meta: META_INVALID,
+                                                    },
+                                                );
+                                                continue;
+                                            }
+
+                                            let meta = if compact_mode && !is_purchase {
+                                                let ingest_sec_rel = ingest_sec - window_start_sec;
+                                                if (-META_FAST_ING_BIAS..META_FAST_ING_BIAS)
+                                                    .contains(&ingest_sec_rel)
+                                                {
+                                                    let ts_rel = (ts_ms - window_start_ms) as u64;
+                                                    let biased =
+                                                        (ingest_sec_rel + META_FAST_ING_BIAS) as u64;
+                                                    META_VALID_FAST | (biased << 31) | ts_rel
+                                                } else {
+                                                    let ext_idx = ext_out.len() as u64;
+                                                    ext_out.push(ExtEvent {
+                                                        ts_ms,
+                                                        ingest_ts_ms: ingest_ms,
+                                                        price_cents: price_val,
+                                                        cat_id,
+                                                    });
+                                                    META_VALID_EXT | ((wid as u64) << 40) | ext_idx
+                                                }
+                                            } else {
+                                                let ext_idx = ext_out.len() as u64;
+                                                ext_out.push(ExtEvent {
+                                                    ts_ms,
+                                                    ingest_ts_ms: ingest_ms,
+                                                    price_cents: price_val,
+                                                    cat_id,
+                                                });
+                                                META_VALID_EXT | ((wid as u64) << 40) | ext_idx
+                                            };
+
+                                            if let Some(uk) = CompactKey64::encode_raw_inline(uid) {
+                                                if lm_empty {
+                                                    swcb_push::<ParsedEvent, SWCB_EV>(
+                                                        &mut swcb,
+                                                        &mut swcb_cnt,
+                                                        &mut ev_buckets,
+                                                        d_shard,
+                                                        ParsedEvent {
+                                                            ev_key,
+                                                            person_key: uk,
+                                                            meta,
+                                                        },
+                                                    );
+                                                } else {
+                                                    let uh = mix64(uk.0);
+                                                    link_map.prefetch_bloom(uh);
+                                                    pending_ev[n_pending] = ParsedEvent {
+                                                        ev_key,
+                                                        person_key: uk,
+                                                        meta,
+                                                    };
+                                                    pending_uh[n_pending] = uh;
+                                                    pending_ds[n_pending] = d_shard as u8;
+                                                    n_pending += 1;
+                                                }
+                                            } else {
+                                                let person_key = link_map
+                                                    .resolve_long(uid)
+                                                    .unwrap_or_else(|| {
+                                                        ev_arena_out.push_ref(wid, uid)
+                                                    });
+                                                swcb_push::<ParsedEvent, SWCB_EV>(
+                                                    &mut swcb,
+                                                    &mut swcb_cnt,
+                                                    &mut ev_buckets,
+                                                    d_shard,
+                                                    ParsedEvent {
+                                                        ev_key,
+                                                        person_key,
+                                                        meta,
+                                                    },
+                                                );
+                                            }
+                                        }
+
+                                        let mut n_hits = 0usize;
+                                        for j in 0..n_pending {
+                                            let uh = pending_uh[j];
+                                            if link_map.bloom_may_contain(uh) {
+                                                link_map.prefetch_slot(uh);
+                                                hit_idxs[n_hits] = j as u8;
+                                                n_hits += 1;
+                                            } else {
+                                                swcb_push::<ParsedEvent, SWCB_EV>(
+                                                    &mut swcb,
+                                                    &mut swcb_cnt,
+                                                    &mut ev_buckets,
+                                                    pending_ds[j] as usize,
+                                                    pending_ev[j],
+                                                );
+                                            }
+                                        }
+
+                                        for k in 0..n_hits {
+                                            let j = hit_idxs[k] as usize;
+                                            let mut ev = pending_ev[j];
+                                            ev.person_key = link_map
+                                                .probe_inline_with_hash(ev.person_key, pending_uh[j]);
+                                            swcb_push::<ParsedEvent, SWCB_EV>(
+                                                &mut swcb,
+                                                &mut swcb_cnt,
+                                                &mut ev_buckets,
+                                                pending_ds[j] as usize,
+                                                ev,
+                                            );
+                                        }
+                                    })
+                                {
+                                    *err_out = Some(e);
+                                    return;
+                                }
+                                cidx = next_ev_ref.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            for ds in 0..P_DEDUP {
+                                let cnt = swcb_cnt[ds] as usize;
+                                if cnt > 0 {
+                                    let base = ds * SWCB_EV;
+                                    ev_buckets[ds].extend_from_slice(&swcb[base..base + cnt]);
+                                }
+                            }
+                            *ev_buckets_slot = ev_buckets;
+                        }
+                    }
+
+                    // Clicks phase immediately in same worker pool (no barrier)
+                    if !cl_chunks.is_empty() {
+                        let first = next_cl_ref.fetch_add(1, Ordering::Relaxed);
+                        if first < cl_chunks.len() {
+                            let mut cl_buckets: Vec<Vec<C>> =
+                                (0..P_PERSON).map(|_| Vec::with_capacity(est_cl_cap)).collect();
+                            let tmpl = C::from_parsed(
+                                CompactKey64::EMPTY,
+                                CompactKey64::EMPTY,
+                                0,
+                                0,
+                                0,
+                            );
+                            let mut swcb = vec![tmpl; P_PERSON * SWCB_CL];
+                            let mut swcb_cnt = [0u8; P_PERSON];
+                            let mut pending_cl = [tmpl; 64];
+
+                            let mut cidx = first;
+                            while let Some(&task) = cl_chunks.get(cidx) {
+                                if let Err(e) =
+                                    click_src.for_each_chunk_batch::<4>(task, &mut buf, |data, spans| {
+                                        let mut n_pending = 0usize;
+
+                                        for sp in spans {
+                                            let click_id = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[0] as usize..sp.ends[0] as usize,
+                                                )
+                                            };
+                                            let uid = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[1] as usize..sp.ends[1] as usize,
+                                                )
+                                            };
+                                            if click_id.is_empty() || uid.is_empty() {
+                                                continue;
+                                            }
+                                            let camp_id = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[2] as usize..sp.ends[2] as usize,
+                                                )
+                                            };
+                                            let Some(cid) = lookups.get_campaign(camp_id) else {
+                                                continue;
+                                            };
+                                            let ts = unsafe {
+                                                data.get_unchecked(
+                                                    sp.starts[3] as usize..sp.ends[3] as usize,
+                                                )
+                                            };
+                                            let Some(ts_ms) = dcache.parse_ts_ms(ts) else {
+                                                continue;
+                                            };
+                                            if ts_ms < click_window_start_ms
+                                                || ts_ms >= window_end_ms
+                                            {
+                                                continue;
+                                            }
+                                            let click_id_key =
+                                                CompactKey64::encode_raw(click_id, wid, cl_arena_out);
+
+                                            if let Some(uk) = CompactKey64::encode_raw_inline(uid) {
+                                                let uh = mix64(uk.0);
+                                                if lm_empty {
+                                                    let pshard =
+                                                        ((uh >> 52) as usize) & (P_PERSON - 1);
+                                                    swcb_push::<C, SWCB_CL>(
+                                                        &mut swcb,
+                                                        &mut swcb_cnt,
+                                                        &mut cl_buckets,
+                                                        pshard,
+                                                        C::from_parsed(
+                                                            uk,
+                                                            click_id_key,
+                                                            ts_ms,
+                                                            click_window_start_ms,
+                                                            cid,
+                                                        ),
+                                                    );
+                                                } else {
+                                                    link_map.prefetch_bloom(uh);
+                                                    pending_cl[n_pending] = C::from_parsed(
+                                                        uk,
+                                                        click_id_key,
+                                                        ts_ms,
+                                                        click_window_start_ms,
+                                                        cid,
+                                                    );
+                                                    pending_uh[n_pending] = uh;
+                                                    n_pending += 1;
+                                                }
+                                            } else {
+                                                let (pk, ph) =
+                                                    if let Some(pk) = link_map.resolve_long(uid) {
+                                                        (pk, mix64(pk.0))
+                                                    } else {
+                                                        (
+                                                            cl_arena_out.push_ref(wid, uid),
+                                                            hash_bytes_fast(uid),
+                                                        )
+                                                    };
+                                                let pshard =
+                                                    ((ph >> 52) as usize) & (P_PERSON - 1);
+                                                swcb_push::<C, SWCB_CL>(
+                                                    &mut swcb,
+                                                    &mut swcb_cnt,
+                                                    &mut cl_buckets,
+                                                    pshard,
+                                                    C::from_parsed(
+                                                        pk,
+                                                        click_id_key,
+                                                        ts_ms,
+                                                        click_window_start_ms,
+                                                        cid,
+                                                    ),
+                                                );
+                                            }
+                                        }
+
+                                        let mut n_hits = 0usize;
+                                        for j in 0..n_pending {
+                                            let uh = pending_uh[j];
+                                            if link_map.bloom_may_contain(uh) {
+                                                link_map.prefetch_slot(uh);
+                                                hit_idxs[n_hits] = j as u8;
+                                                n_hits += 1;
+                                            } else {
+                                                let pshard =
+                                                    ((uh >> 52) as usize) & (P_PERSON - 1);
+                                                swcb_push::<C, SWCB_CL>(
+                                                    &mut swcb,
+                                                    &mut swcb_cnt,
+                                                    &mut cl_buckets,
+                                                    pshard,
+                                                    pending_cl[j],
+                                                );
+                                            }
+                                        }
+
+                                        for k in 0..n_hits {
+                                            let j = hit_idxs[k] as usize;
+                                            let mut pc = pending_cl[j];
+                                            let uk = pc.person_key();
+                                            let uh = pending_uh[j];
+                                            let pk = link_map.probe_inline_with_hash(uk, uh);
+                                            let ph = if pk.0 == uk.0 { uh } else { mix64(pk.0) };
+                                            pc.set_person_key(pk);
+                                            let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
+                                            swcb_push::<C, SWCB_CL>(
+                                                &mut swcb,
+                                                &mut swcb_cnt,
+                                                &mut cl_buckets,
+                                                pshard,
+                                                pc,
+                                            );
+                                        }
+                                    })
+                                {
+                                    *err_out = Some(e);
+                                    return;
+                                }
+                                cidx = next_cl_ref.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            for ps in 0..P_PERSON {
+                                let cnt = swcb_cnt[ps] as usize;
+                                if cnt > 0 {
+                                    let base = ps * SWCB_CL;
+                                    cl_buckets[ps].extend_from_slice(&swcb[base..base + cnt]);
+                                }
+                            }
+                            *cl_buckets_slot = cl_buckets;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    for e in worker_errs.into_iter().flatten() {
+        return Err(e);
+    }
+
+    let mut dedup_inputs: Vec<Vec<Vec<ParsedEvent>>> =
+        (0..P_DEDUP).map(|_| Vec::with_capacity(n_workers)).collect();
+    for mut worker_vecs in ev_worker_shards {
+        for (d_shard, v) in worker_vecs.drain(..).enumerate() {
+            if !v.is_empty() {
+                dedup_inputs[d_shard].push(v);
+            }
+        }
+    }
+
+    let mut person_click_batches: Vec<Vec<Vec<C>>> = (0..P_PERSON)
+        .map(|_| Vec::with_capacity(n_workers))
+        .collect();
+    let mut person_click_counts = vec![0usize; P_PERSON];
+    for mut worker_vecs in cl_worker_shards {
+        for (ps, v) in worker_vecs.drain(..).enumerate() {
+            if !v.is_empty() {
+                person_click_counts[ps] += v.len();
+                person_click_batches[ps].push(v);
+            }
+        }
+    }
+
+    Ok(ParsedPoolOutput {
+        dedup_inputs,
+        ev_worker_arenas,
+        ev_worker_ext,
+        person_click_batches,
+        person_click_counts,
+        cl_worker_arenas,
+    })
+}
+
 impl Stage5Event for PersonEvent16 {
     type Grouped = u64;
 
@@ -1353,7 +2001,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     let (lookups_res, links_res) =
         rayon::join(|| load_lookups(data_dir), || build_link_map(&link_paths, ncpu));
     let lookups = lookups_res?;
-    let link_map = links_res?;
+    let mut link_map = links_res?;
     let t_links = Instant::now();
     let t_lookups = t_startup;
 
@@ -1365,178 +2013,89 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
         && click_span_ms <= (u32::MAX as i64)
         && lookups.categories.len() <= 256;
 
-    // Stage 3a: Events parse with 24B ParsedEvent & immediate LinkMap resolution
+    // Unified Stage 3a + Stage 4: parse events & clicks in one work-stealing pool
     let event_paths = list_csv_files(&data_dir.join("events"))?;
+    let click_paths = list_csv_files(&data_dir.join("clicks"))?;
     let event_src = CsvSource::open(&event_paths)?;
+    let click_src = CsvSource::open(&click_paths)?;
     let ev_chunks = event_src.chunks(CHUNK_BYTES);
-    let n_ev_workers = ncpu.clamp(1, 63).min(ev_chunks.len().max(1));
+    let cl_chunks = click_src.chunks(CHUNK_BYTES);
+    let total_chunks = ev_chunks.len() + cl_chunks.len();
+    let n_ev_workers = ncpu.clamp(1, 63).min(total_chunks.max(1));
     let est_ev_total = event_src.total_bytes() / 68;
-    let raw_ev_cap = est_ev_total / (n_ev_workers * P_DEDUP);
+    let ev_active_workers = n_ev_workers.min(ev_chunks.len().max(1));
+    let raw_ev_cap = est_ev_total / (ev_active_workers * P_DEDUP);
     let est_ev_cap = if raw_ev_cap >= 64 { raw_ev_cap + 16 } else { 0 };
-    let mut ev_worker_shards: Vec<Vec<Vec<ParsedEvent>>> = (0..n_ev_workers)
-        .map(|_| (0..P_DEDUP).map(|_| Vec::with_capacity(est_ev_cap)).collect())
-        .collect();
-    let mut ev_worker_arenas: Vec<LongArena> =
-        (0..n_ev_workers).map(|_| LongArena::default()).collect();
-    let mut ev_worker_ext: Vec<Vec<ExtEvent>> = (0..n_ev_workers).map(|_| Vec::new()).collect();
-    let mut ev_worker_errs: Vec<Option<io::Error>> = (0..n_ev_workers).map(|_| None).collect();
+    let cl_active_workers = n_ev_workers.min(cl_chunks.len().max(1));
+    let raw_cl_cap = (click_src.total_bytes() / 42) / (cl_active_workers * P_PERSON);
+    let est_cl_cap = if raw_cl_cap >= 64 { raw_cl_cap + 16 } else { 0 };
 
-    if !ev_chunks.is_empty() {
-        let next_chunk = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for (wid, (((buckets, arena_out), ext_out), err_out)) in ev_worker_shards
-                .iter_mut()
-                .zip(ev_worker_arenas.iter_mut())
-                .zip(ev_worker_ext.iter_mut())
-                .zip(ev_worker_errs.iter_mut())
-                .enumerate()
-            {
-                let src_ref = &event_src;
-                let chunks_ref = &ev_chunks;
-                let next_ref = &next_chunk;
-                let lookups_ref = &lookups;
-                let lm_ref = &link_map;
-                scope.spawn(move || {
-                    let mut dcache = DateCache::new();
-                    let mut buf = Vec::new();
-                    loop {
-                        let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
-                        let Some(&task) = chunks_ref.get(cidx) else {
-                            break;
-                        };
-                        if let Err(e) = src_ref.for_each_chunk_line::<7>(
-                            task,
-                            &mut buf,
-                            |[ev_id, uid, ts, ingest_ts, etype, pid, price]| {
-                                if ev_id.is_empty() {
-                                    return;
-                                }
-                                let Some(ingest_sec) = dcache.parse_f1_sec(ingest_ts) else {
-                                    return;
-                                };
-                                let ingest_ms = ingest_sec * MS_SECOND;
-                                let (ev_key, ev_hash) =
-                                    if let Some(k) = CompactKey64::encode_raw_inline(ev_id) {
-                                        (k, mix64(k.0))
-                                    } else {
-                                        (arena_out.push_ref(wid, ev_id), hash_bytes_fast(ev_id))
-                                    };
-                                let d_shard = ((ev_hash >> 52) as usize) & (P_DEDUP - 1);
-
-                                let mut valid = false;
-                                let mut ts_ms = 0i64;
-                                let mut price_val = 0u32;
-                                let mut cat_id = 0u32;
-                                let mut is_purchase = false;
-
-                                if !uid.is_empty() && !pid.is_empty() {
-                                    if etype.len() == 4 {
-                                        const VIEW_U32: u32 = u32::from_ne_bytes(*b"view");
-                                        const CART_U32: u32 = u32::from_ne_bytes(*b"cart");
-                                        let w = u32::from_ne_bytes(etype.try_into().unwrap());
-                                        if (w == VIEW_U32) | (w == CART_U32) {
-                                            if let Some(t) = dcache.parse_ts_ms(ts) {
-                                                if t >= window_start_ms
-                                                    && t < window_end_ms
-                                                    && (ingest_ms as i128 - t as i128)
-                                                        <= MS_DAY as i128
-                                                {
-                                                    ts_ms = t;
-                                                    valid = true;
-                                                }
-                                            }
-                                        }
-                                    } else if etype == b"purchase" {
-                                        if let Some(p) = parse_price_cents(price) {
-                                            if let Some(t) = dcache.parse_ts_ms(ts) {
-                                                if t >= window_start_ms
-                                                    && t < window_end_ms
-                                                    && (ingest_ms as i128 - t as i128)
-                                                        <= MS_DAY as i128
-                                                {
-                                                    ts_ms = t;
-                                                    price_val = p;
-                                                    cat_id = lookups_ref.get_product_cat(pid);
-                                                    is_purchase = true;
-                                                    valid = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if !valid {
-                                    buckets[d_shard].push(ParsedEvent {
-                                        ev_key,
-                                        person_key: CompactKey64(ingest_ms as u64),
-                                        meta: META_INVALID,
-                                    });
-                                    return;
-                                }
-
-                                let person_key = if let Some(uk) = CompactKey64::encode_raw_inline(uid) {
-                                    lm_ref.resolve_inline(uk)
-                                } else {
-                                    lm_ref
-                                        .resolve_long(uid)
-                                        .unwrap_or_else(|| arena_out.push_ref(wid, uid))
-                                };
-
-                                if compact_mode && !is_purchase {
-                                    let ingest_sec_rel = ingest_sec - window_start_sec;
-                                    if (-META_FAST_ING_BIAS..META_FAST_ING_BIAS)
-                                        .contains(&ingest_sec_rel)
-                                    {
-                                        let ts_rel = (ts_ms - window_start_ms) as u64;
-                                        let biased = (ingest_sec_rel + META_FAST_ING_BIAS) as u64;
-                                        buckets[d_shard].push(ParsedEvent {
-                                            ev_key,
-                                            person_key,
-                                            meta: META_VALID_FAST | (biased << 31) | ts_rel,
-                                        });
-                                        return;
-                                    }
-                                }
-
-                                let ext_idx = ext_out.len() as u64;
-                                ext_out.push(ExtEvent {
-                                    ts_ms,
-                                    ingest_ts_ms: ingest_ms,
-                                    price_cents: price_val,
-                                    cat_id,
-                                });
-                                buckets[d_shard].push(ParsedEvent {
-                                    ev_key,
-                                    person_key,
-                                    meta: META_VALID_EXT | ((wid as u64) << 40) | ext_idx,
-                                });
-                            },
-                        ) {
-                            *err_out = Some(e);
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-    }
-    for e in ev_worker_errs.into_iter().flatten() {
-        return Err(e);
-    }
+    let (
+        dedup_inputs,
+        ev_worker_arenas,
+        ev_worker_ext,
+        person_click_batches_16,
+        person_click_batches_wide,
+        person_click_counts,
+        cl_worker_arenas,
+    ) = if compact_mode {
+        let out = run_parse_events_and_clicks::<PersonClick16>(
+            &event_src,
+            &ev_chunks,
+            est_ev_cap,
+            &click_src,
+            &cl_chunks,
+            est_cl_cap,
+            &lookups,
+            &link_map,
+            window_start_ms,
+            window_end_ms,
+            window_start_sec,
+            click_window_start_ms,
+            compact_mode,
+            n_ev_workers,
+        )?;
+        (
+            out.dedup_inputs,
+            out.ev_worker_arenas,
+            out.ev_worker_ext,
+            out.person_click_batches,
+            Vec::new(),
+            out.person_click_counts,
+            out.cl_worker_arenas,
+        )
+    } else {
+        let out = run_parse_events_and_clicks::<PersonClickWide>(
+            &event_src,
+            &ev_chunks,
+            est_ev_cap,
+            &click_src,
+            &cl_chunks,
+            est_cl_cap,
+            &lookups,
+            &link_map,
+            window_start_ms,
+            window_end_ms,
+            window_start_sec,
+            click_window_start_ms,
+            compact_mode,
+            n_ev_workers,
+        )?;
+        (
+            out.dedup_inputs,
+            out.ev_worker_arenas,
+            out.ev_worker_ext,
+            Vec::new(),
+            out.person_click_batches,
+            out.person_click_counts,
+            out.cl_worker_arenas,
+        )
+    };
     drop(event_src);
+    drop(click_src);
+    link_map.drop_lookup_tables();
     let t_events_parse = Instant::now();
 
-    // Transpose [worker][d_shard] -> [d_shard][worker] (moves Vec headers only).
-    let mut dedup_inputs: Vec<Vec<Vec<ParsedEvent>>> = (0..P_DEDUP)
-        .map(|_| Vec::with_capacity(n_ev_workers))
-        .collect();
-    for mut worker_vecs in ev_worker_shards {
-        for (d_shard, v) in worker_vecs.drain(..).enumerate() {
-            if !v.is_empty() {
-                dedup_inputs[d_shard].push(v);
-            }
-        }
-    }
     let dedup_slots: Vec<Mutex<Option<Vec<Vec<ParsedEvent>>>>> =
         dedup_inputs.into_iter().map(|v| Mutex::new(Some(v))).collect();
 
@@ -1852,194 +2411,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
     drop(dedup_slots);
     drop(ev_worker_ext);
     let t_events_dedup = Instant::now();
-
-    // Stage 4: Clicks parse + validate + direct P_PERSON-shard scatter
-    let click_paths = list_csv_files(&data_dir.join("clicks"))?;
-    let click_src = CsvSource::open(&click_paths)?;
-    let cl_chunks = click_src.chunks(CHUNK_BYTES);
-    let n_cl_workers = ncpu.clamp(1, 63).min(cl_chunks.len().max(1));
-    let raw_cl_cap = (click_src.total_bytes() / 42) / (n_cl_workers * P_PERSON);
-    let est_cl_cap = if raw_cl_cap >= 64 { raw_cl_cap + 16 } else { 0 };
-    let mut cl_worker_arenas: Vec<LongArena> =
-        (0..n_cl_workers).map(|_| LongArena::default()).collect();
-    let mut cl_worker_errs: Vec<Option<io::Error>> = (0..n_cl_workers).map(|_| None).collect();
-
-    let mut person_click_batches_16: Vec<Vec<Vec<PersonClick16>>> = Vec::new();
-    let mut person_click_batches_wide: Vec<Vec<Vec<PersonClickWide>>> = Vec::new();
-    let mut person_click_counts = vec![0usize; P_PERSON];
-
-    if compact_mode {
-        let mut cl_worker_shards: Vec<Vec<Vec<PersonClick16>>> = (0..n_cl_workers)
-            .map(|_| (0..P_PERSON).map(|_| Vec::with_capacity(est_cl_cap)).collect())
-            .collect();
-        if !cl_chunks.is_empty() {
-            let next_chunk = AtomicUsize::new(0);
-            std::thread::scope(|scope| {
-                for (wid, ((buckets, arena_out), err_out)) in cl_worker_shards
-                    .iter_mut()
-                    .zip(cl_worker_arenas.iter_mut())
-                    .zip(cl_worker_errs.iter_mut())
-                    .enumerate()
-                {
-                    let src_ref = &click_src;
-                    let chunks_ref = &cl_chunks;
-                    let next_ref = &next_chunk;
-                    let lookups_ref = &lookups;
-                    let lm_ref = &link_map;
-                    scope.spawn(move || {
-                        let mut dcache = DateCache::new();
-                        let mut buf = Vec::new();
-                        loop {
-                            let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
-                            let Some(&task) = chunks_ref.get(cidx) else {
-                                break;
-                            };
-                            if let Err(e) = src_ref.for_each_chunk_line::<4>(
-                                task,
-                                &mut buf,
-                                |[click_id, uid, camp_id, ts]| {
-                                    if click_id.is_empty() || uid.is_empty() {
-                                        return;
-                                    }
-                                    let Some(cid) = lookups_ref.get_campaign(camp_id) else {
-                                        return;
-                                    };
-                                    let Some(ts_ms) = dcache.parse_ts_ms(ts) else {
-                                        return;
-                                    };
-                                    if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
-                                        return;
-                                    }
-                                    let (person_key, ph) =
-                                        if let Some(uk) = CompactKey64::encode_raw_inline(uid) {
-                                            let pk = lm_ref.resolve_inline(uk);
-                                            (pk, mix64(pk.0))
-                                        } else if let Some(pk) = lm_ref.resolve_long(uid) {
-                                            (pk, mix64(pk.0))
-                                        } else {
-                                            let pk = arena_out.push_ref(wid, uid);
-                                            (pk, hash_bytes_fast(uid))
-                                        };
-                                    let click_id_key = CompactKey64::encode_raw(click_id, wid, arena_out);
-                                    let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-                                    buckets[pshard].push(PersonClick16 {
-                                        person_key,
-                                        click_id_key,
-                                        ts_rel_ms: (ts_ms - click_window_start_ms) as u32,
-                                        camp_id: cid,
-                                    });
-                                },
-                            ) {
-                                *err_out = Some(e);
-                                break;
-                            }
-                        }
-                    });
-                }
-            });
-        }
-        for e in cl_worker_errs.into_iter().flatten() {
-            return Err(e);
-        }
-        person_click_batches_16 = (0..P_PERSON)
-            .map(|_| Vec::with_capacity(n_cl_workers))
-            .collect();
-        for mut wvecs in cl_worker_shards {
-            for (ps, v) in wvecs.drain(..).enumerate() {
-                if !v.is_empty() {
-                    person_click_counts[ps] += v.len();
-                    person_click_batches_16[ps].push(v);
-                }
-            }
-        }
-    } else {
-        let mut cl_worker_shards: Vec<Vec<Vec<PersonClickWide>>> = (0..n_cl_workers)
-            .map(|_| (0..P_PERSON).map(|_| Vec::with_capacity(est_cl_cap)).collect())
-            .collect();
-        if !cl_chunks.is_empty() {
-            let next_chunk = AtomicUsize::new(0);
-            std::thread::scope(|scope| {
-                for (wid, ((buckets, arena_out), err_out)) in cl_worker_shards
-                    .iter_mut()
-                    .zip(cl_worker_arenas.iter_mut())
-                    .zip(cl_worker_errs.iter_mut())
-                    .enumerate()
-                {
-                    let src_ref = &click_src;
-                    let chunks_ref = &cl_chunks;
-                    let next_ref = &next_chunk;
-                    let lookups_ref = &lookups;
-                    let lm_ref = &link_map;
-                    scope.spawn(move || {
-                        let mut dcache = DateCache::new();
-                        let mut buf = Vec::new();
-                        loop {
-                            let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
-                            let Some(&task) = chunks_ref.get(cidx) else {
-                                break;
-                            };
-                            if let Err(e) = src_ref.for_each_chunk_line::<4>(
-                                task,
-                                &mut buf,
-                                |[click_id, uid, camp_id, ts]| {
-                                    if click_id.is_empty() || uid.is_empty() {
-                                        return;
-                                    }
-                                    let Some(cid) = lookups_ref.get_campaign(camp_id) else {
-                                        return;
-                                    };
-                                    let Some(ts_ms) = dcache.parse_ts_ms(ts) else {
-                                        return;
-                                    };
-                                    if ts_ms < click_window_start_ms || ts_ms >= window_end_ms {
-                                        return;
-                                    }
-                                    let (person_key, ph) =
-                                        if let Some(uk) = CompactKey64::encode_raw_inline(uid) {
-                                            let pk = lm_ref.resolve_inline(uk);
-                                            (pk, mix64(pk.0))
-                                        } else if let Some(pk) = lm_ref.resolve_long(uid) {
-                                            (pk, mix64(pk.0))
-                                        } else {
-                                            let pk = arena_out.push_ref(wid, uid);
-                                            (pk, hash_bytes_fast(uid))
-                                        };
-                                    let click_id_key = CompactKey64::encode_raw(click_id, wid, arena_out);
-                                    let pshard = ((ph >> 52) as usize) & (P_PERSON - 1);
-                                    buckets[pshard].push(PersonClickWide {
-                                        person_key,
-                                        click_id_key,
-                                        ts_ms,
-                                        camp_id: cid,
-                                        _pad: 0,
-                                    });
-                                },
-                            ) {
-                                *err_out = Some(e);
-                                break;
-                            }
-                        }
-                    });
-                }
-            });
-        }
-        for e in cl_worker_errs.into_iter().flatten() {
-            return Err(e);
-        }
-        person_click_batches_wide = (0..P_PERSON)
-            .map(|_| Vec::with_capacity(n_cl_workers))
-            .collect();
-        for mut wvecs in cl_worker_shards {
-            for (ps, v) in wvecs.drain(..).enumerate() {
-                if !v.is_empty() {
-                    person_click_counts[ps] += v.len();
-                    person_click_batches_wide[ps].push(v);
-                }
-            }
-        }
-    }
-    drop(click_src);
-    let t_clicks = Instant::now();
+    let t_clicks = t_events_dedup;
 
     let ud_dir = out_dir.join("user_daily");
     let cd_dir = out_dir.join("campaign_daily");

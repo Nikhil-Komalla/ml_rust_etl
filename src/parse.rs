@@ -151,7 +151,7 @@ impl DateCache {
     }
 
     #[inline(always)]
-    fn parse_civil_datetime_19_sec(&mut self, b: &[u8]) -> Option<i64> {
+    fn parse_civil_date_days(&mut self, b: &[u8]) -> Option<(i32, u64, u16)> {
         if b[10] != b'T' {
             return None;
         }
@@ -161,7 +161,7 @@ impl DateCache {
             ^ ((b[6] as usize & 1) << 5))
             & 63;
         let e = &mut self.entries[idx];
-        let day_days = if e.hi == hi && e.lo == lo {
+        let dd = if e.hi == hi && e.lo == lo {
             e.day_days
         } else {
             if b[4] != b'-' || b[7] != b'-' {
@@ -180,14 +180,45 @@ impl DateCache {
             e.day_days = dd;
             dd
         };
+        Some((dd, hi, lo))
+    }
+
+    #[inline(always)]
+    fn parse_civil_datetime_19_sec(&mut self, b: &[u8]) -> Option<i64> {
+        let (day_days, _, _) = self.parse_civil_date_days(b)?;
         let hms_sec = parse_hms_sec(b)?;
         Some((day_days as i64) * 86_400 + hms_sec)
     }
 
     #[inline(always)]
-    pub fn parse_f1_sec(&mut self, b: &[u8]) -> Option<i64> {
+    fn parse_civil_datetime_19_sec_hint(
+        &mut self,
+        b: &[u8],
+        hint_hi: u64,
+        hint_lo: u16,
+        hint_dd: i32,
+    ) -> Option<i64> {
+        if b[10] != b'T' {
+            return None;
+        }
+        let hi = u64::from_ne_bytes(b[0..8].try_into().unwrap());
+        let lo = u16::from_ne_bytes(b[8..10].try_into().unwrap());
+        let dd = if hi == hint_hi && lo == hint_lo {
+            hint_dd
+        } else {
+            let (d, _, _) = self.parse_civil_date_days(b)?;
+            d
+        };
+        let hms_sec = parse_hms_sec(b)?;
+        Some((dd as i64) * 86_400 + hms_sec)
+    }
+
+    #[inline(always)]
+    pub fn parse_f1_sec_with_date(&mut self, b: &[u8]) -> Option<(i64, u64, u16, i32)> {
         if b.len() == 20 && b[19] == b'Z' {
-            self.parse_civil_datetime_19_sec(b)
+            let (dd, hi, lo) = self.parse_civil_date_days(b)?;
+            let hms_sec = parse_hms_sec(b)?;
+            Some(((dd as i64) * 86_400 + hms_sec, hi, lo, dd))
         } else {
             None
         }
@@ -196,17 +227,28 @@ impl DateCache {
     #[cfg(test)]
     #[inline(always)]
     pub fn parse_f1_ms(&mut self, b: &[u8]) -> Option<i64> {
-        self.parse_f1_sec(b).map(|s| s * MS_SECOND)
+        self.parse_f1_sec_with_date(b).map(|(s, _, _, _)| s * MS_SECOND)
     }
 
     #[inline(always)]
-    pub fn parse_ts_ms(&mut self, b: &[u8]) -> Option<i64> {
+    fn parse_ts_ms_inner<const HAS_HINT: bool>(
+        &mut self,
+        b: &[u8],
+        hint_hi: u64,
+        hint_lo: u16,
+        hint_dd: i32,
+    ) -> Option<i64> {
         let len = b.len();
         if len == 0 {
             return None;
         }
         if len == 20 && b[19] == b'Z' {
-            return self.parse_civil_datetime_19_sec(b).map(|s| s * MS_SECOND);
+            let sec = if HAS_HINT {
+                self.parse_civil_datetime_19_sec_hint(b, hint_hi, hint_lo, hint_dd)?
+            } else {
+                self.parse_civil_datetime_19_sec(b)?
+            };
+            return Some(sec * MS_SECOND);
         }
         if len == 13 {
             let hi8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
@@ -218,7 +260,11 @@ impl DateCache {
             return None;
         }
         if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
-            let base = self.parse_civil_datetime_19_sec(b)? * MS_SECOND;
+            let base = if HAS_HINT {
+                self.parse_civil_datetime_19_sec_hint(b, hint_hi, hint_lo, hint_dd)? * MS_SECOND
+            } else {
+                self.parse_civil_datetime_19_sec(b)? * MS_SECOND
+            };
             let oh = d2(b[20], b[21])?;
             let om = d2(b[23], b[24])?;
             if oh > 23 || om > 59 {
@@ -232,6 +278,22 @@ impl DateCache {
             });
         }
         parse_f3_ms(b)
+    }
+
+    #[inline(always)]
+    pub fn parse_ts_ms(&mut self, b: &[u8]) -> Option<i64> {
+        self.parse_ts_ms_inner::<false>(b, 0, 0, 0)
+    }
+
+    #[inline(always)]
+    pub fn parse_ts_ms_with_hint(
+        &mut self,
+        b: &[u8],
+        hint_hi: u64,
+        hint_lo: u16,
+        hint_dd: i32,
+    ) -> Option<i64> {
+        self.parse_ts_ms_inner::<true>(b, hint_hi, hint_lo, hint_dd)
     }
 }
 
@@ -457,11 +519,21 @@ mod tests {
                     String::from_utf8_lossy(s)
                 );
                 assert_eq!(
-                    cache.parse_f1_sec(s).map(|v| v * MS_SECOND),
+                    cache.parse_f1_sec_with_date(s).map(|v| v.0 * MS_SECOND),
                     parse_f1_ms(s),
                     "f1_sec mismatch on {:?}",
                     String::from_utf8_lossy(s)
                 );
+                if let Some((_, h_hi, h_lo, h_dd)) =
+                    cache.parse_f1_sec_with_date(b"2026-10-03T12:00:00Z")
+                {
+                    assert_eq!(
+                        cache.parse_ts_ms_with_hint(s, h_hi, h_lo, h_dd),
+                        parse_ts_ms(s),
+                        "hint mismatch on {:?}",
+                        String::from_utf8_lossy(s)
+                    );
+                }
             }
         }
     }
