@@ -19,7 +19,7 @@ use crate::parse::{
 use crate::parquet_out::{clean_parquet_dir, write_campaign_daily, CampaignRow, UserDailyWriter};
 
 const P_DEDUP: usize = 256;
-const P_PERSON: usize = 256;
+const P_PERSON: usize = 128;
 const USER_DAILY_BATCH_ROWS: usize = 131_072;
 
 const META_TAG_SHIFT: u32 = 62;
@@ -817,7 +817,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click>(
                     &ud_path,
                     USER_DAILY_BATCH_ROWS,
                     &lookups.categories,
-                    Compression::SNAPPY,
+                    Compression::UNCOMPRESSED,
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -2085,7 +2085,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             &ud_dir.join("part-0.parquet"),
             1,
             &lookups.categories,
-            Compression::SNAPPY,
+            Compression::UNCOMPRESSED,
         )?;
         empty_ud.close()?;
     }
@@ -2141,7 +2141,7 @@ pub fn run_pipeline(data_dir: &Path, out_dir: &Path, ncpu: usize, profile: bool)
             }
         }
     }
-    write_campaign_daily(&cd_dir.join("part-0.parquet"), &cd_rows, Compression::SNAPPY)?;
+    write_campaign_daily(&cd_dir.join("part-0.parquet"), &cd_rows, Compression::UNCOMPRESSED)?;
     let t_done = Instant::now();
 
     if profile {
