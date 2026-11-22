@@ -86,9 +86,12 @@ fn parse_hms_sec_u64(t8: u64) -> (i64, bool) {
     let pat_bad = (t8 & 0xF0F0_FFF0_F0FF_F0F0) ^ 0x3030_3A30_303A_3030;
     let d = t8 & 0x0F0F_0F0F_0F0F_0F0F;
     let range_bad = d.wrapping_add(0x060A_0006_0A00_060D) & 0xF0F0_00F0_F000_F0F0;
-    let h = ((d & 0x0F) * 10 + ((d >> 8) & 0x0F)) as i64;
-    let m = (((d >> 24) & 0x0F) * 10 + ((d >> 32) & 0x0F)) as i64;
-    let s = (((d >> 48) & 0x0F) * 10 + ((d >> 56) & 0x0F)) as i64;
+    let hi = d & 0x000F_0000_0F00_000F;
+    let lo = (d >> 8) & 0x000F_0000_0F00_000F;
+    let pairs = hi.wrapping_mul(10).wrapping_add(lo);
+    let h = (pairs & 0xFF) as i64;
+    let m = ((pairs >> 24) & 0xFF) as i64;
+    let s = (pairs >> 48) as i64;
     let ok = ((pat_bad | range_bad) == 0) & (h <= 23);
     (h * 3_600 + m * 60 + s, ok)
 }
@@ -148,7 +151,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 #[repr(C)]
 struct DateCacheEntry {
     hi: u64,
-    day_num: i32,
+    day_off_sec: i32,
     lo: u16,
     _pad: u16,
 }
@@ -157,15 +160,18 @@ const _: () = assert!(std::mem::size_of::<DateCacheEntry>() == 16);
 
 #[derive(Clone)]
 pub struct DateCache {
+    base_sec: i64,
     entries: [DateCacheEntry; 64],
 }
 
 impl DateCache {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
+            base_sec: 0,
             entries: [DateCacheEntry {
                 hi: u64::MAX,
-                day_num: 0,
+                day_off_sec: 0,
                 lo: 0,
                 _pad: 0,
             }; 64],
@@ -173,37 +179,49 @@ impl DateCache {
     }
 
     pub fn new_for_window(window_start_ms: i64, window_end_ms: i64) -> Self {
-        let mut dc = Self::new();
+        let mut dc = Self {
+            base_sec: window_start_ms.div_euclid(MS_SECOND),
+            entries: [DateCacheEntry {
+                hi: u64::MAX,
+                day_off_sec: 0,
+                lo: 0,
+                _pad: 0,
+            }; 64],
+        };
         let ws_day = window_start_ms.div_euclid(MS_DAY);
         let we_day = (window_end_ms - 1).div_euclid(MS_DAY);
         if we_day >= ws_day && (we_day - ws_day) <= 45 {
+            let base_sec = dc.base_sec;
             let mut insert_day = |d: i64| {
                 let (y, m, dom) = civil_from_days(d);
                 if (0..=9999).contains(&y) {
-                    let y = y as usize;
-                    let m = m as usize;
-                    let dom = dom as usize;
-                    let buf = [
-                        b'0' + (y / 1000) as u8,
-                        b'0' + ((y / 100) % 10) as u8,
-                        b'0' + ((y / 10) % 10) as u8,
-                        b'0' + (y % 10) as u8,
-                        b'-',
-                        b'0' + (m / 10) as u8,
-                        b'0' + (m % 10) as u8,
-                        b'-',
-                        b'0' + (dom / 10) as u8,
-                        b'0' + (dom % 10) as u8,
-                    ];
-                    let hi = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
-                    let lo = u16::from_ne_bytes(buf[8..10].try_into().unwrap());
-                    let idx = date_cache_idx(lo);
-                    dc.entries[idx] = DateCacheEntry {
-                        hi,
-                        day_num: d as i32,
-                        lo,
-                        _pad: 0,
-                    };
+                    let off = d.saturating_mul(86_400).saturating_sub(base_sec);
+                    if off.unsigned_abs() <= 2_000_000_000 {
+                        let y = y as usize;
+                        let m = m as usize;
+                        let dom = dom as usize;
+                        let buf = [
+                            b'0' + (y / 1000) as u8,
+                            b'0' + ((y / 100) % 10) as u8,
+                            b'0' + ((y / 10) % 10) as u8,
+                            b'0' + (y % 10) as u8,
+                            b'-',
+                            b'0' + (m / 10) as u8,
+                            b'0' + (m % 10) as u8,
+                            b'-',
+                            b'0' + (dom / 10) as u8,
+                            b'0' + (dom % 10) as u8,
+                        ];
+                        let hi = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+                        let lo = u16::from_ne_bytes(buf[8..10].try_into().unwrap());
+                        let idx = date_cache_idx(lo);
+                        dc.entries[idx] = DateCacheEntry {
+                            hi,
+                            day_off_sec: off as i32,
+                            lo,
+                            _pad: 0,
+                        };
+                    }
                 }
             };
             // Populate peripheral buffer days first, then click-reach, then hot event window days last.
@@ -233,7 +251,7 @@ impl DateCache {
         let idx = date_cache_idx(lo);
         let e = &mut self.entries[idx];
         let day_sec = if e.hi == hi && e.lo == lo {
-            (e.day_num as i64) * 86_400
+            self.base_sec.wrapping_add(e.day_off_sec as i64)
         } else {
             if b[4] != b'-' || b[7] != b'-' {
                 return None;
@@ -246,10 +264,13 @@ impl DateCache {
                 return None;
             }
             let d = days_from_civil(year, month, day);
-            let ds = d * 86_400;
-            e.hi = hi;
-            e.lo = lo;
-            e.day_num = d as i32;
+            let ds = d.saturating_mul(86_400);
+            let off = ds.saturating_sub(self.base_sec);
+            if off.unsigned_abs() <= 2_000_000_000 {
+                e.hi = hi;
+                e.lo = lo;
+                e.day_off_sec = off as i32;
+            }
             ds
         };
         Some((day_sec, hi, lo))
@@ -305,7 +326,7 @@ impl DateCache {
         let idx = date_cache_idx(lo2);
         let e = unsafe { *self.entries.get_unchecked(idx) };
         if (e.hi == w0_ne) & (e.lo == lo2) & sep_ok & hms_ok {
-            let day_sec = (e.day_num as i64) * 86_400;
+            let day_sec = self.base_sec.wrapping_add(e.day_off_sec as i64);
             return Some((day_sec + hms_sec, w0_ne, lo2, day_sec));
         }
         if !sep_ok || !hms_ok {
@@ -436,8 +457,80 @@ impl DateCache {
         self.parse_ts_ms_inner::<true>(b, hint_hi, hint_lo, hint_day_sec)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn parse_f1_miss_or_other_20(
+        &mut self,
+        padded: &[u8],
+        start: usize,
+        hms_sec: i64,
+        sep_ok: bool,
+        hms_ok: bool,
+    ) -> Option<(i64, i64)> {
+        let s = unsafe { padded.get_unchecked(start..start + 20) };
+        if sep_ok & hms_ok {
+            let (sec, _, _, _) = self.parse_f1_sec_hint_slow(s, hms_sec)?;
+            return Some((sec * MS_SECOND, sec));
+        }
+        if unsafe { *s.get_unchecked(19) } != b'Z' {
+            let ms = parse_f3_ms(s)?;
+            return Some((ms, ms.div_euclid(MS_SECOND)));
+        }
+        None
+    }
+
     #[inline(always)]
-    fn parse_ts_ms_padded_inner<const HAS_HINT: bool, const NEED_SEC: bool>(
+    pub fn parse_f1_only_padded_hint<const HAS_HINT: bool>(
+        &mut self,
+        padded: &[u8],
+        start: usize,
+        hint_hi: u64,
+        hint_lo: u16,
+        hint_day_sec: i64,
+    ) -> Option<(i64, i64)> {
+        debug_assert!(padded.len() >= start + 32);
+        let ptr = unsafe { padded.as_ptr().add(start) };
+        let w0_ne = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
+        let lo2_ne = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
+        let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
+        let sep_ok = (unsafe { *ptr.add(10) } == b'T') & (unsafe { *ptr.add(19) } == b'Z');
+        let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
+        if HAS_HINT && (w0_ne == hint_hi) & (lo2_ne == hint_lo) & sep_ok & hms_ok {
+            let sec = hint_day_sec.wrapping_add(hms_sec);
+            return Some((sec.wrapping_mul(MS_SECOND), sec));
+        }
+        let idx = date_cache_idx(lo2_ne);
+        let e = unsafe { *self.entries.get_unchecked(idx) };
+        if (e.hi == w0_ne) & (e.lo == lo2_ne) & sep_ok & hms_ok {
+            let sec = self
+                .base_sec
+                .wrapping_add(e.day_off_sec as i64)
+                .wrapping_add(hms_sec);
+            return Some((sec.wrapping_mul(MS_SECOND), sec));
+        }
+        self.parse_f1_miss_or_other_20(padded, start, hms_sec, sep_ok, hms_ok)
+    }
+
+    #[inline(always)]
+    pub fn parse_f3_only_13_padded(padded: &[u8], start: usize) -> Option<(i64, i64)> {
+        debug_assert!(padded.len() >= start + 16);
+        let ptr = unsafe { padded.as_ptr().add(start) };
+        let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
+        let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
+        if !(is_8_ascii_digits(w0) & is_8_ascii_digits(w5)) {
+            return None;
+        }
+        let hi8 = parse_8_ascii_digits(w0) as i64;
+        let d89 = (((w5 >> 24) & 0x0F) * 10 + ((w5 >> 32) & 0x0F)) as i64;
+        let f3_sec = hi8 * 100 + d89;
+        let ms3 = (((w5 >> 40) & 0x0F) * 100
+            + ((w5 >> 48) & 0x0F) * 10
+            + ((w5 >> 56) & 0x0F)) as i64;
+        Some((f3_sec * MS_SECOND + ms3, f3_sec))
+    }
+
+    #[inline(always)]
+    pub fn parse_other_ts_padded_hint<const HAS_HINT: bool, const NEED_SEC: bool>(
         &mut self,
         padded: &[u8],
         start: usize,
@@ -448,49 +541,7 @@ impl DateCache {
     ) -> Option<(i64, i64)> {
         debug_assert!(padded.len() >= start + 32);
         let ptr = unsafe { padded.as_ptr().add(start) };
-        let is_f1 = (len == 20) & (unsafe { *ptr.add(19) } == b'Z');
-        let is_f3 = len == 13;
-        if is_f1 | is_f3 {
-            let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
-            let w0_ne = unsafe { u64::from_ne_bytes(*(ptr as *const [u8; 8])) };
-            let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
-            let lo2 = unsafe { u16::from_le_bytes(*(ptr.add(8) as *const [u8; 2])) };
-            let lo2_ne = unsafe { u16::from_ne_bytes(*(ptr.add(8) as *const [u8; 2])) };
-            let w11 = unsafe { u64::from_le_bytes(*(ptr.add(11) as *const [u8; 8])) };
-
-            let f3_ok = is_8_ascii_digits(w0) & is_8_ascii_digits(w5);
-            let hi8 = parse_8_ascii_digits(w0) as i64;
-            let d89 = (((lo2 & 0x0F) * 10) + ((lo2 >> 8) & 0x0F)) as i64;
-            let f3_sec = hi8 * 100 + d89;
-            let ms3 = (((w5 >> 40) & 0x0F) * 100
-                + ((w5 >> 48) & 0x0F) * 10
-                + ((w5 >> 56) & 0x0F)) as i64;
-            let f3_ms = f3_sec * MS_SECOND + ms3;
-
-            let (hms_sec, hms_ok) = parse_hms_sec_u64(w11);
-            let idx = date_cache_idx(lo2_ne);
-            let e = unsafe { *self.entries.get_unchecked(idx) };
-            let hint_hit = HAS_HINT && (w0_ne == hint_hi) & (lo2_ne == hint_lo);
-            let cache_hit = (e.hi == w0_ne) & (e.lo == lo2_ne);
-            let date_ok = hint_hit | cache_hit;
-            let day_sec = if hint_hit {
-                hint_day_sec
-            } else {
-                (e.day_num as i64) * 86_400
-            };
-            let f1_ok = date_ok & (unsafe { *ptr.add(10) } == b'T') & hms_ok;
-            let f1_sec = day_sec.wrapping_add(hms_sec);
-            let f1_ms = f1_sec.wrapping_mul(MS_SECOND);
-
-            let fast_ok = if is_f1 { f1_ok } else { f3_ok };
-            if fast_ok {
-                return Some(if is_f1 {
-                    (f1_ms, f1_sec)
-                } else {
-                    (f3_ms, f3_sec)
-                });
-            }
-        } else if len == 25 {
+        if len == 25 {
             let sign = unsafe { *ptr.add(19) };
             if ((sign == b'+') | (sign == b'-'))
                 & (unsafe { *ptr.add(22) } == b':')
@@ -515,7 +566,7 @@ impl DateCache {
                     let day_sec = if hint_hit {
                         Some(hint_day_sec)
                     } else if (e.hi == w0_ne) & (e.lo == lo2_ne) {
-                        Some((e.day_num as i64) * 86_400)
+                        Some(self.base_sec.wrapping_add(e.day_off_sec as i64))
                     } else {
                         None
                     };
@@ -538,6 +589,34 @@ impl DateCache {
         Some((ms, sec))
     }
 
+    #[cfg(test)]
+    #[inline(always)]
+    fn parse_ts_ms_padded_inner<const HAS_HINT: bool, const NEED_SEC: bool>(
+        &mut self,
+        padded: &[u8],
+        start: usize,
+        len: usize,
+        hint_hi: u64,
+        hint_lo: u16,
+        hint_day_sec: i64,
+    ) -> Option<(i64, i64)> {
+        if len == 20 {
+            self.parse_f1_only_padded_hint::<HAS_HINT>(padded, start, hint_hi, hint_lo, hint_day_sec)
+        } else if len == 13 {
+            Self::parse_f3_only_13_padded(padded, start)
+        } else {
+            self.parse_other_ts_padded_hint::<HAS_HINT, NEED_SEC>(
+                padded,
+                start,
+                len,
+                hint_hi,
+                hint_lo,
+                hint_day_sec,
+            )
+        }
+    }
+
+    #[cfg(test)]
     #[inline(always)]
     pub fn parse_ts_ms_sec_padded_hint(
         &mut self,
@@ -572,6 +651,7 @@ impl DateCache {
         self.parse_ts_ms_inner::<false>(b, 0, 0, 0)
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn parse_ts_ms_padded_dc(
         &mut self,
@@ -1169,6 +1249,51 @@ mod tests {
                 "dc ms mismatch on {:?}",
                 String::from_utf8_lossy(c)
             );
+            if c.len() == 20 {
+                assert_eq!(
+                    dc.parse_f1_only_padded_hint::<true>(&pad, 4, hint.1, hint.2, hint.3)
+                        .map(|(ms, _)| ms),
+                    exp,
+                    "f1_only hint mismatch on {:?}",
+                    String::from_utf8_lossy(c)
+                );
+            } else if c.len() == 13 {
+                assert_eq!(
+                    DateCache::parse_f3_only_13_padded(&pad, 4).map(|(ms, _)| ms),
+                    exp,
+                    "f3_only_13 mismatch on {:?}",
+                    String::from_utf8_lossy(c)
+                );
+            } else {
+                assert_eq!(
+                    dc.parse_other_ts_padded_hint::<true, true>(
+                        &pad,
+                        4,
+                        c.len(),
+                        hint.1,
+                        hint.2,
+                        hint.3
+                    )
+                    .map(|(ms, _)| ms),
+                    exp,
+                    "other_ts mismatch on {:?}",
+                    String::from_utf8_lossy(c)
+                );
+            }
+        }
+        // Non-midnight window_start and far-future date outside +-2B sec off_sec range
+        let nm_ws = parse_ts_ms(b"2026-06-01T12:34:56Z").unwrap();
+        let nm_we = parse_ts_ms(b"2026-06-15T12:34:56Z").unwrap();
+        let mut nm_dc = DateCache::new_for_window(nm_ws, nm_we);
+        for &s in &[
+            b"2026-06-05T01:02:03Z".as_slice(),
+            b"2026-06-05T01:02:03+02:00".as_slice(),
+            b"2099-01-01T00:00:00Z".as_slice(),
+            b"1950-01-01T00:00:00Z".as_slice(),
+        ] {
+            let mut pad = vec![0u8; 4 + s.len() + 32];
+            pad[4..4 + s.len()].copy_from_slice(s);
+            assert_eq!(nm_dc.parse_ts_ms_padded_dc(&pad, 4, s.len()), parse_ts_ms(s));
         }
     }
 }

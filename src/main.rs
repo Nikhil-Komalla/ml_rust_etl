@@ -25,16 +25,7 @@ fn main() -> ExitCode {
         .unwrap_or(default_cpus);
     let profile = env::var("PROFILE").ok().as_deref() == Some("1");
 
-    let pool = match rayon::ThreadPoolBuilder::new().num_threads(ncpu).build() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("failed to initialize rayon pool: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let result =
-        pool.install(|| pipeline::run_pipeline_with_exit(&data_dir, &out_dir, ncpu, profile, true));
+    let result = pipeline::run_pipeline_with_exit(&data_dir, &out_dir, ncpu, profile, true);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

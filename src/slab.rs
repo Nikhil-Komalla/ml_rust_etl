@@ -2,7 +2,6 @@ use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::{self, NonNull};
 
-pub const SWCB_W: usize = 4;
 pub const USE_MADV_HUGEPAGE: bool = true;
 const HUGE_SLAB_BYTES: usize = 4 * 1024 * 1024;
 
@@ -289,7 +288,7 @@ impl SlabArena {
     }
 }
 
-pub struct SlabBuckets<T: Copy, const P: usize, const CHUNK: usize> {
+pub struct SlabBuckets<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize = 4> {
     arena: SlabArena,
     swcb: *mut T,
     swcb_cnt: [u8; P],
@@ -299,15 +298,23 @@ pub struct SlabBuckets<T: Copy, const P: usize, const CHUNK: usize> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T: Copy + Send, const P: usize, const CHUNK: usize> Send
-    for SlabBuckets<T, P, CHUNK>
+unsafe impl<T: Copy + Send, const P: usize, const CHUNK: usize, const SWCB_W: usize> Send
+    for SlabBuckets<T, P, CHUNK, SWCB_W>
 {
 }
 
-impl<T: Copy, const P: usize, const CHUNK: usize> SlabBuckets<T, P, CHUNK> {
+impl<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize>
+    SlabBuckets<T, P, CHUNK, SWCB_W>
+{
     pub fn new(hint_bytes: usize) -> Self {
         assert!(P > 0 && P.is_power_of_two());
-        assert!(CHUNK >= SWCB_W && CHUNK.is_power_of_two() && CHUNK <= u16::MAX as usize);
+        assert!(
+            SWCB_W > 0
+                && SWCB_W <= 255
+                && CHUNK >= SWCB_W
+                && CHUNK.is_power_of_two()
+                && CHUNK <= u16::MAX as usize
+        );
         assert!(align_of::<T>() <= 64);
         assert!(size_of::<T>() > 0);
         let mut arena = SlabArena::new(hint_bytes);
@@ -484,5 +491,29 @@ mod tests {
         assert_eq!(collect_shard(1), vec![1, 2, 3]);
         assert_eq!(collect_shard(2), (10..18).collect::<Vec<u64>>());
         assert_eq!(collect_shard(3), (100..119).collect::<Vec<u64>>());
+
+        // SlabBuckets with SWCB_W = 8 on 8B items (exercise 64B NT stream flushes & partial tail)
+        let mut sb8 = SlabBuckets::<u64, 4, 16, 8>::new(64 * 1024);
+        for v in 1..=7u64 {
+            sb8.push(0, v);
+        }
+        for v in 10..26u64 {
+            sb8.push(1, v);
+        }
+        for v in 100..137u64 {
+            sb8.push(2, v);
+        }
+        let (_arena8, chunks8) = sb8.finish();
+        let collect_shard8 = |s: usize| -> Vec<u64> {
+            let mut out = Vec::new();
+            for c in &chunks8[s] {
+                out.extend_from_slice(unsafe { c.as_slice() });
+            }
+            out
+        };
+        assert_eq!(collect_shard8(0), (1..=7).collect::<Vec<u64>>());
+        assert_eq!(collect_shard8(1), (10..26).collect::<Vec<u64>>());
+        assert_eq!(collect_shard8(2), (100..137).collect::<Vec<u64>>());
+        assert!(chunks8[3].is_empty());
     }
 }

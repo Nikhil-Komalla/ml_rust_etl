@@ -290,7 +290,7 @@ impl UserDailyWriter {
             file,
             file_pos: 4,
             row_groups: Vec::new(),
-            uid_plain: Vec::with_capacity(cap * 16 + 16),
+            uid_plain: Vec::with_capacity(cap * 18 + 32),
             days: Vec::with_capacity(cap),
             sessions: Vec::with_capacity(cap),
             events: Vec::with_capacity(cap),
@@ -342,6 +342,25 @@ impl UserDailyWriter {
                     dst.add(4 + uid_len - 8) as *mut u64,
                     std::ptr::read_unaligned(uptr.add(uid_len - 8) as *const u64),
                 );
+            } else if uid_len == 33 {
+                let uptr = user_id.as_ptr();
+                std::ptr::write_unaligned(
+                    dst.add(4) as *mut u64,
+                    std::ptr::read_unaligned(uptr as *const u64),
+                );
+                std::ptr::write_unaligned(
+                    dst.add(12) as *mut u64,
+                    std::ptr::read_unaligned(uptr.add(8) as *const u64),
+                );
+                std::ptr::write_unaligned(
+                    dst.add(20) as *mut u64,
+                    std::ptr::read_unaligned(uptr.add(16) as *const u64),
+                );
+                std::ptr::write_unaligned(
+                    dst.add(28) as *mut u64,
+                    std::ptr::read_unaligned(uptr.add(24) as *const u64),
+                );
+                *dst.add(36) = *uptr.add(32);
             } else {
                 std::ptr::copy_nonoverlapping(user_id.as_ptr(), dst.add(4), uid_len);
             }

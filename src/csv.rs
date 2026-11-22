@@ -108,7 +108,7 @@ pub fn encode_b37_padded(padded: &[u8], start: usize, len: usize, prefix: u8) ->
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
     unsafe {
         use std::arch::x86_64::*;
-        let tail_le = *(ptr.add(1) as *const u64);
+        let tail_le = std::ptr::read_unaligned(ptr.add(1) as *const u64);
         let v_raw = _mm_cvtsi64_si128(tail_le as i64);
         let d_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'0' as i8).wrapping_sub(-128)));
         let is_dig = _mm_cmplt_epi8(d_sub, _mm_set1_epi8(-118));
@@ -177,8 +177,8 @@ pub fn encode_b37_pair_padded(
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
     unsafe {
         use std::arch::x86_64::*;
-        let t0 = *(p0.add(1) as *const u64);
-        let t1 = *(p1.add(1) as *const u64);
+        let t0 = std::ptr::read_unaligned(p0.add(1) as *const u64);
+        let t1 = std::ptr::read_unaligned(p1.add(1) as *const u64);
         let v_raw = _mm_set_epi64x(t1 as i64, t0 as i64);
         let d_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'0' as i8).wrapping_sub(-128)));
         let is_dig = _mm_cmplt_epi8(d_sub, _mm_set1_epi8(-118));
@@ -238,6 +238,106 @@ pub fn decode_b37(val: u64, prefix: u8, buf: &mut [u8; 10]) -> usize {
         let be = u64::from_be_bytes(w);
         9 - ((be.trailing_zeros() >> 3) as usize)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct Hex128 {
+    pub hi: u64,
+    pub lo: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<Hex128>() == 16);
+
+#[inline(always)]
+pub const fn hash_hex128(h: Hex128) -> u64 {
+    mix64(h.hi ^ h.lo.rotate_left(17))
+}
+
+#[inline(always)]
+pub fn encode_hex32_padded(padded: &[u8], start: usize, len: usize, prefix: u8) -> Option<Hex128> {
+    debug_assert!(padded.len() >= start + 33);
+    if len != 33 {
+        return None;
+    }
+    let ptr = unsafe { padded.as_ptr().add(start) };
+    if unsafe { *ptr } != prefix {
+        return None;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm256_loadu_si256(ptr.add(1) as *const __m256i);
+        let d_sub = _mm256_sub_epi8(v, _mm256_set1_epi8((b'0' as i8).wrapping_sub(-128)));
+        let is_dig = _mm256_cmpgt_epi8(_mm256_set1_epi8(-118), d_sub);
+        let a_sub = _mm256_sub_epi8(v, _mm256_set1_epi8((b'a' as i8).wrapping_sub(-128)));
+        let is_af = _mm256_cmpgt_epi8(_mm256_set1_epi8(-122), a_sub);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_dig, is_af)) != -1 {
+            return None;
+        }
+        let nib = _mm256_sub_epi8(
+            _mm256_sub_epi8(v, _mm256_set1_epi8(48)),
+            _mm256_and_si256(is_af, _mm256_set1_epi8(39)),
+        );
+        let pairs16 = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let packed = _mm256_packus_epi16(pairs16, pairs16);
+        let hi = u64::from_be(_mm_cvtsi128_si64(_mm256_castsi256_si128(packed)) as u64);
+        let lo = u64::from_be(_mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(packed)) as u64);
+        Some(Hex128 { hi, lo })
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let mut parse_u64 = |off: usize| -> Option<u64> {
+            let mut acc = 0u64;
+            for i in 0..16 {
+                let b = unsafe { *ptr.add(off + i) };
+                let nib = if b.is_ascii_digit() {
+                    b - b'0'
+                } else if (b'a'..=b'f').contains(&b) {
+                    b - b'a' + 10
+                } else {
+                    return None;
+                };
+                acc = (acc << 4) | (nib as u64);
+            }
+            Some(acc)
+        };
+        let hi = parse_u64(1)?;
+        let lo = parse_u64(17)?;
+        Some(Hex128 { hi, lo })
+    }
+}
+
+#[inline(always)]
+pub fn decode_hex32(val: Hex128, prefix: u8, buf: &mut [u8; 40]) -> usize {
+    buf[0] = prefix;
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let x = _mm_set_epi64x(val.lo.to_be() as i64, val.hi.to_be() as i64);
+        let hi_nibs = _mm_and_si128(_mm_srli_epi16::<4>(x), _mm_set1_epi8(0x0F));
+        let lo_nibs = _mm_and_si128(x, _mm_set1_epi8(0x0F));
+        let h0 = _mm_unpacklo_epi8(hi_nibs, lo_nibs);
+        let h1 = _mm_unpackhi_epi8(hi_nibs, lo_nibs);
+        let lut = _mm_loadu_si128(b"0123456789abcdef".as_ptr() as *const __m128i);
+        _mm_storeu_si128(
+            buf.as_mut_ptr().add(1) as *mut __m128i,
+            _mm_shuffle_epi8(lut, h0),
+        );
+        _mm_storeu_si128(
+            buf.as_mut_ptr().add(17) as *mut __m128i,
+            _mm_shuffle_epi8(lut, h1),
+        );
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for i in 0..16 {
+            buf[1 + i] = HEX[((val.hi >> ((15 - i) * 4)) & 0xF) as usize];
+            buf[17 + i] = HEX[((val.lo >> ((15 - i) * 4)) & 0xF) as usize];
+        }
+    }
+    33
 }
 
 #[inline(always)]
@@ -302,10 +402,11 @@ pub fn hash_bytes_fast(mut b: &[u8]) -> u64 {
 
 /// 64-bit compact identifier (never 0 when valid):
 /// - `0`: `EMPTY` sentinel
-/// - `1 ..= u32::MAX + 1` (`(val >> 54) == 0 && val != 0`): linked `comp_id + 1`
-/// - `(1u64 << 54) ..= ...` (`(val >> 54) == 1`): `k_b37` (`^k[0-9a-z]{1,8}$`)
-/// - `(2u64 << 54) ..= ...` (`(val >> 54) == 2`): `u_b37` (`^u[0-9a-z]{1,8}$`)
-/// - `(3u64 << 54) ..= ...` (`(val >> 54) == 3`): `uh42` (`biject42(u_b37)`)
+/// - `1 ..= u32::MAX + 1` (`(val >> 53) == 0 && val != 0`): linked `comp_id + 1`
+/// - `(val >> 53) == 1`: `HexRef` (`[u|k]` + 32 lowercase hex digits in `hex_pools[wid][idx]`)
+/// - `(val >> 54) == 1`: `k_b37` (`^k[0-9a-z]{1,8}$`)
+/// - `(val >> 54) == 2`: `u_b37` (`^u[0-9a-z]{1,8}$`)
+/// - `(val >> 54) == 3`: `uh42` (`biject42(u_b37)`)
 /// - `(1u64 << 56) ..= 0x7FFF_FFFF_FFFF_FFFF` (`bit 63 == 0` and `(val >> 56) != 0`):
 ///   lossless 1..=9 byte non-NUL ASCII string (`s[0]` in bits `62..56`, `pext7(s[1..])` BE in `55..0`)
 /// - `bit 63 == 1`: arena ref `(1 << 63) | (wid:6 << 57) | (off:37 << 20) | (len:20)`
@@ -315,6 +416,7 @@ pub struct CompactKey64(pub u64);
 
 const _: () = assert!(std::mem::size_of::<CompactKey64>() == 8);
 
+const TAG_HEX_SHIFT: u64 = 1u64 << 53;
 const TAG_KB37_SHIFT: u64 = 1u64 << 54;
 const TAG_UB37_SHIFT: u64 = 2u64 << 54;
 const TAG_UH42_SHIFT: u64 = 3u64 << 54;
@@ -329,12 +431,59 @@ impl CompactKey64 {
 
     #[inline(always)]
     pub const fn is_comp(self) -> bool {
-        (self.0 >> 54) == 0 && self.0 != 0
+        (self.0 >> 53) == 0 && self.0 != 0
     }
 
     #[inline(always)]
     pub const fn comp_id(self) -> u32 {
         (self.0 - 1) as u32
+    }
+
+    #[inline(always)]
+    pub fn from_hex(wid: usize, idx: usize, is_k: bool, h20: u32) -> Self {
+        debug_assert!(wid < 64 && idx < (1usize << 26));
+        Self(
+            TAG_HEX_SHIFT
+                | ((wid as u64) << 47)
+                | ((idx as u64) << 21)
+                | (u64::from(is_k) << 20)
+                | ((h20 as u64) & 0xF_FFFF),
+        )
+    }
+
+    #[inline(always)]
+    pub const fn is_hex(self) -> bool {
+        (self.0 >> 53) == 1
+    }
+
+    #[inline(always)]
+    pub const fn hex_wid(self) -> usize {
+        ((self.0 >> 47) & 63) as usize
+    }
+
+    #[inline(always)]
+    pub const fn hex_idx(self) -> usize {
+        ((self.0 >> 21) & 0x3FF_FFFF) as usize
+    }
+
+    #[inline(always)]
+    pub const fn hex_is_k(self) -> bool {
+        ((self.0 >> 20) & 1) != 0
+    }
+
+    #[inline(always)]
+    pub const fn hex_h20(self) -> u32 {
+        (self.0 & 0xF_FFFF) as u32
+    }
+
+    #[inline(always)]
+    pub fn resolve_hex(self, hex_pools: &[Vec<Hex128>]) -> Hex128 {
+        debug_assert!(self.is_hex());
+        unsafe {
+            *hex_pools
+                .get_unchecked(self.hex_wid())
+                .get_unchecked(self.hex_idx())
+        }
     }
 
     #[inline(always)]
@@ -387,6 +536,7 @@ impl CompactKey64 {
         (self.0 as i64) < 0
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn encode_user_inline_padded(padded: &[u8], start: usize, len: usize) -> Option<Self> {
         if let Some(u37) = encode_b37_padded(padded, start, len, b'u') {
@@ -540,21 +690,30 @@ impl LongArena {
 pub fn resolve_raw_key<'a>(
     key: CompactKey64,
     arenas: &'a [LongArena],
-    scratch: &'a mut [u8; 10],
+    hex_pools: &'a [Vec<Hex128>],
+    scratch: &'a mut [u8; 40],
 ) -> &'a [u8] {
     if key.is_ref() {
         LongArena::resolve_in(arenas, key)
+    } else if key.is_hex() {
+        let pfx = if key.hex_is_k() { b'k' } else { b'u' };
+        let len = decode_hex32(key.resolve_hex(hex_pools), pfx, scratch);
+        &scratch[..len]
     } else if key.is_ub37() {
-        let len = decode_b37(key.ub37_val(), b'u', scratch);
+        let s10: &mut [u8; 10] = (&mut scratch[..10]).try_into().unwrap();
+        let len = decode_b37(key.ub37_val(), b'u', s10);
         &scratch[..len]
     } else if key.is_uh42() {
-        let len = decode_b37(inv_biject42(key.uh42_val()), b'u', scratch);
+        let s10: &mut [u8; 10] = (&mut scratch[..10]).try_into().unwrap();
+        let len = decode_b37(inv_biject42(key.uh42_val()), b'u', s10);
         &scratch[..len]
     } else if key.is_kb37() {
-        let len = decode_b37(key.0 & B37_MASK42, b'k', scratch);
+        let s10: &mut [u8; 10] = (&mut scratch[..10]).try_into().unwrap();
+        let len = decode_b37(key.0 & B37_MASK42, b'k', s10);
         &scratch[..len]
     } else {
-        let len = key.decode_inline(scratch);
+        let s10: &mut [u8; 10] = (&mut scratch[..10]).try_into().unwrap();
+        let len = key.decode_inline(s10);
         &scratch[..len]
     }
 }
@@ -564,7 +723,9 @@ pub fn cmp_raw_keys(
     a: CompactKey64,
     b: CompactKey64,
     arenas_a: &[LongArena],
+    hex_a: &[Vec<Hex128>],
     arenas_b: &[LongArena],
+    hex_b: &[Vec<Hex128>],
 ) -> Ordering {
     if (a.is_inline() && b.is_inline())
         || (a.is_ub37() && b.is_ub37())
@@ -572,10 +733,15 @@ pub fn cmp_raw_keys(
     {
         return a.0.cmp(&b.0);
     }
-    let mut ba = [0u8; 10];
-    let mut bb = [0u8; 10];
-    let sa = resolve_raw_key(a, arenas_a, &mut ba);
-    let sb = resolve_raw_key(b, arenas_b, &mut bb);
+    if a.is_hex() && b.is_hex() && a.hex_is_k() == b.hex_is_k() {
+        let ha = a.resolve_hex(hex_a);
+        let hb = b.resolve_hex(hex_b);
+        return (ha.hi, ha.lo).cmp(&(hb.hi, hb.lo));
+    }
+    let mut ba = [0u8; 40];
+    let mut bb = [0u8; 40];
+    let sa = resolve_raw_key(a, arenas_a, hex_a, &mut ba);
+    let sb = resolve_raw_key(b, arenas_b, hex_b, &mut bb);
     sa.cmp(sb)
 }
 
@@ -584,22 +750,29 @@ pub fn eq_raw_keys(
     a: CompactKey64,
     b: CompactKey64,
     arenas_a: &[LongArena],
+    hex_a: &[Vec<Hex128>],
     arenas_b: &[LongArena],
+    hex_b: &[Vec<Hex128>],
 ) -> bool {
-    let mut ba = [0u8; 10];
-    let mut bb = [0u8; 10];
-    let sa = resolve_raw_key(a, arenas_a, &mut ba);
-    let sb = resolve_raw_key(b, arenas_b, &mut bb);
+    if a.is_hex() && b.is_hex() {
+        return a.hex_is_k() == b.hex_is_k() && a.resolve_hex(hex_a) == b.resolve_hex(hex_b);
+    }
+    let mut ba = [0u8; 40];
+    let mut bb = [0u8; 40];
+    let sa = resolve_raw_key(a, arenas_a, hex_a, &mut ba);
+    let sb = resolve_raw_key(b, arenas_b, hex_b, &mut bb);
     sa == sb
 }
 
 #[inline(always)]
-pub fn hash_raw_key(k: CompactKey64, arenas: &[LongArena]) -> u64 {
-    if !k.is_ref() && !k.is_ub37() && !k.is_uh42() && !k.is_kb37() {
+pub fn hash_raw_key(k: CompactKey64, arenas: &[LongArena], hex_pools: &[Vec<Hex128>]) -> u64 {
+    if k.is_hex() {
+        hash_hex128(k.resolve_hex(hex_pools))
+    } else if !k.is_ref() && !k.is_ub37() && !k.is_uh42() && !k.is_kb37() {
         mix64(k.0)
     } else {
-        let mut buf = [0u8; 10];
-        let s = resolve_raw_key(k, arenas, &mut buf);
+        let mut buf = [0u8; 40];
+        let s = resolve_raw_key(k, arenas, hex_pools, &mut buf);
         hash_bytes_fast(s)
     }
 }
@@ -2786,8 +2959,9 @@ mod tests {
         let k_long = CompactKey64::encode_raw(b"chain_00000", 0, &mut arena);
         assert!(k_long.is_ref());
         let arenas = [arena];
+        let hex_pools: [Vec<Hex128>; 0] = [];
         assert_eq!(
-            cmp_raw_keys(k_special, k_long, &arenas, &arenas),
+            cmp_raw_keys(k_special, k_long, &arenas, &hex_pools, &arenas, &hex_pools),
             Ordering::Less
         );
     }
@@ -3090,7 +3264,99 @@ mod tests {
         assert!(kp.is_inline() && !kp.is_ub37() && !kp.is_uh42() && !kp.is_kb37());
         assert!(kc.is_comp() && !kc.is_kb37() && !kc.is_ub37() && !kc.is_inline());
         let arenas: [LongArena; 0] = [];
-        assert_eq!(cmp_raw_keys(ku, CompactKey64::encode_raw_inline(b"u82u2orgh").unwrap(), &arenas, &arenas), Ordering::Equal);
-        assert_eq!(cmp_raw_keys(kp, ku, &arenas, &arenas), Ordering::Less);
+        let hex_pools: [Vec<Hex128>; 0] = [];
+        assert_eq!(
+            cmp_raw_keys(
+                ku,
+                CompactKey64::encode_raw_inline(b"u82u2orgh").unwrap(),
+                &arenas,
+                &hex_pools,
+                &arenas,
+                &hex_pools
+            ),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp_raw_keys(kp, ku, &arenas, &hex_pools, &arenas, &hex_pools),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_hex32_avx2_roundtrip_order_and_rejects() {
+        let valid_cases = [
+            b"u00000000000000000000000000000000",
+            b"u0123456789abcdef0123456789abcdef",
+            b"ufedcba9876543210fedcba9876543210",
+            b"uffffffffffffffffffffffffffffffff",
+            b"ub9c0822bb1f1f04ea123f6f665e8b790",
+        ];
+        let mut pool = Vec::new();
+        let mut keys = Vec::new();
+        for &s in &valid_cases {
+            let mut pad = vec![0xAAu8; 5 + s.len() + 40];
+            pad[5..5 + s.len()].copy_from_slice(s);
+            let hx = encode_hex32_padded(&pad, 5, s.len(), b'u').unwrap();
+            let mut dec = [0u8; 40];
+            let dlen = decode_hex32(hx, b'u', &mut dec);
+            assert_eq!(dlen, 33);
+            assert_eq!(&dec[..33], s);
+            let h20 = (hash_hex128(hx) & 0xF_FFFF) as u32;
+            let k = CompactKey64::from_hex(0, pool.len(), false, h20);
+            assert!(k.is_hex());
+            assert!(!k.is_comp());
+            assert!(!k.is_inline());
+            assert!(!k.is_ref());
+            assert!(!k.is_ub37());
+            assert!(!k.is_uh42());
+            assert!(!k.is_kb37());
+            assert_eq!(k.hex_wid(), 0);
+            assert_eq!(k.hex_idx(), pool.len());
+            assert!(!k.hex_is_k());
+            assert_eq!(k.hex_h20(), h20);
+            pool.push(hx);
+            keys.push(k);
+        }
+
+        // Reject uppercase prefix, uppercase hex, non-hex char, wrong lengths
+        for bad in [
+            b"U0123456789abcdef0123456789abcdef".as_slice(),
+            b"u0123456789ABCDEF0123456789abcdef".as_slice(),
+            b"u0123456789abcdef0123456789abcdeg".as_slice(),
+            b"u0123456789abcdef0123456789abcde/".as_slice(),
+            b"u0123456789abcdef0123456789abcde".as_slice(),
+            b"u0123456789abcdef0123456789abcdef0".as_slice(),
+        ] {
+            let mut pad = vec![0u8; 4 + bad.len() + 40];
+            pad[4..4 + bad.len()].copy_from_slice(bad);
+            assert_eq!(encode_hex32_padded(&pad, 4, bad.len(), b'u'), None);
+        }
+
+        let arenas: [LongArena; 0] = [];
+        let pools = [pool];
+        // Mixed comparison with b37 & other hex32
+        let k_b37_mid = CompactKey64::from_ub37(
+            encode_b37_padded(b"u01234567\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 0, 9, b'u').unwrap(),
+        );
+        let k_b37_hi = CompactKey64::from_ub37(
+            encode_b37_padded(b"u9\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 0, 2, b'u').unwrap(),
+        );
+        assert_eq!(
+            cmp_raw_keys(keys[0], keys[1], &arenas, &pools, &arenas, &pools),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_raw_keys(keys[1], k_b37_mid, &arenas, &pools, &arenas, &pools),
+            Ordering::Greater // "u0123456789..." > "u01234567"
+        );
+        assert_eq!(
+            cmp_raw_keys(keys[1], k_b37_hi, &arenas, &pools, &arenas, &pools),
+            Ordering::Less // "u012..." < "u9"
+        );
+        let mut dec40 = [0u8; 40];
+        assert_eq!(
+            resolve_raw_key(keys[4], &arenas, &pools, &mut dec40),
+            b"ub9c0822bb1f1f04ea123f6f665e8b790"
+        );
     }
 }
