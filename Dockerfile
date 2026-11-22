@@ -16,8 +16,11 @@ COPY --from=builder /src/target/release/shopping-sessions /app/shopping-sessions
 COPY run.sh /app/run.sh
 RUN chmod +x /app/shopping-sessions /app/run.sh
 
-ENV TMPDIR=/scratch \
+ENV DATA_DIR=/data \
+    OUTPUT_DIR=/output \
+    SCRATCH_DIR=/scratch \
+    TMPDIR=/scratch \
     HOME=/scratch
 
 WORKDIR /app
-CMD ["/app/run.sh"]
+CMD ["/app/shopping-sessions"]

@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::ptr;
 
 use memchr::{memchr, memrchr};
 
@@ -12,6 +13,232 @@ pub const READ_BLOCK_BYTES: usize = 256 * 1024;
 pub const LONG_LEN_OVERFLOW: usize = 0xF_FFFF;
 pub const LONG_LEN_MASK: u64 = 0xF_FFFF;
 pub const LONG_OFF_MASK: u64 = (1u64 << 37) - 1;
+
+pub const B37_MASK42: u64 = (1u64 << 42) - 1;
+const B37_M1: u64 = 0x27D4_EB2D_1656_67B1;
+const B37_M2: u64 = 0x1656_67B1_9E37_79B9;
+
+const fn modinv42(a: u64) -> u64 {
+    let mut inv = 1u64;
+    let mut i = 0;
+    while i < 6 {
+        inv = inv.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(inv))) & B37_MASK42;
+        i += 1;
+    }
+    inv
+}
+
+const B37_M1_INV: u64 = modinv42(B37_M1);
+const B37_M2_INV: u64 = modinv42(B37_M2);
+const _: () = assert!((B37_M1.wrapping_mul(B37_M1_INV) & B37_MASK42) == 1);
+const _: () = assert!((B37_M2.wrapping_mul(B37_M2_INV) & B37_MASK42) == 1);
+
+#[inline(always)]
+pub const fn biject42(mut x: u64) -> u64 {
+    x &= B37_MASK42;
+    x ^= x >> 21;
+    x = x.wrapping_mul(B37_M1) & B37_MASK42;
+    x ^= x >> 21;
+    x = x.wrapping_mul(B37_M2) & B37_MASK42;
+    x ^= x >> 21;
+    x
+}
+
+#[inline(always)]
+pub const fn inv_biject42(mut y: u64) -> u64 {
+    y &= B37_MASK42;
+    y ^= y >> 21;
+    y = y.wrapping_mul(B37_M2_INV) & B37_MASK42;
+    y ^= y >> 21;
+    y = y.wrapping_mul(B37_M1_INV) & B37_MASK42;
+    y ^= y >> 21;
+    y
+}
+
+const fn build_b37_pairs() -> [[u8; 2]; 1369] {
+    let mut ch = [0u8; 37];
+    let mut i = 0;
+    while i < 10 {
+        ch[1 + i] = b'0' + (i as u8);
+        i += 1;
+    }
+    let mut j = 0;
+    while j < 26 {
+        ch[11 + j] = b'a' + (j as u8);
+        j += 1;
+    }
+    let mut pairs = [[0u8; 2]; 1369];
+    let mut hi = 0;
+    while hi < 37 {
+        let mut lo = 0;
+        while lo < 37 {
+            pairs[hi * 37 + lo] = [ch[hi], ch[lo]];
+            lo += 1;
+        }
+        hi += 1;
+    }
+    pairs
+}
+
+static B37_PAIRS: [[u8; 2]; 1369] = build_b37_pairs();
+
+static B37_LANE_MASKS: [u64; 10] = [
+    0,
+    0,
+    0x0000_0000_0000_00FF,
+    0x0000_0000_0000_FFFF,
+    0x0000_0000_00FF_FFFF,
+    0x0000_0000_FFFF_FFFF,
+    0x0000_00FF_FFFF_FFFF,
+    0x0000_FFFF_FFFF_FFFF,
+    0x00FF_FFFF_FFFF_FFFF,
+    0xFFFF_FFFF_FFFF_FFFF,
+];
+
+#[inline(always)]
+pub fn encode_b37_padded(padded: &[u8], start: usize, len: usize, prefix: u8) -> Option<u64> {
+    debug_assert!(padded.len() >= start + 16);
+    if len.wrapping_sub(2) > 7 {
+        return None;
+    }
+    let ptr = unsafe { padded.as_ptr().add(start) };
+    if unsafe { *ptr } != prefix {
+        return None;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let tail_le = *(ptr.add(1) as *const u64);
+        let v_raw = _mm_cvtsi64_si128(tail_le as i64);
+        let d_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'0' as i8).wrapping_sub(-128)));
+        let is_dig = _mm_cmplt_epi8(d_sub, _mm_set1_epi8(-118));
+        let a_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'a' as i8).wrapping_sub(-128)));
+        let is_low = _mm_cmplt_epi8(a_sub, _mm_set1_epi8(-102));
+        let valid_mask = (_mm_movemask_epi8(_mm_or_si128(is_dig, is_low)) as u32) & 0xFF;
+        let need_mask = (1u32 << (len - 1)) - 1;
+        if (valid_mask & need_mask) != need_mask {
+            return None;
+        }
+        let mapped = _mm_sub_epi8(
+            _mm_sub_epi8(v_raw, _mm_set1_epi8(47)),
+            _mm_and_si128(is_low, _mm_set1_epi8(39)),
+        );
+        let lane_mask = _mm_cvtsi64_si128(*B37_LANE_MASKS.get_unchecked(len) as i64);
+        let clean = _mm_and_si128(mapped, lane_mask);
+        let pairs = _mm_maddubs_epi16(
+            clean,
+            _mm_setr_epi8(37, 1, 37, 1, 37, 1, 37, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+        );
+        let quads = _mm_madd_epi16(pairs, _mm_setr_epi16(1369, 1, 1369, 1, 0, 0, 0, 0));
+        let q64 = _mm_cvtsi128_si64(quads) as u64;
+        let hi = (q64 & 0xFFFF_FFFF) as u64;
+        let lo = (q64 >> 32) as u64;
+        Some(hi * 1_874_161 + lo)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+    {
+        let mut acc = 0u64;
+        let mut w = 94_931_877_133u64;
+        for i in 1..len {
+            let b = unsafe { *ptr.add(i) };
+            let v = if b.is_ascii_digit() {
+                (b - b'0' + 1) as u64
+            } else if (b'a'..=b'z').contains(&b) {
+                (b - b'a' + 11) as u64
+            } else {
+                return None;
+            };
+            acc += v * w;
+            w /= 37;
+        }
+        Some(acc)
+    }
+}
+
+#[inline(always)]
+pub fn encode_b37_pair_padded(
+    padded: &[u8],
+    s0: usize,
+    len0: usize,
+    pfx0: u8,
+    s1: usize,
+    len1: usize,
+    pfx1: u8,
+) -> Option<(u64, u64)> {
+    debug_assert!(padded.len() >= s0 + 16 && padded.len() >= s1 + 16);
+    if len0.wrapping_sub(2) > 7 || len1.wrapping_sub(2) > 7 {
+        return None;
+    }
+    let p0 = unsafe { padded.as_ptr().add(s0) };
+    let p1 = unsafe { padded.as_ptr().add(s1) };
+    if unsafe { *p0 != pfx0 || *p1 != pfx1 } {
+        return None;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let t0 = *(p0.add(1) as *const u64);
+        let t1 = *(p1.add(1) as *const u64);
+        let v_raw = _mm_set_epi64x(t1 as i64, t0 as i64);
+        let d_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'0' as i8).wrapping_sub(-128)));
+        let is_dig = _mm_cmplt_epi8(d_sub, _mm_set1_epi8(-118));
+        let a_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'a' as i8).wrapping_sub(-128)));
+        let is_low = _mm_cmplt_epi8(a_sub, _mm_set1_epi8(-102));
+        let valid_mask = _mm_movemask_epi8(_mm_or_si128(is_dig, is_low)) as u32;
+        let need_mask = ((1u32 << (len0 - 1)) - 1) | (((1u32 << (len1 - 1)) - 1) << 8);
+        if (valid_mask & need_mask) != need_mask {
+            return None;
+        }
+        let mapped = _mm_sub_epi8(
+            _mm_sub_epi8(v_raw, _mm_set1_epi8(47)),
+            _mm_and_si128(is_low, _mm_set1_epi8(39)),
+        );
+        let lane_mask = _mm_set_epi64x(
+            *B37_LANE_MASKS.get_unchecked(len1) as i64,
+            *B37_LANE_MASKS.get_unchecked(len0) as i64,
+        );
+        let clean = _mm_and_si128(mapped, lane_mask);
+        let pairs = _mm_maddubs_epi16(
+            clean,
+            _mm_setr_epi8(37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1),
+        );
+        let quads = _mm_madd_epi16(pairs, _mm_setr_epi16(1369, 1, 1369, 1, 1369, 1, 1369, 1));
+        let q0 = _mm_cvtsi128_si64(quads) as u64;
+        let q1 = _mm_extract_epi64::<1>(quads) as u64;
+        let v0 = (q0 & 0xFFFF_FFFF) * 1_874_161 + (q0 >> 32);
+        let v1 = (q1 & 0xFFFF_FFFF) * 1_874_161 + (q1 >> 32);
+        Some((v0, v1))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+    {
+        Some((
+            encode_b37_padded(padded, s0, len0, pfx0)?,
+            encode_b37_padded(padded, s1, len1, pfx1)?,
+        ))
+    }
+}
+
+#[inline(always)]
+pub fn decode_b37(val: u64, prefix: u8, buf: &mut [u8; 10]) -> usize {
+    debug_assert!(val > 0 && val <= B37_MASK42);
+    buf[0] = prefix;
+    let hi4 = (val / 1_874_161) as usize;
+    let lo4 = (val % 1_874_161) as usize;
+    let p0 = hi4 / 1369;
+    let p1 = hi4 % 1369;
+    let p2 = lo4 / 1369;
+    let p3 = lo4 % 1369;
+    unsafe {
+        let a0 = *B37_PAIRS.get_unchecked(p0);
+        let a1 = *B37_PAIRS.get_unchecked(p1);
+        let a2 = *B37_PAIRS.get_unchecked(p2);
+        let a3 = *B37_PAIRS.get_unchecked(p3);
+        let w = [a0[0], a0[1], a1[0], a1[1], a2[0], a2[1], a3[0], a3[1]];
+        ptr::copy_nonoverlapping(w.as_ptr(), buf.as_mut_ptr().add(1), 8);
+        let be = u64::from_be_bytes(w);
+        9 - ((be.trailing_zeros() >> 3) as usize)
+    }
+}
 
 #[inline(always)]
 pub const fn mix64(mut x: u64) -> u64 {
@@ -75,15 +302,22 @@ pub fn hash_bytes_fast(mut b: &[u8]) -> u64 {
 
 /// 64-bit compact identifier (never 0 when valid):
 /// - `0`: `EMPTY` sentinel
-/// - `1 ..= u32::MAX + 1` (`(val >> 56) == 0 && val != 0`): linked `comp_id + 1`
+/// - `1 ..= u32::MAX + 1` (`(val >> 54) == 0 && val != 0`): linked `comp_id + 1`
+/// - `(1u64 << 54) ..= ...` (`(val >> 54) == 1`): `k_b37` (`^k[0-9a-z]{1,8}$`)
+/// - `(2u64 << 54) ..= ...` (`(val >> 54) == 2`): `u_b37` (`^u[0-9a-z]{1,8}$`)
+/// - `(3u64 << 54) ..= ...` (`(val >> 54) == 3`): `uh42` (`biject42(u_b37)`)
 /// - `(1u64 << 56) ..= 0x7FFF_FFFF_FFFF_FFFF` (`bit 63 == 0` and `(val >> 56) != 0`):
 ///   lossless 1..=9 byte non-NUL ASCII string (`s[0]` in bits `62..56`, `pext7(s[1..])` BE in `55..0`)
 /// - `bit 63 == 1`: arena ref `(1 << 63) | (wid:6 << 57) | (off:37 << 20) | (len:20)`
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct CompactKey64(pub u64);
 
 const _: () = assert!(std::mem::size_of::<CompactKey64>() == 8);
+
+const TAG_KB37_SHIFT: u64 = 1u64 << 54;
+const TAG_UB37_SHIFT: u64 = 2u64 << 54;
+const TAG_UH42_SHIFT: u64 = 3u64 << 54;
 
 impl CompactKey64 {
     pub const EMPTY: Self = Self(0);
@@ -95,12 +329,52 @@ impl CompactKey64 {
 
     #[inline(always)]
     pub const fn is_comp(self) -> bool {
-        (self.0 >> 56) == 0 && self.0 != 0
+        (self.0 >> 54) == 0 && self.0 != 0
     }
 
     #[inline(always)]
     pub const fn comp_id(self) -> u32 {
         (self.0 - 1) as u32
+    }
+
+    #[inline(always)]
+    pub const fn from_kb37(val: u64) -> Self {
+        Self(TAG_KB37_SHIFT | val)
+    }
+
+    #[inline(always)]
+    pub const fn is_kb37(self) -> bool {
+        (self.0 >> 54) == 1
+    }
+
+    #[inline(always)]
+    pub const fn from_ub37(val: u64) -> Self {
+        Self(TAG_UB37_SHIFT | val)
+    }
+
+    #[inline(always)]
+    pub const fn is_ub37(self) -> bool {
+        (self.0 >> 54) == 2
+    }
+
+    #[inline(always)]
+    pub const fn ub37_val(self) -> u64 {
+        self.0 & B37_MASK42
+    }
+
+    #[inline(always)]
+    pub const fn from_uh42(h42: u64) -> Self {
+        Self(TAG_UH42_SHIFT | h42)
+    }
+
+    #[inline(always)]
+    pub const fn is_uh42(self) -> bool {
+        (self.0 >> 54) == 3
+    }
+
+    #[inline(always)]
+    pub const fn uh42_val(self) -> u64 {
+        self.0 & B37_MASK42
     }
 
     #[inline(always)]
@@ -111,6 +385,25 @@ impl CompactKey64 {
     #[inline(always)]
     pub const fn is_ref(self) -> bool {
         (self.0 as i64) < 0
+    }
+
+    #[inline(always)]
+    pub fn encode_user_inline_padded(padded: &[u8], start: usize, len: usize) -> Option<Self> {
+        if let Some(u37) = encode_b37_padded(padded, start, len, b'u') {
+            return Some(Self::from_ub37(u37));
+        }
+        Self::encode_raw_inline_padded(padded, start, len)
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub fn encode_user_inline(s: &[u8]) -> Option<Self> {
+        let mut pad = [0u8; 32];
+        if s.len() <= 16 {
+            pad[..s.len()].copy_from_slice(s);
+            return Self::encode_user_inline_padded(&pad, 0, s.len());
+        }
+        Self::encode_raw_inline(s)
     }
 
     #[inline(always)]
@@ -251,6 +544,15 @@ pub fn resolve_raw_key<'a>(
 ) -> &'a [u8] {
     if key.is_ref() {
         LongArena::resolve_in(arenas, key)
+    } else if key.is_ub37() {
+        let len = decode_b37(key.ub37_val(), b'u', scratch);
+        &scratch[..len]
+    } else if key.is_uh42() {
+        let len = decode_b37(inv_biject42(key.uh42_val()), b'u', scratch);
+        &scratch[..len]
+    } else if key.is_kb37() {
+        let len = decode_b37(key.0 & B37_MASK42, b'k', scratch);
+        &scratch[..len]
     } else {
         let len = key.decode_inline(scratch);
         &scratch[..len]
@@ -264,7 +566,10 @@ pub fn cmp_raw_keys(
     arenas_a: &[LongArena],
     arenas_b: &[LongArena],
 ) -> Ordering {
-    if a.is_inline() && b.is_inline() {
+    if (a.is_inline() && b.is_inline())
+        || (a.is_ub37() && b.is_ub37())
+        || (a.is_kb37() && b.is_kb37())
+    {
         return a.0.cmp(&b.0);
     }
     let mut ba = [0u8; 10];
@@ -275,11 +580,27 @@ pub fn cmp_raw_keys(
 }
 
 #[inline(always)]
+pub fn eq_raw_keys(
+    a: CompactKey64,
+    b: CompactKey64,
+    arenas_a: &[LongArena],
+    arenas_b: &[LongArena],
+) -> bool {
+    let mut ba = [0u8; 10];
+    let mut bb = [0u8; 10];
+    let sa = resolve_raw_key(a, arenas_a, &mut ba);
+    let sb = resolve_raw_key(b, arenas_b, &mut bb);
+    sa == sb
+}
+
+#[inline(always)]
 pub fn hash_raw_key(k: CompactKey64, arenas: &[LongArena]) -> u64 {
-    if !k.is_ref() {
+    if !k.is_ref() && !k.is_ub37() && !k.is_uh42() && !k.is_kb37() {
         mix64(k.0)
     } else {
-        hash_bytes_fast(LongArena::resolve_in(arenas, k))
+        let mut buf = [0u8; 10];
+        let s = resolve_raw_key(k, arenas, &mut buf);
+        hash_bytes_fast(s)
     }
 }
 
@@ -489,6 +810,624 @@ pub fn for_each_line_fields_padded<const K: usize>(
     for_each_line_fields_slice::<K>(&padded_buf[..valid_len], f);
 }
 
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn scan_direct_step64<const K: usize>(
+    padded_buf: &[u8],
+    p: usize,
+    mut nl_mask: u64,
+    cm_mask: u64,
+    qt_mask: u64,
+    na_mask: u64,
+    d_for_ends: u64,
+    next_d0: u64,
+    prev_delim: &mut u64,
+    prev_in_q: &mut u64,
+    line_start: &mut usize,
+    cm_buf: &mut [u32; 576],
+    cm_head: &mut usize,
+    cm_tail: &mut usize,
+    line_start_parity: &mut u64,
+    line_bad: &mut u64,
+    line_na: &mut u64,
+    on_line: &mut impl FnMut(&[u8], usize, usize, *const u32),
+) {
+    let d = cm_mask | nl_mask;
+    let starts = (d << 1) | *prev_delim;
+    let ends = (d_for_ends >> 1) | (next_d0 << 63);
+    let bad_pos = qt_mask & !(starts ^ ends);
+    let after_q = prefix_xor_u64(qt_mask) ^ *prev_in_q;
+    *prev_delim = d >> 63;
+    *prev_in_q = ((after_q as i64) >> 63) as u64;
+
+    if *cm_tail >= 512 {
+        let carry = *cm_tail - *cm_head;
+        if carry <= K {
+            std::ptr::copy(cm_buf.as_ptr().add(*cm_head), cm_buf.as_mut_ptr(), carry);
+            *cm_head = 0;
+            *cm_tail = carry;
+        } else {
+            *cm_head = 0;
+            *cm_tail = K + 1;
+        }
+    }
+
+    let base_tail = *cm_tail;
+    let block_cm = cm_mask.count_ones() as usize;
+    let mut m = cm_mask;
+    let mut dst = cm_buf.as_mut_ptr().add(base_tail);
+    let p32 = p as u32;
+    while m != 0 {
+        *dst = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(1) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(2) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(3) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(4) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(5) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(6) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(7) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        dst = dst.add(8);
+    }
+
+    let mut prev_done = 0u64;
+    let lsp = *line_start_parity;
+    let mut lb_cur = *line_bad;
+    let mut lna_cur = *line_na;
+    let mut ls = *line_start;
+    let mut ch = *cm_head;
+    let mut cur_lsp = lsp;
+
+    while nl_mask != 0 {
+        let nl_bit = nl_mask.trailing_zeros();
+        let line_end = p + nl_bit as usize;
+        let nl_flag = 1u64 << nl_bit;
+        let before_nl = nl_flag - 1;
+        let seg = before_nl & !prev_done;
+        let seg_inc = (before_nl | nl_flag) & !prev_done;
+        let line_cm_end = base_tail + (cm_mask & before_nl).count_ones() as usize;
+        let n_commas = line_cm_end - ch;
+        let bad_d = (after_q ^ cur_lsp) & (d & seg_inc);
+        let bad = lb_cur | (bad_pos & seg) | bad_d;
+        let lna = lna_cur | (na_mask & seg);
+        if line_end > ls
+            && n_commas == K - 1
+            && bad == 0
+            && (lna == 0
+                || std::str::from_utf8(padded_buf.get_unchecked(ls..line_end)).is_ok())
+        {
+            on_line(padded_buf, ls, line_end, cm_buf.as_ptr().add(ch));
+        }
+        ls = line_end + 1;
+        ch = line_cm_end;
+        cur_lsp = 0u64.wrapping_sub((after_q >> nl_bit) & 1);
+        lb_cur = 0;
+        lna_cur = 0;
+        prev_done = before_nl | nl_flag;
+        nl_mask &= nl_mask - 1;
+    }
+
+    *line_start = ls;
+    *cm_head = ch;
+    *cm_tail = base_tail + block_cm;
+    *line_start_parity = cur_lsp;
+    let rem_mask = !prev_done;
+    *line_bad = lb_cur | (bad_pos & rem_mask) | ((after_q ^ cur_lsp) & (d & rem_mask));
+    *line_na = lna_cur | (na_mask & rem_mask);
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
+pub fn scan_lines_direct_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_line: impl FnMut(&[u8], usize, usize, *const u32),
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    if valid_len == 0 {
+        return;
+    }
+    let mut line_start = 0usize;
+    let mut cm_buf = [0u32; 576];
+    let mut cm_head = 0usize;
+    let mut cm_tail = 0usize;
+    let mut prev_delim = 1u64;
+    let mut prev_in_q = 0u64;
+    let mut line_start_parity = 0u64;
+    let mut line_bad = 0u64;
+    let mut line_na = 0u64;
+    let mut p = 0usize;
+
+    unsafe {
+        use std::arch::x86_64::*;
+        let v_nl = _mm256_set1_epi8(b'\n' as i8);
+        let v_cm = _mm256_set1_epi8(b',' as i8);
+        let v_qt = _mm256_set1_epi8(b'"' as i8);
+        let base = padded_buf.as_ptr();
+
+        while p + 64 < valid_len {
+            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+            let nl_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32);
+            let cm_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32);
+            let qt_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32);
+            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+                0u64
+            } else {
+                (_mm256_movemask_epi8(v0) as u32 as u64)
+                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32)
+            };
+            let nb = *base.add(p + 64);
+            let next_d0 = u64::from((nb == b',') | (nb == b'\n'));
+            scan_direct_step64::<K>(
+                padded_buf,
+                p,
+                nl_mask,
+                cm_mask,
+                qt_mask,
+                na_mask,
+                cm_mask | nl_mask,
+                next_d0,
+                &mut prev_delim,
+                &mut prev_in_q,
+                &mut line_start,
+                &mut cm_buf,
+                &mut cm_head,
+                &mut cm_tail,
+                &mut line_start_parity,
+                &mut line_bad,
+                &mut line_na,
+                &mut on_line,
+            );
+            p += 64;
+        }
+
+        if p < valid_len {
+            let rem = valid_len - p;
+            let valid_mask = if rem == 64 { !0u64 } else { (1u64 << rem) - 1 };
+            let eof_bit = if rem < 64 { 1u64 << rem } else { 0u64 };
+            let tail_next_d0 = u64::from(rem == 64);
+            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+            let nl_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32))
+                & valid_mask;
+            let cm_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32))
+                & valid_mask;
+            let qt_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32))
+                & valid_mask;
+            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+                0u64
+            } else {
+                ((_mm256_movemask_epi8(v0) as u32 as u64)
+                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32))
+                    & valid_mask
+            };
+            scan_direct_step64::<K>(
+                padded_buf,
+                p,
+                nl_mask,
+                cm_mask,
+                qt_mask,
+                na_mask,
+                cm_mask | nl_mask | eof_bit,
+                tail_next_d0,
+                &mut prev_delim,
+                &mut prev_in_q,
+                &mut line_start,
+                &mut cm_buf,
+                &mut cm_head,
+                &mut cm_tail,
+                &mut line_start_parity,
+                &mut line_bad,
+                &mut line_na,
+                &mut on_line,
+            );
+        }
+
+        if line_start < valid_len
+            && (cm_tail - cm_head) == K - 1
+            && line_bad == 0
+            && prev_in_q == line_start_parity
+            && (line_na == 0
+                || std::str::from_utf8(padded_buf.get_unchecked(line_start..valid_len)).is_ok())
+        {
+            on_line(padded_buf, line_start, valid_len, cm_buf.as_ptr().add(cm_head));
+        }
+    }
+}
+
+#[cfg(all(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
+pub fn scan_lines_direct_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_line: impl FnMut(&[u8], usize, usize, *const u32),
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    let data = &padded_buf[..valid_len];
+    let base = padded_buf.as_ptr() as usize;
+    let mut commas = [0u32; K];
+    for_each_line_fields_slice::<K>(data, |fields| {
+        let raw_0 = (fields[0].as_ptr() as usize) - base;
+        let line_start = if raw_0 > 0 && padded_buf[raw_0 - 1] == b'"' {
+            raw_0 - 1
+        } else {
+            raw_0
+        };
+        let mut prev_raw_e = 0usize;
+        let mut line_end = 0usize;
+        for i in 0..K {
+            let f_s = (fields[i].as_ptr() as usize) - base;
+            let f_e = f_s + fields[i].len();
+            let is_q = if i == 0 {
+                f_s > line_start
+            } else {
+                f_s > prev_raw_e + 1
+            };
+            let raw_e = f_e + usize::from(is_q);
+            if i + 1 < K {
+                commas[i] = raw_e as u32;
+                prev_raw_e = raw_e;
+            } else {
+                line_end = raw_e;
+            }
+        }
+        on_line(padded_buf, line_start, line_end, commas.as_ptr());
+    });
+}
+
+const DIRECT_BATCH_LEN: usize = 64;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct DirectLine<const K: usize> {
+    pub ls: u32,
+    pub commas_end: [u32; K],
+}
+
+impl<const K: usize> DirectLine<K> {
+    pub const ZERO: Self = Self {
+        ls: 0,
+        commas_end: [0; K],
+    };
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn scan_direct_batched_step64<const K: usize>(
+    padded_buf: &[u8],
+    p: usize,
+    mut nl_mask: u64,
+    cm_mask: u64,
+    qt_mask: u64,
+    na_mask: u64,
+    d_for_ends: u64,
+    next_d0: u64,
+    prev_delim: &mut u64,
+    prev_in_q: &mut u64,
+    line_start: &mut usize,
+    cm_buf: &mut [u32; 576],
+    cm_head: &mut usize,
+    cm_tail: &mut usize,
+    line_start_parity: &mut u64,
+    line_bad: &mut u64,
+    line_na: &mut u64,
+    batch: &mut [DirectLine<K>; DIRECT_BATCH_LEN],
+    batch_len: &mut usize,
+    on_batch: &mut impl FnMut(&[u8], &[DirectLine<K>]),
+) {
+    let d = cm_mask | nl_mask;
+    let starts = (d << 1) | *prev_delim;
+    let ends = (d_for_ends >> 1) | (next_d0 << 63);
+    let bad_pos = qt_mask & !(starts ^ ends);
+    let after_q = prefix_xor_u64(qt_mask) ^ *prev_in_q;
+    *prev_delim = d >> 63;
+    *prev_in_q = ((after_q as i64) >> 63) as u64;
+
+    if *cm_tail >= 512 {
+        let carry = *cm_tail - *cm_head;
+        if carry <= K {
+            std::ptr::copy(cm_buf.as_ptr().add(*cm_head), cm_buf.as_mut_ptr(), carry);
+            *cm_head = 0;
+            *cm_tail = carry;
+        } else {
+            *cm_head = 0;
+            *cm_tail = K + 1;
+        }
+    }
+
+    let base_tail = *cm_tail;
+    let block_cm = cm_mask.count_ones() as usize;
+    let mut m = cm_mask;
+    let mut dst = cm_buf.as_mut_ptr().add(base_tail);
+    let p32 = p as u32;
+    while m != 0 {
+        *dst = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(1) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(2) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(3) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(4) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(5) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(6) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(7) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        dst = dst.add(8);
+    }
+
+    let mut prev_done = 0u64;
+    let lsp = *line_start_parity;
+    let mut lb_cur = *line_bad;
+    let mut lna_cur = *line_na;
+    let mut ls = *line_start;
+    let mut ch = *cm_head;
+    let mut cur_lsp = lsp;
+
+    while nl_mask != 0 {
+        let nl_bit = nl_mask.trailing_zeros();
+        let line_end = p + nl_bit as usize;
+        let nl_flag = 1u64 << nl_bit;
+        let before_nl = nl_flag - 1;
+        let seg = before_nl & !prev_done;
+        let seg_inc = (before_nl | nl_flag) & !prev_done;
+        let line_cm_end = base_tail + (cm_mask & before_nl).count_ones() as usize;
+        let n_commas = line_cm_end - ch;
+        let bad_d = (after_q ^ cur_lsp) & (d & seg_inc);
+        let bad = lb_cur | (bad_pos & seg) | bad_d;
+        let lna = lna_cur | (na_mask & seg);
+        if line_end > ls
+            && n_commas == K - 1
+            && bad == 0
+            && (lna == 0
+                || std::str::from_utf8(padded_buf.get_unchecked(ls..line_end)).is_ok())
+        {
+            let bl = *batch_len;
+            let dl = batch.get_unchecked_mut(bl);
+            dl.ls = ls as u32;
+            std::ptr::copy_nonoverlapping(
+                cm_buf.as_ptr().add(ch),
+                dl.commas_end.as_mut_ptr(),
+                K - 1,
+            );
+            *dl.commas_end.get_unchecked_mut(K - 1) = line_end as u32;
+            let new_bl = bl + 1;
+            if new_bl == DIRECT_BATCH_LEN {
+                on_batch(padded_buf, batch);
+                *batch_len = 0;
+            } else {
+                *batch_len = new_bl;
+            }
+        }
+        ls = line_end + 1;
+        ch = line_cm_end;
+        cur_lsp = 0u64.wrapping_sub((after_q >> nl_bit) & 1);
+        lb_cur = 0;
+        lna_cur = 0;
+        prev_done = before_nl | nl_flag;
+        nl_mask &= nl_mask - 1;
+    }
+
+    *line_start = ls;
+    *cm_head = ch;
+    *cm_tail = base_tail + block_cm;
+    *line_start_parity = cur_lsp;
+    let rem_mask = !prev_done;
+    *line_bad = lb_cur | (bad_pos & rem_mask) | ((after_q ^ cur_lsp) & (d & rem_mask));
+    *line_na = lna_cur | (na_mask & rem_mask);
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub fn scan_lines_direct_batched_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_batch: impl FnMut(&[u8], &[DirectLine<K>]),
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    if valid_len == 0 {
+        return;
+    }
+    let mut line_start = 0usize;
+    let mut cm_buf = [0u32; 576];
+    let mut cm_head = 0usize;
+    let mut cm_tail = 0usize;
+    let mut prev_delim = 1u64;
+    let mut prev_in_q = 0u64;
+    let mut line_start_parity = 0u64;
+    let mut line_bad = 0u64;
+    let mut line_na = 0u64;
+    let mut batch = [DirectLine::<K>::ZERO; DIRECT_BATCH_LEN];
+    let mut batch_len = 0usize;
+    let mut p = 0usize;
+
+    unsafe {
+        use std::arch::x86_64::*;
+        let v_nl = _mm256_set1_epi8(b'\n' as i8);
+        let v_cm = _mm256_set1_epi8(b',' as i8);
+        let v_qt = _mm256_set1_epi8(b'"' as i8);
+        let base = padded_buf.as_ptr();
+
+        while p + 64 < valid_len {
+            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+            let nl_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32);
+            let cm_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32);
+            let qt_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32);
+            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+                0u64
+            } else {
+                (_mm256_movemask_epi8(v0) as u32 as u64)
+                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32)
+            };
+            let nb = *base.add(p + 64);
+            let next_d0 = u64::from((nb == b',') | (nb == b'\n'));
+            scan_direct_batched_step64::<K>(
+                padded_buf,
+                p,
+                nl_mask,
+                cm_mask,
+                qt_mask,
+                na_mask,
+                cm_mask | nl_mask,
+                next_d0,
+                &mut prev_delim,
+                &mut prev_in_q,
+                &mut line_start,
+                &mut cm_buf,
+                &mut cm_head,
+                &mut cm_tail,
+                &mut line_start_parity,
+                &mut line_bad,
+                &mut line_na,
+                &mut batch,
+                &mut batch_len,
+                &mut on_batch,
+            );
+            p += 64;
+        }
+
+        if p < valid_len {
+            let rem = valid_len - p;
+            let valid_mask = if rem == 64 { !0u64 } else { (1u64 << rem) - 1 };
+            let eof_bit = if rem < 64 { 1u64 << rem } else { 0u64 };
+            let tail_next_d0 = u64::from(rem == 64);
+            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+            let nl_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32))
+                & valid_mask;
+            let cm_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32))
+                & valid_mask;
+            let qt_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32))
+                & valid_mask;
+            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+                0u64
+            } else {
+                ((_mm256_movemask_epi8(v0) as u32 as u64)
+                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32))
+                    & valid_mask
+            };
+            scan_direct_batched_step64::<K>(
+                padded_buf,
+                p,
+                nl_mask,
+                cm_mask,
+                qt_mask,
+                na_mask,
+                cm_mask | nl_mask | eof_bit,
+                tail_next_d0,
+                &mut prev_delim,
+                &mut prev_in_q,
+                &mut line_start,
+                &mut cm_buf,
+                &mut cm_head,
+                &mut cm_tail,
+                &mut line_start_parity,
+                &mut line_bad,
+                &mut line_na,
+                &mut batch,
+                &mut batch_len,
+                &mut on_batch,
+            );
+        }
+
+        if line_start < valid_len
+            && (cm_tail - cm_head) == K - 1
+            && line_bad == 0
+            && prev_in_q == line_start_parity
+            && (line_na == 0
+                || std::str::from_utf8(padded_buf.get_unchecked(line_start..valid_len)).is_ok())
+        {
+            let dl = batch.get_unchecked_mut(batch_len);
+            dl.ls = line_start as u32;
+            std::ptr::copy_nonoverlapping(
+                cm_buf.as_ptr().add(cm_head),
+                dl.commas_end.as_mut_ptr(),
+                K - 1,
+            );
+            *dl.commas_end.get_unchecked_mut(K - 1) = valid_len as u32;
+            batch_len += 1;
+        }
+        if batch_len > 0 {
+            on_batch(padded_buf, &batch[..batch_len]);
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+pub fn scan_lines_direct_batched_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_batch: impl FnMut(&[u8], &[DirectLine<K>]),
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    let data = &padded_buf[..valid_len];
+    let base = padded_buf.as_ptr() as usize;
+    let mut batch = [DirectLine::<K>::ZERO; DIRECT_BATCH_LEN];
+    let mut batch_len = 0usize;
+    for_each_line_fields_slice::<K>(data, |fields| {
+        let raw_0 = (fields[0].as_ptr() as usize) - base;
+        let ls = if raw_0 > 0 && padded_buf[raw_0 - 1] == b'"' {
+            raw_0 - 1
+        } else {
+            raw_0
+        };
+        let mut dl = DirectLine::<K>::ZERO;
+        dl.ls = ls as u32;
+        let mut prev_raw_e = 0usize;
+        for i in 0..K {
+            let f_s = (fields[i].as_ptr() as usize) - base;
+            let f_e = f_s + fields[i].len();
+            let is_q = if i == 0 {
+                f_s > ls
+            } else {
+                f_s > prev_raw_e + 1
+            };
+            let raw_e = f_e + usize::from(is_q);
+            dl.commas_end[i] = raw_e as u32;
+            prev_raw_e = raw_e;
+        }
+        batch[batch_len] = dl;
+        batch_len += 1;
+        if batch_len == DIRECT_BATCH_LEN {
+            on_batch(padded_buf, &batch);
+            batch_len = 0;
+        }
+    });
+    if batch_len > 0 {
+        on_batch(padded_buf, &batch[..batch_len]);
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 pub fn for_each_line_fields_slice<const K: usize>(slice: &[u8], mut f: impl FnMut([&[u8]; K])) {
@@ -575,12 +1514,14 @@ pub fn for_each_line_fields_slice<const K: usize>(slice: &[u8], mut f: impl FnMu
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub struct LineBounds<const K: usize> {
     pub line_start: u32,
     pub commas_and_end: [u32; K],
 }
 
+#[cfg(test)]
 impl<const K: usize> LineBounds<K> {
     pub const ZERO: Self = Self {
         line_start: 0,
@@ -599,6 +1540,23 @@ impl<const K: usize> LineBounds<K> {
         let q = (entry >> 31) as usize;
         (raw_s + q, raw_e - q)
     }
+}
+
+#[inline(always)]
+pub unsafe fn field_span(base: *const u8, s: usize, e: usize) -> (usize, usize) {
+    let q = usize::from(*base.add(s) == b'"');
+    (s + q, e - q)
+}
+
+#[inline(always)]
+fn prefix_xor_u64(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
 }
 
 #[cfg(test)]
@@ -878,7 +1836,7 @@ pub fn scan_lines_batched_avx2<const K: usize>(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn push_lb_l1<const K: usize>(
     padded_buf: &[u8],
@@ -936,7 +1894,7 @@ unsafe fn push_lb_l1<const K: usize>(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn scan_step64_l1<const K: usize>(
     padded_buf: &[u8],
@@ -1037,7 +1995,7 @@ unsafe fn scan_step64_l1<const K: usize>(
     *non_ascii |= ((na_mask & rem) != 0) as u32;
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
 pub fn scan_lines_l1_batched_avx2<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
@@ -1161,7 +2119,7 @@ pub fn scan_lines_l1_batched_avx2<const K: usize>(
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg(all(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
 pub fn scan_lines_l1_batched_avx2<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
@@ -1404,9 +2362,19 @@ impl CsvSource {
                 }
                 offset += n as u64;
                 if let Some(nl) = memchr(b'\n', &buf[..n]) {
-                    let rem = n - (nl + 1);
-                    buf.copy_within(nl + 1..n, 0);
-                    carry = rem;
+                    let start = nl + 1;
+                    if start < n {
+                        if let Some(rel_last_nl) = memrchr(b'\n', &buf[start..n]) {
+                            let process_len = rel_last_nl + 1;
+                            feed(&buf[start..], process_len);
+                            let abs_end = start + process_len;
+                            buf.copy_within(abs_end..n, 0);
+                            carry = n - abs_end;
+                        } else {
+                            buf.copy_within(start..n, 0);
+                            carry = n - start;
+                        }
+                    }
                     found = true;
                     break;
                 }
@@ -1479,14 +2447,14 @@ impl CsvSource {
     }
 
     #[inline(always)]
-    pub fn for_each_chunk_l1_batch<const K: usize>(
+    pub fn for_each_chunk_direct_batched<const K: usize>(
         &self,
         task: ChunkTask,
         buf: &mut Vec<u8>,
-        mut on_batch: impl FnMut(&[u8], &[LineBounds<K>]),
+        mut on_batch: impl FnMut(&[u8], &[DirectLine<K>]),
     ) -> io::Result<()> {
         self.for_each_chunk_blocks(task, buf, 64, |padded, valid_len| {
-            scan_lines_l1_batched_avx2::<K>(padded, valid_len, &mut on_batch);
+            scan_lines_direct_batched_avx2::<K>(padded, valid_len, &mut on_batch);
         })
     }
 
@@ -1899,5 +2867,230 @@ mod tests {
             ev_scalar.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
         });
         assert_eq!(ev_fused, ev_scalar);
+
+        // Compare scan_lines_direct_avx2 against scalar across all tricky 64B quote/comma/EOF boundaries
+        let mut dir_data = data.clone();
+        dir_data.extend_from_slice(b"\n");
+        let pad_to_63 = (64 - (dir_data.len() % 64)) % 64;
+        for _ in 0..pad_to_63 {
+            dir_data.push(b'\n');
+        }
+        // Quote right at byte 63 followed by comma at byte 64, and another at 64-byte aligned start
+        let b63_line = format!("\"{}\",\"ok\"\n", "a".repeat(61));
+        dir_data.extend_from_slice(b63_line.as_bytes()); // length = 68 (63+1+1+2+1) -> crosses 64B boundary right after closing quote!
+        let b63_exact = format!("{},\"b\"\n", "x".repeat(63));
+        dir_data.extend_from_slice(b63_exact.as_bytes()); // comma at byte 63, opening quote at next block byte 0!
+        // Unpaired quote line followed by valid quoted line, plus lone 1-byte quote field
+        dir_data.extend_from_slice(b"\"odd_unclosed,x\n\"good\",\"line\"\n\",ok\nok,\"\n");
+        // Empty trailing field without newline at EOF, 64B-aligned EOF without newline, and trailing empty after comma
+        for tail_case in [b"last0,last1".as_slice(), b"last_empty,".as_slice(), b"\"q0\",\"\"".as_slice()] {
+            let mut full = dir_data.clone();
+            full.extend_from_slice(tail_case);
+            let mut tpad = full.clone();
+            tpad.resize(full.len() + 64, 0);
+            let mut got_dir = Vec::new();
+            scan_lines_direct_avx2::<2>(&tpad, full.len(), |p, ls, le, cp| unsafe {
+                let base = p.as_ptr();
+                let c0 = *cp.add(0) as usize;
+                let (s0, e0) = field_span(base, ls, c0);
+                let (s1, e1) = field_span(base, c0 + 1, le);
+                got_dir.push((p[s0..e0].to_vec(), p[s1..e1].to_vec()));
+            });
+            let mut exp_dir = Vec::new();
+            for_each_line_fields_slice::<2>(&full, |f| {
+                exp_dir.push((f[0].to_vec(), f[1].to_vec()));
+            });
+            assert_eq!(got_dir, exp_dir, "direct scanner mismatch on tail {:?}", String::from_utf8_lossy(tail_case));
+        }
+        // Test exact multiple-of-64 EOF without trailing newline
+        let exact64_line = format!("{},end", "k".repeat(60));
+        assert_eq!(exact64_line.len(), 64);
+        let mut tpad64 = exact64_line.as_bytes().to_vec();
+        tpad64.resize(128, 0);
+        let mut got64 = Vec::new();
+        scan_lines_direct_avx2::<2>(&tpad64, 64, |p, ls, le, cp| unsafe {
+            let base = p.as_ptr();
+            let c0 = *cp.add(0) as usize;
+            let (s0, e0) = field_span(base, ls, c0);
+            let (s1, e1) = field_span(base, c0 + 1, le);
+            got64.push((p[s0..e0].to_vec(), p[s1..e1].to_vec()));
+        });
+        assert_eq!(
+            got64,
+            vec![(b"k".repeat(60), b"end".to_vec())],
+            "exact 64B EOF direct scan mismatch"
+        );
+
+        // Verify scan_lines_direct_batched_avx2 matches scan_lines_direct_avx2 across >200 lines & K=7
+        let mut batched_dir = Vec::new();
+        let mut batched_sizes = Vec::new();
+        scan_lines_direct_batched_avx2::<2>(&padded, data.len(), |p, lines| {
+            batched_sizes.push(lines.len());
+            let base = p.as_ptr();
+            for dl in lines {
+                let ls = dl.ls as usize;
+                let c0 = dl.commas_end[0] as usize;
+                let le = dl.commas_end[1] as usize;
+                let (s0, e0) = unsafe { field_span(base, ls, c0) };
+                let (s1, e1) = unsafe { field_span(base, c0 + 1, le) };
+                batched_dir.push((p[s0..e0].to_vec(), p[s1..e1].to_vec()));
+            }
+        });
+        assert!(batched_sizes.len() >= 3 && batched_sizes[0] == 64 && batched_sizes[1] == 64);
+        assert_eq!(batched_dir, scalar_expected);
+
+        let mut ev_batched_dir = Vec::new();
+        scan_lines_direct_batched_avx2::<7>(&ev_pad, ev_data.len(), |p, lines| {
+            let base = p.as_ptr();
+            for dl in lines {
+                let mut row = Vec::with_capacity(7);
+                let mut prev = dl.ls as usize;
+                for k in 0..7 {
+                    let end = dl.commas_end[k] as usize;
+                    let (s, e) = unsafe { field_span(base, prev, end) };
+                    row.push(p[s..e].to_vec());
+                    prev = end + 1;
+                }
+                ev_batched_dir.push(row);
+            }
+        });
+        assert_eq!(ev_batched_dir, ev_scalar);
+    }
+
+    #[test]
+    fn test_b37_sse_pair_matches_single() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng
+        };
+        let alphabet: Vec<u8> = (0u8..=255).collect();
+        let make_field = |len: usize, pfx: u8, r: u64, force_valid: bool| -> [u8; 32] {
+            let mut buf = [b'!'; 32];
+            if len > 0 {
+                buf[0] = if force_valid {
+                    pfx
+                } else {
+                    alphabet[((r >> 56) as usize) % 256]
+                };
+            }
+            for i in 1..len.min(16) {
+                let x = ((r >> ((i * 7) % 48)) as usize) + i * 13;
+                if force_valid {
+                    let v = x % 36;
+                    buf[i] = if v < 10 { b'0' + v as u8 } else { b'a' + (v - 10) as u8 };
+                } else {
+                    let edge = [b'0' - 1, b'9' + 1, b'a' - 1, b'z' + 1, 0x80, 0xFF, b'0', b'a'];
+                    buf[i] = edge[x % edge.len()];
+                }
+            }
+            buf
+        };
+        for l0 in 0..=11 {
+            for l1 in 0..=11 {
+                for valid0 in [true, false] {
+                    for valid1 in [true, false] {
+                        let b0 = make_field(l0, b'e', next(), valid0);
+                        let b1 = make_field(l1, b'u', next(), valid1);
+                        let mut pad = [0u8; 80];
+                        pad[3..3 + l0.max(1)].copy_from_slice(&b0[..l0.max(1)]);
+                        pad[30..30 + l1.max(1)].copy_from_slice(&b1[..l1.max(1)]);
+                        let s0 = encode_b37_padded(&pad, 3, l0, b'e');
+                        let s1 = encode_b37_padded(&pad, 30, l1, b'u');
+                        let pair = encode_b37_pair_padded(&pad, 3, l0, b'e', 30, l1, b'u');
+                        let exp = match (s0, s1) {
+                            (Some(a), Some(b)) => Some((a, b)),
+                            _ => None,
+                        };
+                        assert_eq!(pair, exp, "pair mismatch l0={l0} l1={l1} v0={valid0} v1={valid1}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_b37_sse_biject42_roundtrip_order_and_all_bytes() {
+        let mut buf = [0u8; 10];
+        let samples: &[&[u8]] = &[
+            b"u0",
+            b"u1",
+            b"u10",
+            b"u1a",
+            b"u2",
+            b"u9z",
+            b"u00000000",
+            b"u12345678",
+            b"uzzzzzzzz",
+            b"u82u2orgh",
+            b"u9jhbmnn4",
+        ];
+        for &s in samples {
+            let mut pad = vec![0xFFu8; 4 + s.len() + 32];
+            pad[4..4 + s.len()].copy_from_slice(s);
+            let v = encode_b37_padded(&pad, 4, s.len(), b'u').unwrap();
+            assert!(v > 0 && v <= B37_MASK42);
+            let h = biject42(v);
+            assert!(h > 0 && h <= B37_MASK42);
+            assert_eq!(inv_biject42(h), v);
+            let n = decode_b37(v, b'u', &mut buf);
+            assert_eq!(&buf[..n], s, "roundtrip failed for {s:?}");
+        }
+
+        // Exhaustive lexicographical ordering check across variable lengths & digits/letters
+        let mut sorted: Vec<&[u8]> = samples.to_vec();
+        sorted.sort();
+        for w in sorted.windows(2) {
+            let mut pa = vec![0u8; 32];
+            let mut pb = vec![0u8; 32];
+            pa[..w[0].len()].copy_from_slice(w[0]);
+            pb[..w[1].len()].copy_from_slice(w[1]);
+            let va = encode_b37_padded(&pa, 0, w[0].len(), b'u').unwrap();
+            let vb = encode_b37_padded(&pb, 0, w[1].len(), b'u').unwrap();
+            assert_eq!(va.cmp(&vb), w[0].cmp(w[1]), "order {:?} vs {:?}", w[0], w[1]);
+        }
+
+        // Exhaustive check across ALL 256 byte values in EVERY tail lane 0..8 and len 2..=9
+        for len in 2..=9 {
+            for pos in 1..len {
+                for b in 0u8..=255 {
+                    let mut pad = [b'x'; 32];
+                    pad[0] = b'e';
+                    for k in 1..len {
+                        pad[k] = b'0';
+                    }
+                    pad[pos] = b;
+                    let ok = b.is_ascii_digit() || (b'a'..=b'z').contains(&b);
+                    let res = encode_b37_padded(&pad, 0, len, b'e');
+                    assert_eq!(res.is_some(), ok, "len={len} pos={pos} byte={b}");
+                    if let Some(v) = res {
+                        assert_eq!(inv_biject42(biject42(v)), v);
+                        let n = decode_b37(v, b'e', &mut buf);
+                        assert_eq!(&buf[..n], &pad[..len]);
+                    }
+                }
+            }
+        }
+        // Check invalid prefixes, lengths, and disjoint CompactKey64 tag ranges
+        let mut p10 = [b'0'; 32];
+        p10[0] = b'u';
+        assert!(encode_b37_padded(&p10, 0, 0, b'u').is_none());
+        assert!(encode_b37_padded(&p10, 0, 1, b'u').is_none());
+        assert!(encode_b37_padded(&p10, 0, 10, b'u').is_none());
+        assert!(encode_b37_padded(&p10, 0, 5, b'e').is_none());
+
+        let ku = CompactKey64::encode_user_inline(b"u82u2orgh").unwrap();
+        let kk = CompactKey64::from_kb37(encode_b37_padded(b"k34avidd4\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 0, 9, b'k').unwrap());
+        let kh = CompactKey64::from_uh42(biject42(ku.ub37_val()));
+        let kp = CompactKey64::encode_raw_inline(b"\x01abc").unwrap();
+        let kc = CompactKey64::from_comp(u32::MAX);
+        assert!(ku.is_ub37() && !ku.is_inline() && !ku.is_comp() && !ku.is_ref());
+        assert!(kk.is_kb37() && !kk.is_ub37() && !kk.is_inline());
+        assert!(kh.is_uh42() && !kh.is_ub37() && !kh.is_inline());
+        assert!(kp.is_inline() && !kp.is_ub37() && !kp.is_uh42() && !kp.is_kb37());
+        assert!(kc.is_comp() && !kc.is_kb37() && !kc.is_ub37() && !kc.is_inline());
+        let arenas: [LongArena; 0] = [];
+        assert_eq!(cmp_raw_keys(ku, CompactKey64::encode_raw_inline(b"u82u2orgh").unwrap(), &arenas, &arenas), Ordering::Equal);
+        assert_eq!(cmp_raw_keys(kp, ku, &arenas, &arenas), Ordering::Less);
     }
 }

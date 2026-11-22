@@ -1,8 +1,9 @@
 mod csv;
 mod links;
-mod parse;
 mod parquet_out;
+mod parse;
 mod pipeline;
+mod slab;
 
 use std::env;
 use std::path::PathBuf;

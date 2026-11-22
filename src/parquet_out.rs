@@ -2,8 +2,6 @@ use std::fs::{self, File};
 use std::io::{self, IoSlice, Write};
 use std::path::Path;
 
-use parquet::basic::Compression;
-
 pub fn clean_parquet_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     for entry in fs::read_dir(dir)? {
@@ -249,6 +247,7 @@ pub struct UserDailyWriter {
     cat_def_rle: Vec<u8>,
     cat_plain: Vec<u8>,
     cat_encoded: Vec<Box<[u8]>>,
+    cat_fast: Vec<([u8; 16], u8)>,
     hdr_bufs: [Vec<u8>; 6],
     total_rows: usize,
     batch_rows: usize,
@@ -259,7 +258,6 @@ impl UserDailyWriter {
         path: &Path,
         batch_rows: usize,
         categories: &[Box<[u8]>],
-        _compression: Compression,
     ) -> io::Result<Self> {
         let batch_rows = batch_rows.max(1);
         let mut file = File::create(path)?;
@@ -274,11 +272,25 @@ impl UserDailyWriter {
                 v.into_boxed_slice()
             })
             .collect();
+        let cat_fast = categories
+            .iter()
+            .map(|c| {
+                let mut buf = [0u8; 16];
+                let total = 4 + c.len();
+                if total <= 16 {
+                    buf[..4].copy_from_slice(&(c.len() as u32).to_le_bytes());
+                    buf[4..total].copy_from_slice(c.as_ref());
+                    (buf, total as u8)
+                } else {
+                    (buf, 0u8)
+                }
+            })
+            .collect();
         Ok(Self {
             file,
             file_pos: 4,
             row_groups: Vec::new(),
-            uid_plain: Vec::with_capacity(cap * 16),
+            uid_plain: Vec::with_capacity(cap * 16 + 16),
             days: Vec::with_capacity(cap),
             sessions: Vec::with_capacity(cap),
             events: Vec::with_capacity(cap),
@@ -286,8 +298,9 @@ impl UserDailyWriter {
             rg_len: 0,
             cat_def_bits: vec![0u8; (cap + 7) >> 3],
             cat_def_rle: Vec::with_capacity(((cap + 7) >> 3) + 64),
-            cat_plain: Vec::with_capacity(cap * 12),
+            cat_plain: Vec::with_capacity(cap * 4 + 16),
             cat_encoded,
+            cat_fast,
             hdr_bufs: std::array::from_fn(|_| Vec::with_capacity(32)),
             total_rows: 0,
             batch_rows,
@@ -313,13 +326,25 @@ impl UserDailyWriter {
         let rg_idx = self.rg_len;
         let uid_len = user_id.len();
         let cur_uid_len = self.uid_plain.len();
-        if cur_uid_len + 4 + uid_len > self.uid_plain.capacity() {
-            Self::grow_plain_buf(&mut self.uid_plain, 4 + uid_len);
+        if cur_uid_len + 4 + uid_len + 16 > self.uid_plain.capacity() {
+            Self::grow_plain_buf(&mut self.uid_plain, 4 + uid_len + 16);
         }
         unsafe {
             let dst = self.uid_plain.as_mut_ptr().add(cur_uid_len);
             std::ptr::write_unaligned(dst as *mut u32, (uid_len as u32).to_le());
-            std::ptr::copy_nonoverlapping(user_id.as_ptr(), dst.add(4), uid_len);
+            if uid_len >= 8 && uid_len <= 16 {
+                let uptr = user_id.as_ptr();
+                std::ptr::write_unaligned(
+                    dst.add(4) as *mut u64,
+                    std::ptr::read_unaligned(uptr as *const u64),
+                );
+                std::ptr::write_unaligned(
+                    dst.add(4 + uid_len - 8) as *mut u64,
+                    std::ptr::read_unaligned(uptr.add(uid_len - 8) as *const u64),
+                );
+            } else {
+                std::ptr::copy_nonoverlapping(user_id.as_ptr(), dst.add(4), uid_len);
+            }
             self.uid_plain.set_len(cur_uid_len + 4 + uid_len);
 
             debug_assert!(rg_idx < self.days.capacity());
@@ -335,19 +360,34 @@ impl UserDailyWriter {
         let byte_idx = rg_idx >> 3;
         debug_assert!(byte_idx < self.cat_def_bits.len());
         if let Some(cid) = top_cat_id {
-            let enc = unsafe { self.cat_encoded.get_unchecked(cid as usize) };
             let cur_clen = self.cat_plain.len();
-            if cur_clen + enc.len() > self.cat_plain.capacity() {
-                Self::grow_plain_buf(&mut self.cat_plain, enc.len());
-            }
-            unsafe {
-                *self.cat_def_bits.get_unchecked_mut(byte_idx) |= 1u8 << (rg_idx & 7);
-                std::ptr::copy_nonoverlapping(
-                    enc.as_ptr(),
-                    self.cat_plain.as_mut_ptr().add(cur_clen),
-                    enc.len(),
-                );
-                self.cat_plain.set_len(cur_clen + enc.len());
+            let (fast_buf, fast_len) = unsafe { *self.cat_fast.get_unchecked(cid as usize) };
+            if fast_len > 0 {
+                if cur_clen + 16 > self.cat_plain.capacity() {
+                    Self::grow_plain_buf(&mut self.cat_plain, 16);
+                }
+                unsafe {
+                    *self.cat_def_bits.get_unchecked_mut(byte_idx) |= 1u8 << (rg_idx & 7);
+                    std::ptr::write_unaligned(
+                        self.cat_plain.as_mut_ptr().add(cur_clen) as *mut [u8; 16],
+                        fast_buf,
+                    );
+                    self.cat_plain.set_len(cur_clen + fast_len as usize);
+                }
+            } else {
+                let enc = unsafe { self.cat_encoded.get_unchecked(cid as usize) };
+                if cur_clen + enc.len() + 16 > self.cat_plain.capacity() {
+                    Self::grow_plain_buf(&mut self.cat_plain, enc.len() + 16);
+                }
+                unsafe {
+                    *self.cat_def_bits.get_unchecked_mut(byte_idx) |= 1u8 << (rg_idx & 7);
+                    std::ptr::copy_nonoverlapping(
+                        enc.as_ptr(),
+                        self.cat_plain.as_mut_ptr().add(cur_clen),
+                        enc.len(),
+                    );
+                    self.cat_plain.set_len(cur_clen + enc.len());
+                }
             }
         }
 
@@ -599,11 +639,7 @@ pub struct CampaignRow<'a> {
     pub assisted_sessions: i64,
 }
 
-pub fn write_campaign_daily(
-    path: &Path,
-    rows: &[CampaignRow<'_>],
-    _compression: Compression,
-) -> io::Result<()> {
+pub fn write_campaign_daily(path: &Path, rows: &[CampaignRow<'_>]) -> io::Result<()> {
     let mut file = File::create(path)?;
     let n = rows.len();
     let n_i32 = n as i32;
@@ -823,7 +859,7 @@ mod tests {
                           mode: u8,
                           wide_rev: bool| {
             let p = dir.join(format!("{name}.parquet"));
-            let mut w = UserDailyWriter::create(&p, batch, &cats, Compression::UNCOMPRESSED).unwrap();
+            let mut w = UserDailyWriter::create(&p, batch, &cats).unwrap();
             let mut expected = Vec::with_capacity(n);
             for i in 0..n {
                 let uid = format!("user_{i}");
@@ -942,7 +978,7 @@ mod tests {
                 })
                 .collect();
 
-            write_campaign_daily(&p, &rows, Compression::UNCOMPRESSED).unwrap();
+            write_campaign_daily(&p, &rows).unwrap();
 
             let rdr = SerializedFileReader::new(File::open(&p).unwrap()).unwrap();
             assert_eq!(rdr.metadata().file_metadata().num_rows(), n as i64);
