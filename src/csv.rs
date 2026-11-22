@@ -1265,18 +1265,21 @@ pub fn scan_lines_direct_avx2<const K: usize>(
 }
 
 const DIRECT_BATCH_LEN: usize = 64;
+const CM_BUF_CAP: usize = 1024;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct DirectLine<const K: usize> {
+pub struct DirectLineRef {
     pub ls: u32,
-    pub commas_end: [u32; K],
+    pub le: u32,
+    pub cm_off: u32,
 }
 
-impl<const K: usize> DirectLine<K> {
+impl DirectLineRef {
     pub const ZERO: Self = Self {
         ls: 0,
-        commas_end: [0; K],
+        le: 0,
+        cm_off: 0,
     };
 }
 
@@ -1294,15 +1297,15 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
     prev_delim: &mut u64,
     prev_in_q: &mut u64,
     line_start: &mut usize,
-    cm_buf: &mut [u32; 576],
+    cm_buf: &mut [u32; CM_BUF_CAP + 8],
     cm_head: &mut usize,
     cm_tail: &mut usize,
     line_start_parity: &mut u64,
     line_bad: &mut u64,
     line_na: &mut u64,
-    batch: &mut [DirectLine<K>; DIRECT_BATCH_LEN],
+    batch: &mut [DirectLineRef; DIRECT_BATCH_LEN],
     batch_len: &mut usize,
-    on_batch: &mut impl FnMut(&[u8], &[DirectLine<K>]),
+    on_batch: &mut impl FnMut(&[u8], &[u32], &[DirectLineRef]),
 ) {
     let d = cm_mask | nl_mask;
     let starts = (d << 1) | *prev_delim;
@@ -1312,7 +1315,11 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
     *prev_delim = d >> 63;
     *prev_in_q = ((after_q as i64) >> 63) as u64;
 
-    if *cm_tail >= 512 {
+    if (*batch_len == 0 && *cm_tail >= 512) || (*cm_tail + 64 > CM_BUF_CAP) {
+        if *batch_len > 0 {
+            on_batch(padded_buf, cm_buf, &batch[..*batch_len]);
+            *batch_len = 0;
+        }
         let carry = *cm_tail - *cm_head;
         if carry <= K {
             std::ptr::copy(cm_buf.as_ptr().add(*cm_head), cm_buf.as_mut_ptr(), carry);
@@ -1325,28 +1332,35 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
     }
 
     let base_tail = *cm_tail;
-    let block_cm = cm_mask.count_ones() as usize;
-    let mut m = cm_mask;
-    let mut dst = cm_buf.as_mut_ptr().add(base_tail);
+    let mut m_lo = cm_mask as u32;
+    let mut m_hi = (cm_mask >> 32) as u32;
+    let lo_cnt = m_lo.count_ones() as usize;
+    let block_cm = lo_cnt + (m_hi.count_ones() as usize);
     let p32 = p as u32;
-    while m != 0 {
-        *dst = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(1) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(2) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(3) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(4) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(5) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(6) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(7) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        dst = dst.add(8);
+    let p32_hi = p32.wrapping_add(32);
+    let mut dst_lo = cm_buf.as_mut_ptr().add(base_tail);
+    while m_lo != 0 {
+        *dst_lo = p32.wrapping_add(m_lo.trailing_zeros());
+        m_lo &= m_lo.wrapping_sub(1);
+        *dst_lo.add(1) = p32.wrapping_add(m_lo.trailing_zeros());
+        m_lo &= m_lo.wrapping_sub(1);
+        *dst_lo.add(2) = p32.wrapping_add(m_lo.trailing_zeros());
+        m_lo &= m_lo.wrapping_sub(1);
+        *dst_lo.add(3) = p32.wrapping_add(m_lo.trailing_zeros());
+        m_lo &= m_lo.wrapping_sub(1);
+        dst_lo = dst_lo.add(4);
+    }
+    let mut dst_hi = cm_buf.as_mut_ptr().add(base_tail + lo_cnt);
+    while m_hi != 0 {
+        *dst_hi = p32_hi.wrapping_add(m_hi.trailing_zeros());
+        m_hi &= m_hi.wrapping_sub(1);
+        *dst_hi.add(1) = p32_hi.wrapping_add(m_hi.trailing_zeros());
+        m_hi &= m_hi.wrapping_sub(1);
+        *dst_hi.add(2) = p32_hi.wrapping_add(m_hi.trailing_zeros());
+        m_hi &= m_hi.wrapping_sub(1);
+        *dst_hi.add(3) = p32_hi.wrapping_add(m_hi.trailing_zeros());
+        m_hi &= m_hi.wrapping_sub(1);
+        dst_hi = dst_hi.add(4);
     }
 
     let mut prev_done = 0u64;
@@ -1378,15 +1392,11 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
             let bl = *batch_len;
             let dl = batch.get_unchecked_mut(bl);
             dl.ls = ls as u32;
-            std::ptr::copy_nonoverlapping(
-                cm_buf.as_ptr().add(ch),
-                dl.commas_end.as_mut_ptr(),
-                K - 1,
-            );
-            *dl.commas_end.get_unchecked_mut(K - 1) = line_end as u32;
+            dl.le = line_end as u32;
+            dl.cm_off = ch as u32;
             let new_bl = bl + 1;
             if new_bl == DIRECT_BATCH_LEN {
-                on_batch(padded_buf, batch);
+                on_batch(padded_buf, cm_buf, batch);
                 *batch_len = 0;
             } else {
                 *batch_len = new_bl;
@@ -1414,7 +1424,7 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
 pub fn scan_lines_direct_batched_avx2<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
-    mut on_batch: impl FnMut(&[u8], &[DirectLine<K>]),
+    mut on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
 ) {
     assert!(K >= 2);
     assert!(valid_len < (1 << 31));
@@ -1423,7 +1433,7 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
         return;
     }
     let mut line_start = 0usize;
-    let mut cm_buf = [0u32; 576];
+    let mut cm_buf = [0u32; CM_BUF_CAP + 8];
     let mut cm_head = 0usize;
     let mut cm_tail = 0usize;
     let mut prev_delim = 1u64;
@@ -1431,7 +1441,7 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
     let mut line_start_parity = 0u64;
     let mut line_bad = 0u64;
     let mut line_na = 0u64;
-    let mut batch = [DirectLine::<K>::ZERO; DIRECT_BATCH_LEN];
+    let mut batch = [DirectLineRef::ZERO; DIRECT_BATCH_LEN];
     let mut batch_len = 0usize;
     let mut p = 0usize;
 
@@ -1540,16 +1550,12 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
         {
             let dl = batch.get_unchecked_mut(batch_len);
             dl.ls = line_start as u32;
-            std::ptr::copy_nonoverlapping(
-                cm_buf.as_ptr().add(cm_head),
-                dl.commas_end.as_mut_ptr(),
-                K - 1,
-            );
-            *dl.commas_end.get_unchecked_mut(K - 1) = valid_len as u32;
+            dl.le = valid_len as u32;
+            dl.cm_off = cm_head as u32;
             batch_len += 1;
         }
         if batch_len > 0 {
-            on_batch(padded_buf, &batch[..batch_len]);
+            on_batch(padded_buf, &cm_buf, &batch[..batch_len]);
         }
     }
 }
@@ -1558,14 +1564,15 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
 pub fn scan_lines_direct_batched_avx2<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
-    mut on_batch: impl FnMut(&[u8], &[DirectLine<K>]),
+    mut on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
 ) {
     assert!(K >= 2);
     assert!(valid_len < (1 << 31));
     assert!(padded_buf.len() >= valid_len + 64);
     let data = &padded_buf[..valid_len];
     let base = padded_buf.as_ptr() as usize;
-    let mut batch = [DirectLine::<K>::ZERO; DIRECT_BATCH_LEN];
+    let mut cm_buf = vec![0u32; DIRECT_BATCH_LEN * (K - 1)];
+    let mut batch = [DirectLineRef::ZERO; DIRECT_BATCH_LEN];
     let mut batch_len = 0usize;
     for_each_line_fields_slice::<K>(data, |fields| {
         let raw_0 = (fields[0].as_ptr() as usize) - base;
@@ -1574,9 +1581,9 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
         } else {
             raw_0
         };
-        let mut dl = DirectLine::<K>::ZERO;
-        dl.ls = ls as u32;
+        let cm_off = batch_len * (K - 1);
         let mut prev_raw_e = 0usize;
+        let mut le = ls;
         for i in 0..K {
             let f_s = (fields[i].as_ptr() as usize) - base;
             let f_e = f_s + fields[i].len();
@@ -1586,18 +1593,26 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
                 f_s > prev_raw_e + 1
             };
             let raw_e = f_e + usize::from(is_q);
-            dl.commas_end[i] = raw_e as u32;
+            if i + 1 < K {
+                cm_buf[cm_off + i] = raw_e as u32;
+            } else {
+                le = raw_e;
+            }
             prev_raw_e = raw_e;
         }
-        batch[batch_len] = dl;
+        batch[batch_len] = DirectLineRef {
+            ls: ls as u32,
+            le: le as u32,
+            cm_off: cm_off as u32,
+        };
         batch_len += 1;
         if batch_len == DIRECT_BATCH_LEN {
-            on_batch(padded_buf, &batch);
+            on_batch(padded_buf, &cm_buf, &batch);
             batch_len = 0;
         }
     });
     if batch_len > 0 {
-        on_batch(padded_buf, &batch[..batch_len]);
+        on_batch(padded_buf, &cm_buf, &batch[..batch_len]);
     }
 }
 
@@ -2503,11 +2518,12 @@ impl CsvSource {
         out
     }
 
-    fn for_each_chunk_blocks(
+    fn for_each_chunk_blocks_impl<const PD: bool>(
         &self,
         task: ChunkTask,
         buf: &mut Vec<u8>,
         pad: usize,
+        pread_ns: &mut u64,
         mut feed: impl FnMut(&[u8], usize),
     ) -> io::Result<()> {
         let file = &self.files[task.file_idx];
@@ -2529,7 +2545,15 @@ impl CsvSource {
                 if buf.len() < to_read + pad {
                     buf.resize(to_read + pad, 0);
                 }
+                let tr = if PD {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let n = read_at_full(file, &mut buf[..to_read], offset)?;
+                if let Some(t) = tr {
+                    *pread_ns += t.elapsed().as_nanos() as u64;
+                }
                 if n == 0 {
                     break;
                 }
@@ -2574,7 +2598,15 @@ impl CsvSource {
             if buf.len() < carry + to_read + pad {
                 buf.resize((carry + to_read).next_power_of_two() + pad, 0);
             }
+            let tr = if PD {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let n = read_at_full(file, &mut buf[carry..carry + to_read], offset)?;
+            if let Some(t) = tr {
+                *pread_ns += t.elapsed().as_nanos() as u64;
+            }
             if n == 0 {
                 break;
             }
@@ -2594,7 +2626,15 @@ impl CsvSource {
                     if buf.len() < line_len + step + pad {
                         buf.resize((line_len + step).next_power_of_two() + pad, 0);
                     }
+                    let tr = if PD {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let n = read_at_full(file, &mut buf[line_len..line_len + step], pos)?;
+                    if let Some(t) = tr {
+                        *pread_ns += t.elapsed().as_nanos() as u64;
+                    }
                     if n == 0 {
                         break;
                     }
@@ -2619,12 +2659,36 @@ impl CsvSource {
         Ok(())
     }
 
+    fn for_each_chunk_blocks(
+        &self,
+        task: ChunkTask,
+        buf: &mut Vec<u8>,
+        pad: usize,
+        feed: impl FnMut(&[u8], usize),
+    ) -> io::Result<()> {
+        let mut dummy = 0u64;
+        self.for_each_chunk_blocks_impl::<false>(task, buf, pad, &mut dummy, feed)
+    }
+
+    #[inline(always)]
+    pub fn for_each_chunk_direct_batched_timed<const K: usize, const PD: bool>(
+        &self,
+        task: ChunkTask,
+        buf: &mut Vec<u8>,
+        pread_ns: &mut u64,
+        mut on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
+    ) -> io::Result<()> {
+        self.for_each_chunk_blocks_impl::<PD>(task, buf, 64, pread_ns, |padded, valid_len| {
+            scan_lines_direct_batched_avx2::<K>(padded, valid_len, &mut on_batch);
+        })
+    }
+
     #[inline(always)]
     pub fn for_each_chunk_direct_batched<const K: usize>(
         &self,
         task: ChunkTask,
         buf: &mut Vec<u8>,
-        mut on_batch: impl FnMut(&[u8], &[DirectLine<K>]),
+        mut on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
     ) -> io::Result<()> {
         self.for_each_chunk_blocks(task, buf, 64, |padded, valid_len| {
             scan_lines_direct_batched_avx2::<K>(padded, valid_len, &mut on_batch);
@@ -3098,13 +3162,14 @@ mod tests {
         // Verify scan_lines_direct_batched_avx2 matches scan_lines_direct_avx2 across >200 lines & K=7
         let mut batched_dir = Vec::new();
         let mut batched_sizes = Vec::new();
-        scan_lines_direct_batched_avx2::<2>(&padded, data.len(), |p, lines| {
+        scan_lines_direct_batched_avx2::<2>(&padded, data.len(), |p, cm_buf, lines| {
             batched_sizes.push(lines.len());
             let base = p.as_ptr();
+            let cm_ptr = cm_buf.as_ptr();
             for dl in lines {
                 let ls = dl.ls as usize;
-                let c0 = dl.commas_end[0] as usize;
-                let le = dl.commas_end[1] as usize;
+                let c0 = unsafe { *cm_ptr.add(dl.cm_off as usize) } as usize;
+                let le = dl.le as usize;
                 let (s0, e0) = unsafe { field_span(base, ls, c0) };
                 let (s1, e1) = unsafe { field_span(base, c0 + 1, le) };
                 batched_dir.push((p[s0..e0].to_vec(), p[s1..e1].to_vec()));
@@ -3114,13 +3179,19 @@ mod tests {
         assert_eq!(batched_dir, scalar_expected);
 
         let mut ev_batched_dir = Vec::new();
-        scan_lines_direct_batched_avx2::<7>(&ev_pad, ev_data.len(), |p, lines| {
+        scan_lines_direct_batched_avx2::<7>(&ev_pad, ev_data.len(), |p, cm_buf, lines| {
             let base = p.as_ptr();
+            let cm_ptr = cm_buf.as_ptr();
             for dl in lines {
                 let mut row = Vec::with_capacity(7);
                 let mut prev = dl.ls as usize;
+                let cm_off = dl.cm_off as usize;
                 for k in 0..7 {
-                    let end = dl.commas_end[k] as usize;
+                    let end = if k < 6 {
+                        unsafe { *cm_ptr.add(cm_off + k) as usize }
+                    } else {
+                        dl.le as usize
+                    };
                     let (s, e) = unsafe { field_span(base, prev, end) };
                     row.push(p[s..e].to_vec());
                     prev = end + 1;

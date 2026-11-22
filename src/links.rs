@@ -135,6 +135,15 @@ impl LinkMap {
         self.empty
     }
 
+    pub fn debug_stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.bloom.len() * std::mem::size_of::<u64>(),
+            self.slots_b37.len() * std::mem::size_of::<LinkSlotB37>(),
+            self.bloom_hex.len() * std::mem::size_of::<u64>(),
+            self.slots_hex.len() * std::mem::size_of::<LinkSlotHex>(),
+        )
+    }
+
     #[inline(always)]
     fn bloom_idx(&self, h42: u64) -> usize {
         let s = (h42 >> 37) as usize;
@@ -507,12 +516,14 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             let Some(&task) = chunks.get(cidx) else {
                 break;
             };
-            if let Err(e) = src.for_each_chunk_direct_batched::<2>(task, &mut buf, |padded, lines| {
-                let base = padded.as_ptr();
-                for dl in lines {
-                    let ls = dl.ls as usize;
-                    let c0 = dl.commas_end[0] as usize;
-                    let le = dl.commas_end[1] as usize;
+            if let Err(e) =
+                src.for_each_chunk_direct_batched::<2>(task, &mut buf, |padded, cm_buf, lines| {
+                    let base = padded.as_ptr();
+                    let cm_ptr = cm_buf.as_ptr();
+                    for dl in lines {
+                        let ls = dl.ls as usize;
+                        let c0 = unsafe { *cm_ptr.add(dl.cm_off as usize) } as usize;
+                        let le = dl.le as usize;
                     let (a_s, a_e) = unsafe { field_span(base, ls, c0) };
                     let (b_s, b_e) = unsafe { field_span(base, c0 + 1, le) };
                     let a_len = a_e - a_s;
