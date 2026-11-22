@@ -1,9 +1,71 @@
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 pub const USE_MADV_HUGEPAGE: bool = true;
 const HUGE_SLAB_BYTES: usize = 4 * 1024 * 1024;
+
+static RECYCLE_SLABS: AtomicBool = AtomicBool::new(false);
+
+struct PoolEntry {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for PoolEntry {}
+
+static DIRTY_SLAB_POOL: Mutex<Vec<PoolEntry>> = Mutex::new(Vec::new());
+
+/// Enables or disables process-wide recycling of freed `mmap` slabs and huge buffers.
+pub fn set_slab_recycling(enable: bool) {
+    RECYCLE_SLABS.store(enable, Ordering::Release);
+    if !enable {
+        #[cfg(unix)]
+        {
+            let entries: Vec<PoolEntry> = {
+                let mut pool = DIRTY_SLAB_POOL.lock().unwrap();
+                std::mem::take(&mut *pool)
+            };
+            for e in entries {
+                unsafe {
+                    let _ = os_mem::munmap(e.ptr as *mut std::os::raw::c_void, e.len);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[inline]
+fn recycle_or_munmap_raw(ptr: *mut u8, len: usize) {
+    if RECYCLE_SLABS.load(Ordering::Acquire) {
+        DIRTY_SLAB_POOL.lock().unwrap().push(PoolEntry { ptr, len });
+    } else {
+        unsafe {
+            let _ = os_mem::munmap(ptr as *mut std::os::raw::c_void, len);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[inline]
+fn pop_pooled_slab(min_bytes: usize) -> Option<PoolEntry> {
+    if !RECYCLE_SLABS.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut pool = DIRTY_SLAB_POOL.lock().unwrap();
+    let mut best_idx: Option<usize> = None;
+    let mut best_len = 0usize;
+    for (i, e) in pool.iter().enumerate() {
+        if e.len >= min_bytes && e.len > best_len {
+            best_len = e.len;
+            best_idx = Some(i);
+        }
+    }
+    best_idx.map(|i| pool.swap_remove(i))
+}
 
 #[cfg(unix)]
 mod os_mem {
@@ -43,9 +105,7 @@ impl Drop for SlabBacking {
     fn drop(&mut self) {
         match *self {
             #[cfg(unix)]
-            SlabBacking::Mmap(ptr, len) => unsafe {
-                let _ = os_mem::munmap(ptr as *mut std::os::raw::c_void, len);
-            },
+            SlabBacking::Mmap(ptr, len) => recycle_or_munmap_raw(ptr, len),
             SlabBacking::Heap(_) => {}
         }
     }
@@ -99,9 +159,7 @@ impl<T: Copy> Drop for HugeBuf<T> {
     fn drop(&mut self) {
         if let HugeBacking::Mmap(ptr, _, mmap_bytes) = self.backing {
             #[cfg(unix)]
-            unsafe {
-                let _ = os_mem::munmap(ptr as *mut std::os::raw::c_void, mmap_bytes);
-            }
+            recycle_or_munmap_raw(ptr as *mut u8, mmap_bytes);
         }
     }
 }
@@ -167,7 +225,6 @@ impl<T: Copy> HugeBuf<T> {
         }
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         match &mut self.backing {
@@ -250,6 +307,13 @@ impl SlabArena {
 
         #[cfg(unix)]
         if self.use_huge_from_start || need >= HUGE_SLAB_BYTES {
+            let min_recycle = min_bytes.max(HUGE_PAGE_ALIGN);
+            if let Some(entry) = pop_pooled_slab(min_recycle) {
+                self.slabs.push(SlabBacking::Mmap(entry.ptr, entry.len));
+                self.cur_ptr = entry.ptr;
+                self.cur_end = unsafe { entry.ptr.add(entry.len) };
+                return;
+            }
             let aligned_len = (need + HUGE_SLAB_BYTES - 1) & !(HUGE_SLAB_BYTES - 1);
             unsafe {
                 let p = os_mem::mmap(
@@ -499,6 +563,148 @@ impl<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize>
     }
 }
 
+/// Reusable 2MB-hugepage-backed scratch bump allocator for per-shard Stage 5 CSR buffers.
+pub struct HugeScratch {
+    ptr: *mut u8,
+    cap: usize,
+    off: usize,
+    is_mmap: bool,
+    overflow: Vec<(*mut u8, usize, bool)>,
+    heap_fallback: Vec<Vec<u8>>,
+}
+
+unsafe impl Send for HugeScratch {}
+unsafe impl Sync for HugeScratch {}
+
+impl HugeScratch {
+    fn alloc_slab(
+        min_bytes: usize,
+        heap_fallback: &mut Vec<Vec<u8>>,
+    ) -> (*mut u8, usize, bool) {
+        let aligned_len = ((min_bytes.max(HUGE_PAGE_ALIGN) + HUGE_PAGE_ALIGN - 1)
+            & !(HUGE_PAGE_ALIGN - 1))
+        .max(HUGE_PAGE_ALIGN);
+        #[cfg(unix)]
+        {
+            if let Some(entry) = pop_pooled_slab(aligned_len) {
+                return (entry.ptr, entry.len, true);
+            }
+            unsafe {
+                let p = os_mem::mmap(
+                    ptr::null_mut(),
+                    aligned_len,
+                    os_mem::PROT_READ | os_mem::PROT_WRITE,
+                    os_mem::MAP_PRIVATE | os_mem::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if p != os_mem::MAP_FAILED && !p.is_null() {
+                    if USE_MADV_HUGEPAGE {
+                        #[cfg(target_os = "linux")]
+                        let _ = os_mem::madvise(p, aligned_len, os_mem::MADV_HUGEPAGE);
+                    }
+                    return (p as *mut u8, aligned_len, true);
+                }
+            }
+        }
+        let mut buf = vec![0u8; aligned_len + 64];
+        let raw = buf.as_mut_ptr() as usize;
+        let aligned = (raw + 63) & !63;
+        let usable = (raw + buf.len()) - aligned;
+        heap_fallback.push(buf);
+        (aligned as *mut u8, usable, false)
+    }
+
+    pub fn with_capacity(min_bytes: usize) -> Self {
+        let mut heap_fallback = Vec::new();
+        let (ptr, cap, is_mmap) = Self::alloc_slab(min_bytes, &mut heap_fallback);
+        Self {
+            ptr,
+            cap,
+            off: 0,
+            is_mmap,
+            overflow: Vec::new(),
+            heap_fallback,
+        }
+    }
+
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        self.off = 0;
+        if !self.overflow.is_empty() {
+            for (p, l, is_mmap) in self.overflow.drain(..) {
+                #[cfg(unix)]
+                if is_mmap {
+                    recycle_or_munmap_raw(p, l);
+                }
+                #[cfg(not(unix))]
+                let _ = (p, l, is_mmap);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_and_alloc(&mut self, bytes: usize) -> *mut u8 {
+        if self.cap > 0 {
+            self.overflow.push((self.ptr, self.cap, self.is_mmap));
+        }
+        let need = bytes.max(self.cap.saturating_mul(2)).max(HUGE_SLAB_BYTES);
+        let (ptr, cap, is_mmap) = Self::alloc_slab(need, &mut self.heap_fallback);
+        self.ptr = ptr;
+        self.cap = cap;
+        self.is_mmap = is_mmap;
+        self.off = bytes;
+        ptr
+    }
+
+    #[inline(always)]
+    pub fn alloc_uninit_ptr<T: Copy>(&mut self, len: usize) -> *mut T {
+        if len == 0 {
+            return NonNull::<T>::dangling().as_ptr();
+        }
+        let align = align_of::<T>().max(64);
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .expect("HugeScratch size overflow");
+        let aligned_off = (self.off + align - 1) & !(align - 1);
+        if aligned_off.saturating_add(bytes) <= self.cap {
+            self.off = aligned_off + bytes;
+            unsafe { self.ptr.add(aligned_off) as *mut T }
+        } else {
+            self.grow_and_alloc(bytes) as *mut T
+        }
+    }
+
+    #[inline(always)]
+    pub fn alloc_zeroed_ptr<T: Zeroable>(&mut self, len: usize) -> *mut T {
+        let p = self.alloc_uninit_ptr::<T>(len);
+        if len > 0 {
+            unsafe {
+                ptr::write_bytes(p, 0, len);
+            }
+        }
+        p
+    }
+}
+
+impl Drop for HugeScratch {
+    fn drop(&mut self) {
+        if self.is_mmap && self.cap > 0 {
+            #[cfg(unix)]
+            recycle_or_munmap_raw(self.ptr, self.cap);
+        }
+        for (p, l, is_mmap) in self.overflow.drain(..) {
+            #[cfg(unix)]
+            if is_mmap {
+                recycle_or_munmap_raw(p, l);
+            }
+            #[cfg(not(unix))]
+            let _ = (p, l, is_mmap);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +800,30 @@ mod tests {
         assert_eq!(collect_shard1(1), (10..18).collect::<Vec<u64>>());
         assert_eq!(collect_shard1(2), (100..121).collect::<Vec<u64>>());
         assert!(chunks1[3].is_empty());
+
+        // HugeScratch bump, zeroing, overflow growth, reset & slab recycling lifecycle
+        set_slab_recycling(true);
+        {
+            let mut hs = HugeScratch::with_capacity(2 * 1024 * 1024);
+            let z = hs.alloc_zeroed_ptr::<u64>(1024);
+            assert!(unsafe { std::slice::from_raw_parts(z, 1024) }.iter().all(|&x| x == 0));
+            let u = hs.alloc_uninit_ptr::<u32>(300);
+            unsafe {
+                *u = 7;
+                *u.add(299) = 99;
+            }
+            // Trigger overflow growth past 2 MiB
+            let big = hs.alloc_zeroed_ptr::<u64>(600_000);
+            unsafe {
+                assert_eq!(*big, 0);
+                assert_eq!(*big.add(599_999), 0);
+                *big.add(12345) = 0xCAFE_BABE;
+                assert_eq!(*big.add(12345), 0xCAFE_BABE);
+            }
+            hs.reset();
+            let z2 = hs.alloc_zeroed_ptr::<u32>(128);
+            assert!(unsafe { std::slice::from_raw_parts(z2, 128) }.iter().all(|&x| x == 0));
+        }
+        set_slab_recycling(false);
     }
 }
