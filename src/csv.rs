@@ -16,7 +16,6 @@ pub const LONG_OFF_MASK: u64 = (1u64 << 37) - 1;
 
 pub const B37_MASK42: u64 = (1u64 << 42) - 1;
 const B37_M1: u64 = 0x27D4_EB2D_1656_67B1;
-const B37_M2: u64 = 0x1656_67B1_9E37_79B9;
 
 const fn modinv42(a: u64) -> u64 {
     let mut inv = 1u64;
@@ -29,9 +28,7 @@ const fn modinv42(a: u64) -> u64 {
 }
 
 const B37_M1_INV: u64 = modinv42(B37_M1);
-const B37_M2_INV: u64 = modinv42(B37_M2);
 const _: () = assert!((B37_M1.wrapping_mul(B37_M1_INV) & B37_MASK42) == 1);
-const _: () = assert!((B37_M2.wrapping_mul(B37_M2_INV) & B37_MASK42) == 1);
 
 #[inline(always)]
 pub const fn biject42(mut x: u64) -> u64 {
@@ -39,16 +36,12 @@ pub const fn biject42(mut x: u64) -> u64 {
     x ^= x >> 21;
     x = x.wrapping_mul(B37_M1) & B37_MASK42;
     x ^= x >> 21;
-    x = x.wrapping_mul(B37_M2) & B37_MASK42;
-    x ^= x >> 21;
     x
 }
 
 #[inline(always)]
 pub const fn inv_biject42(mut y: u64) -> u64 {
     y &= B37_MASK42;
-    y ^= y >> 21;
-    y = y.wrapping_mul(B37_M2_INV) & B37_MASK42;
     y ^= y >> 21;
     y = y.wrapping_mul(B37_M1_INV) & B37_MASK42;
     y ^= y >> 21;
@@ -95,6 +88,8 @@ static B37_LANE_MASKS: [u64; 10] = [
     0xFFFF_FFFF_FFFF_FFFF,
 ];
 
+static B37_NEED_MASK: [u32; 10] = [0, 0, 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF];
+
 #[inline(always)]
 pub fn encode_b37_padded(padded: &[u8], start: usize, len: usize, prefix: u8) -> Option<u64> {
     debug_assert!(padded.len() >= start + 16);
@@ -115,7 +110,7 @@ pub fn encode_b37_padded(padded: &[u8], start: usize, len: usize, prefix: u8) ->
         let a_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'a' as i8).wrapping_sub(-128)));
         let is_low = _mm_cmplt_epi8(a_sub, _mm_set1_epi8(-102));
         let valid_mask = (_mm_movemask_epi8(_mm_or_si128(is_dig, is_low)) as u32) & 0xFF;
-        let need_mask = (1u32 << (len - 1)) - 1;
+        let need_mask = *B37_NEED_MASK.get_unchecked(len);
         if (valid_mask & need_mask) != need_mask {
             return None;
         }
@@ -185,7 +180,8 @@ pub fn encode_b37_pair_padded(
         let a_sub = _mm_sub_epi8(v_raw, _mm_set1_epi8((b'a' as i8).wrapping_sub(-128)));
         let is_low = _mm_cmplt_epi8(a_sub, _mm_set1_epi8(-102));
         let valid_mask = _mm_movemask_epi8(_mm_or_si128(is_dig, is_low)) as u32;
-        let need_mask = ((1u32 << (len0 - 1)) - 1) | (((1u32 << (len1 - 1)) - 1) << 8);
+        let need_mask =
+            *B37_NEED_MASK.get_unchecked(len0) | (*B37_NEED_MASK.get_unchecked(len1) << 8);
         if (valid_mask & need_mask) != need_mask {
             return None;
         }
@@ -1264,8 +1260,8 @@ pub fn scan_lines_direct_avx2<const K: usize>(
     });
 }
 
-const DIRECT_BATCH_LEN: usize = 64;
-const CM_BUF_CAP: usize = 1024;
+pub const DIRECT_BATCH_LEN: usize = 64;
+const CM_BUF_CAP: usize = 512;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1297,7 +1293,7 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
     prev_delim: &mut u64,
     prev_in_q: &mut u64,
     line_start: &mut usize,
-    cm_buf: &mut [u32; CM_BUF_CAP + 8],
+    cm_buf: &mut [u32; CM_BUF_CAP + 72],
     cm_head: &mut usize,
     cm_tail: &mut usize,
     line_start_parity: &mut u64,
@@ -1306,16 +1302,17 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
     batch: &mut [DirectLineRef; DIRECT_BATCH_LEN],
     batch_len: &mut usize,
     on_batch: &mut impl FnMut(&[u8], &[u32], &[DirectLineRef]),
+    mut prefix_xor_fn: impl FnMut(u64) -> u64,
 ) {
     let d = cm_mask | nl_mask;
     let starts = (d << 1) | *prev_delim;
     let ends = (d_for_ends >> 1) | (next_d0 << 63);
     let bad_pos = qt_mask & !(starts ^ ends);
-    let after_q = prefix_xor_u64(qt_mask) ^ *prev_in_q;
+    let after_q = prefix_xor_fn(qt_mask) ^ *prev_in_q;
     *prev_delim = d >> 63;
     *prev_in_q = ((after_q as i64) >> 63) as u64;
 
-    if (*batch_len == 0 && *cm_tail >= 512) || (*cm_tail + 64 > CM_BUF_CAP) {
+    if (*batch_len == 0 && *cm_tail >= 128) || (*cm_tail + 64 > CM_BUF_CAP) {
         if *batch_len > 0 {
             on_batch(padded_buf, cm_buf, &batch[..*batch_len]);
             *batch_len = 0;
@@ -1332,35 +1329,47 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
     }
 
     let base_tail = *cm_tail;
-    let mut m_lo = cm_mask as u32;
-    let mut m_hi = (cm_mask >> 32) as u32;
-    let lo_cnt = m_lo.count_ones() as usize;
-    let block_cm = lo_cnt + (m_hi.count_ones() as usize);
+    let lo = cm_mask as u32;
+    let hi = (cm_mask >> 32) as u32;
+    let n_lo = lo.count_ones() as usize;
+    let block_cm = n_lo + (hi.count_ones() as usize);
     let p32 = p as u32;
-    let p32_hi = p32.wrapping_add(32);
-    let mut dst_lo = cm_buf.as_mut_ptr().add(base_tail);
-    while m_lo != 0 {
-        *dst_lo = p32.wrapping_add(m_lo.trailing_zeros());
-        m_lo &= m_lo.wrapping_sub(1);
-        *dst_lo.add(1) = p32.wrapping_add(m_lo.trailing_zeros());
-        m_lo &= m_lo.wrapping_sub(1);
-        *dst_lo.add(2) = p32.wrapping_add(m_lo.trailing_zeros());
-        m_lo &= m_lo.wrapping_sub(1);
-        *dst_lo.add(3) = p32.wrapping_add(m_lo.trailing_zeros());
-        m_lo &= m_lo.wrapping_sub(1);
-        dst_lo = dst_lo.add(4);
+    {
+        let mut m = lo;
+        let mut dst = cm_buf.as_mut_ptr().add(base_tail);
+        *dst = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(1) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(2) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        if m != 0 {
+            dst = dst.add(3);
+            while m != 0 {
+                *dst = p32.wrapping_add(m.trailing_zeros());
+                dst = dst.add(1);
+                m &= m.wrapping_sub(1);
+            }
+        }
     }
-    let mut dst_hi = cm_buf.as_mut_ptr().add(base_tail + lo_cnt);
-    while m_hi != 0 {
-        *dst_hi = p32_hi.wrapping_add(m_hi.trailing_zeros());
-        m_hi &= m_hi.wrapping_sub(1);
-        *dst_hi.add(1) = p32_hi.wrapping_add(m_hi.trailing_zeros());
-        m_hi &= m_hi.wrapping_sub(1);
-        *dst_hi.add(2) = p32_hi.wrapping_add(m_hi.trailing_zeros());
-        m_hi &= m_hi.wrapping_sub(1);
-        *dst_hi.add(3) = p32_hi.wrapping_add(m_hi.trailing_zeros());
-        m_hi &= m_hi.wrapping_sub(1);
-        dst_hi = dst_hi.add(4);
+    if hi != 0 {
+        let mut m = hi;
+        let p32_hi = p32.wrapping_add(32);
+        let mut dst = cm_buf.as_mut_ptr().add(base_tail + n_lo);
+        *dst = p32_hi.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(1) = p32_hi.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(2) = p32_hi.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        if m != 0 {
+            dst = dst.add(3);
+            while m != 0 {
+                *dst = p32_hi.wrapping_add(m.trailing_zeros());
+                dst = dst.add(1);
+                m &= m.wrapping_sub(1);
+            }
+        }
     }
 
     let mut prev_done = 0u64;
@@ -1421,10 +1430,12 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-pub fn scan_lines_direct_batched_avx2<const K: usize>(
+#[inline(always)]
+unsafe fn scan_lines_direct_batched_avx2_inner<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
     mut on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
+    mut prefix_xor_fn: impl FnMut(u64) -> u64,
 ) {
     assert!(K >= 2);
     assert!(valid_len < (1 << 31));
@@ -1433,7 +1444,7 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
         return;
     }
     let mut line_start = 0usize;
-    let mut cm_buf = [0u32; CM_BUF_CAP + 8];
+    let mut cm_buf = [0u32; CM_BUF_CAP + 72];
     let mut cm_head = 0usize;
     let mut cm_tail = 0usize;
     let mut prev_delim = 1u64;
@@ -1445,118 +1456,155 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
     let mut batch_len = 0usize;
     let mut p = 0usize;
 
-    unsafe {
-        use std::arch::x86_64::*;
-        let v_nl = _mm256_set1_epi8(b'\n' as i8);
-        let v_cm = _mm256_set1_epi8(b',' as i8);
-        let v_qt = _mm256_set1_epi8(b'"' as i8);
-        let base = padded_buf.as_ptr();
+    use std::arch::x86_64::*;
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+    let v_cm = _mm256_set1_epi8(b',' as i8);
+    let v_qt = _mm256_set1_epi8(b'"' as i8);
+    let base = padded_buf.as_ptr();
 
-        while p + 64 < valid_len {
-            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
-            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
-            let nl_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
-                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32);
-            let cm_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
-                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32);
-            let qt_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
-                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32);
-            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
-                0u64
-            } else {
-                (_mm256_movemask_epi8(v0) as u32 as u64)
-                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32)
-            };
-            let nb = *base.add(p + 64);
-            let next_d0 = u64::from((nb == b',') | (nb == b'\n'));
-            scan_direct_batched_step64::<K>(
-                padded_buf,
-                p,
-                nl_mask,
-                cm_mask,
-                qt_mask,
-                na_mask,
-                cm_mask | nl_mask,
-                next_d0,
-                &mut prev_delim,
-                &mut prev_in_q,
-                &mut line_start,
-                &mut cm_buf,
-                &mut cm_head,
-                &mut cm_tail,
-                &mut line_start_parity,
-                &mut line_bad,
-                &mut line_na,
-                &mut batch,
-                &mut batch_len,
-                &mut on_batch,
-            );
-            p += 64;
-        }
+    while p + 64 < valid_len {
+        let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+        let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+        let nl_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32);
+        let cm_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32);
+        let qt_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32);
+        let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+            0u64
+        } else {
+            (_mm256_movemask_epi8(v0) as u32 as u64)
+                | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32)
+        };
+        let nb = *base.add(p + 64);
+        let next_d0 = u64::from((nb == b',') | (nb == b'\n'));
+        scan_direct_batched_step64::<K>(
+            padded_buf,
+            p,
+            nl_mask,
+            cm_mask,
+            qt_mask,
+            na_mask,
+            cm_mask | nl_mask,
+            next_d0,
+            &mut prev_delim,
+            &mut prev_in_q,
+            &mut line_start,
+            &mut cm_buf,
+            &mut cm_head,
+            &mut cm_tail,
+            &mut line_start_parity,
+            &mut line_bad,
+            &mut line_na,
+            &mut batch,
+            &mut batch_len,
+            &mut on_batch,
+            &mut prefix_xor_fn,
+        );
+        p += 64;
+    }
 
-        if p < valid_len {
-            let rem = valid_len - p;
-            let valid_mask = if rem == 64 { !0u64 } else { (1u64 << rem) - 1 };
-            let eof_bit = if rem < 64 { 1u64 << rem } else { 0u64 };
-            let tail_next_d0 = u64::from(rem == 64);
-            let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
-            let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
-            let nl_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
-                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32))
-                & valid_mask;
-            let cm_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
-                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32))
-                & valid_mask;
-            let qt_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
-                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32))
-                & valid_mask;
-            let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
-                0u64
-            } else {
-                ((_mm256_movemask_epi8(v0) as u32 as u64)
-                    | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32))
-                    & valid_mask
-            };
-            scan_direct_batched_step64::<K>(
-                padded_buf,
-                p,
-                nl_mask,
-                cm_mask,
-                qt_mask,
-                na_mask,
-                cm_mask | nl_mask | eof_bit,
-                tail_next_d0,
-                &mut prev_delim,
-                &mut prev_in_q,
-                &mut line_start,
-                &mut cm_buf,
-                &mut cm_head,
-                &mut cm_tail,
-                &mut line_start_parity,
-                &mut line_bad,
-                &mut line_na,
-                &mut batch,
-                &mut batch_len,
-                &mut on_batch,
-            );
-        }
+    if p < valid_len {
+        let rem = valid_len - p;
+        let valid_mask = if rem == 64 { !0u64 } else { (1u64 << rem) - 1 };
+        let eof_bit = if rem < 64 { 1u64 << rem } else { 0u64 };
+        let tail_next_d0 = u64::from(rem == 64);
+        let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+        let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+        let nl_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32))
+            & valid_mask;
+        let cm_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32))
+            & valid_mask;
+        let qt_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32))
+            & valid_mask;
+        let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+            0u64
+        } else {
+            ((_mm256_movemask_epi8(v0) as u32 as u64)
+                | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32))
+                & valid_mask
+        };
+        scan_direct_batched_step64::<K>(
+            padded_buf,
+            p,
+            nl_mask,
+            cm_mask,
+            qt_mask,
+            na_mask,
+            cm_mask | nl_mask | eof_bit,
+            tail_next_d0,
+            &mut prev_delim,
+            &mut prev_in_q,
+            &mut line_start,
+            &mut cm_buf,
+            &mut cm_head,
+            &mut cm_tail,
+            &mut line_start_parity,
+            &mut line_bad,
+            &mut line_na,
+            &mut batch,
+            &mut batch_len,
+            &mut on_batch,
+            &mut prefix_xor_fn,
+        );
+    }
 
-        if line_start < valid_len
-            && (cm_tail - cm_head) == K - 1
-            && line_bad == 0
-            && prev_in_q == line_start_parity
-            && (line_na == 0
-                || std::str::from_utf8(padded_buf.get_unchecked(line_start..valid_len)).is_ok())
-        {
-            let dl = batch.get_unchecked_mut(batch_len);
-            dl.ls = line_start as u32;
-            dl.le = valid_len as u32;
-            dl.cm_off = cm_head as u32;
-            batch_len += 1;
-        }
-        if batch_len > 0 {
-            on_batch(padded_buf, &cm_buf, &batch[..batch_len]);
-        }
+    if line_start < valid_len
+        && (cm_tail - cm_head) == K - 1
+        && line_bad == 0
+        && prev_in_q == line_start_parity
+        && (line_na == 0
+            || std::str::from_utf8(padded_buf.get_unchecked(line_start..valid_len)).is_ok())
+    {
+        let dl = batch.get_unchecked_mut(batch_len);
+        dl.ls = line_start as u32;
+        dl.le = valid_len as u32;
+        dl.cm_off = cm_head as u32;
+        batch_len += 1;
+    }
+    if batch_len > 0 {
+        on_batch(padded_buf, &cm_buf, &batch[..batch_len]);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2,pclmulqdq")]
+unsafe fn scan_lines_direct_batched_avx2_clmul<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
+) {
+    use std::arch::x86_64::*;
+    let all_ones = _mm_set1_epi8(-1);
+    scan_lines_direct_batched_avx2_inner::<K>(padded_buf, valid_len, on_batch, |qt_mask| {
+        let qv = _mm_cvtsi64_si128(qt_mask as i64);
+        _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0x00>(qv, all_ones)) as u64
+    });
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+unsafe fn scan_lines_direct_batched_avx2_sw<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
+) {
+    scan_lines_direct_batched_avx2_inner::<K>(padded_buf, valid_len, on_batch, prefix_xor_u64);
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub fn scan_lines_direct_batched_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
+) {
+    if std::is_x86_feature_detected!("pclmulqdq") {
+        unsafe { scan_lines_direct_batched_avx2_clmul::<K>(padded_buf, valid_len, on_batch) }
+    } else {
+        unsafe { scan_lines_direct_batched_avx2_sw::<K>(padded_buf, valid_len, on_batch) }
     }
 }
 
@@ -3175,7 +3223,7 @@ mod tests {
                 batched_dir.push((p[s0..e0].to_vec(), p[s1..e1].to_vec()));
             }
         });
-        assert!(batched_sizes.len() >= 3 && batched_sizes[0] == 64 && batched_sizes[1] == 64);
+        assert!(batched_sizes.len() >= 2 && batched_sizes[0] == DIRECT_BATCH_LEN);
         assert_eq!(batched_dir, scalar_expected);
 
         let mut ev_batched_dir = Vec::new();

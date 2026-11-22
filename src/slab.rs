@@ -208,6 +208,7 @@ pub struct SlabArena {
     cur_ptr: *mut u8,
     cur_end: *mut u8,
     use_huge_from_start: bool,
+    init_slab_bytes: usize,
 }
 
 unsafe impl Send for SlabArena {}
@@ -215,19 +216,30 @@ unsafe impl Sync for SlabArena {}
 
 impl SlabArena {
     pub fn new(hint_bytes: usize) -> Self {
+        let init_slab_bytes = if hint_bytes >= 2 * 1024 * 1024 {
+            let rounded = (hint_bytes + HUGE_PAGE_ALIGN - 1) & !(HUGE_PAGE_ALIGN - 1);
+            rounded.clamp(HUGE_SLAB_BYTES, 128 * 1024 * 1024)
+        } else {
+            HUGE_SLAB_BYTES
+        };
         Self {
             slabs: Vec::new(),
             cur_ptr: ptr::null_mut(),
             cur_end: ptr::null_mut(),
             use_huge_from_start: hint_bytes >= 512 * 1024,
+            init_slab_bytes,
         }
     }
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, min_bytes: usize) {
-        let step_bytes = if self.use_huge_from_start || self.slabs.len() >= 2 {
+        let step_bytes = if self.slabs.is_empty() && self.use_huge_from_start {
+            self.init_slab_bytes
+        } else if self.use_huge_from_start || self.slabs.len() >= 2 {
             HUGE_SLAB_BYTES
+                .max(self.init_slab_bytes / 2)
+                .min(64 * 1024 * 1024)
         } else if self.slabs.len() == 1 {
             256 * 1024
         } else {
@@ -288,12 +300,18 @@ impl SlabArena {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BucketHead<T> {
+    cur: *mut T,
+    end: *mut T,
+}
+
 pub struct SlabBuckets<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize = 4> {
     arena: SlabArena,
     swcb: *mut T,
     swcb_cnt: [u8; P],
-    cur_ptrs: [*mut T; P],
-    cur_lens: [u16; P],
+    heads: [BucketHead<T>; P],
     completed: Vec<Vec<MutChunkRef<T>>>,
     _marker: PhantomData<T>,
 }
@@ -313,20 +331,27 @@ impl<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize>
                 && SWCB_W <= 255
                 && CHUNK >= SWCB_W
                 && CHUNK.is_power_of_two()
+                && CHUNK % SWCB_W == 0
                 && CHUNK <= u16::MAX as usize
         );
         assert!(align_of::<T>() <= 64);
         assert!(size_of::<T>() > 0);
         let mut arena = SlabArena::new(hint_bytes);
-        let swcb_bytes = P * SWCB_W * size_of::<T>();
-        let swcb = arena.alloc_aligned_64(swcb_bytes).as_ptr() as *mut T;
+        let swcb = if SWCB_W == 1 {
+            ptr::null_mut()
+        } else {
+            let swcb_bytes = P * SWCB_W * size_of::<T>();
+            arena.alloc_aligned_64(swcb_bytes).as_ptr() as *mut T
+        };
         let completed = (0..P).map(|_| Vec::new()).collect();
         Self {
             arena,
             swcb,
             swcb_cnt: [0u8; P],
-            cur_ptrs: [ptr::null_mut(); P],
-            cur_lens: [CHUNK as u16; P],
+            heads: [BucketHead {
+                cur: ptr::null_mut(),
+                end: ptr::null_mut(),
+            }; P],
             completed,
             _marker: PhantomData,
         }
@@ -334,25 +359,41 @@ impl<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize>
 
     #[cold]
     #[inline(never)]
-    fn alloc_next_chunk(&mut self, shard: usize, old_ptr: *mut T, old_len: usize) -> *mut T {
-        if !old_ptr.is_null() {
+    fn alloc_next_chunk(&mut self, shard: usize) -> *mut T {
+        let old_end = unsafe { (*self.heads.get_unchecked(shard)).end };
+        if !old_end.is_null() {
             unsafe {
+                let base = old_end.sub(CHUNK);
                 self.completed.get_unchecked_mut(shard).push(MutChunkRef {
-                    ptr: old_ptr,
-                    len: old_len,
+                    ptr: base,
+                    len: CHUNK,
                 });
             }
         }
         let chunk_bytes = CHUNK * size_of::<T>();
         let new_ptr = self.arena.alloc_aligned_64(chunk_bytes).as_ptr() as *mut T;
         unsafe {
-            *self.cur_ptrs.get_unchecked_mut(shard) = new_ptr;
+            let h = self.heads.get_unchecked_mut(shard);
+            h.cur = new_ptr;
+            h.end = new_ptr.add(CHUNK);
         }
         new_ptr
     }
 
     #[inline(always)]
     pub fn push(&mut self, shard: usize, val: T) {
+        if SWCB_W == 1 {
+            let h = unsafe { self.heads.get_unchecked_mut(shard) };
+            let mut cur = h.cur;
+            if cur == h.end {
+                cur = self.alloc_next_chunk(shard);
+            }
+            unsafe {
+                *cur = val;
+                (*self.heads.get_unchecked_mut(shard)).cur = cur.add(1);
+            }
+            return;
+        }
         let base = shard * SWCB_W;
         let c = unsafe { *self.swcb_cnt.get_unchecked(shard) } as usize;
         unsafe {
@@ -370,14 +411,12 @@ impl<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize>
 
     #[inline(always)]
     fn flush_full_swcb(&mut self, shard: usize, base: usize) {
-        let mut cur_ptr = unsafe { *self.cur_ptrs.get_unchecked(shard) };
-        let mut cur_len = unsafe { *self.cur_lens.get_unchecked(shard) } as usize;
-        if cur_len >= CHUNK {
-            cur_ptr = self.alloc_next_chunk(shard, cur_ptr, cur_len);
-            cur_len = 0;
+        let h = unsafe { self.heads.get_unchecked_mut(shard) };
+        let mut dst = h.cur;
+        if dst == h.end {
+            dst = self.alloc_next_chunk(shard);
         }
 
-        let dst = unsafe { cur_ptr.add(cur_len) };
         let src = unsafe { self.swcb.add(base) };
         let bytes = SWCB_W * size_of::<T>();
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -394,46 +433,61 @@ impl<T: Copy, const P: usize, const CHUNK: usize, const SWCB_W: usize>
                 }
             }
             unsafe {
-                *self.cur_lens.get_unchecked_mut(shard) = (cur_len + SWCB_W) as u16;
+                (*self.heads.get_unchecked_mut(shard)).cur = dst.add(SWCB_W);
                 *self.swcb_cnt.get_unchecked_mut(shard) = 0;
             }
             return;
         }
         unsafe {
             ptr::copy_nonoverlapping(src, dst, SWCB_W);
-            *self.cur_lens.get_unchecked_mut(shard) = (cur_len + SWCB_W) as u16;
+            (*self.heads.get_unchecked_mut(shard)).cur = dst.add(SWCB_W);
             *self.swcb_cnt.get_unchecked_mut(shard) = 0;
         }
     }
 
     pub fn finish(mut self) -> (SlabArena, Vec<Vec<MutChunkRef<T>>>) {
+        if SWCB_W == 1 {
+            for shard in 0..P {
+                let h = self.heads[shard];
+                if !h.end.is_null() {
+                    let base = unsafe { h.end.sub(CHUNK) };
+                    let len = unsafe { h.cur.offset_from(base) as usize };
+                    if len > 0 {
+                        self.completed[shard].push(MutChunkRef { ptr: base, len });
+                    }
+                }
+            }
+            return (self.arena, self.completed);
+        }
         for shard in 0..P {
             let cnt = self.swcb_cnt[shard] as usize;
-            let cur_ptr = self.cur_ptrs[shard];
-            let cur_len = self.cur_lens[shard] as usize;
+            let h = self.heads[shard];
             if cnt > 0 {
-                let mut ptr = cur_ptr;
-                let mut len = cur_len;
-                if ptr.is_null() {
-                    ptr = self.arena.alloc_aligned_64(cnt * size_of::<T>()).as_ptr() as *mut T;
-                    len = 0;
-                } else if len + cnt > CHUNK {
-                    self.completed[shard].push(MutChunkRef { ptr, len });
-                    ptr = self.arena.alloc_aligned_64(cnt * size_of::<T>()).as_ptr() as *mut T;
-                    len = 0;
+                let mut cur = h.cur;
+                let mut base = if h.end.is_null() {
+                    ptr::null_mut()
+                } else {
+                    unsafe { h.end.sub(CHUNK) }
+                };
+                if cur == h.end {
+                    if !base.is_null() {
+                        self.completed[shard].push(MutChunkRef { ptr: base, len: CHUNK });
+                    }
+                    cur = self.arena.alloc_aligned_64(cnt * size_of::<T>()).as_ptr() as *mut T;
+                    base = cur;
                 }
                 unsafe {
-                    ptr::copy_nonoverlapping(self.swcb.add(shard * SWCB_W), ptr.add(len), cnt);
+                    ptr::copy_nonoverlapping(self.swcb.add(shard * SWCB_W), cur, cnt);
+                    cur = cur.add(cnt);
+                    let len = cur.offset_from(base) as usize;
+                    self.completed[shard].push(MutChunkRef { ptr: base, len });
                 }
-                self.completed[shard].push(MutChunkRef {
-                    ptr,
-                    len: len + cnt,
-                });
-            } else if !cur_ptr.is_null() && cur_len > 0 {
-                self.completed[shard].push(MutChunkRef {
-                    ptr: cur_ptr,
-                    len: cur_len,
-                });
+            } else if !h.end.is_null() {
+                let base = unsafe { h.end.sub(CHUNK) };
+                let len = unsafe { h.cur.offset_from(base) as usize };
+                if len > 0 {
+                    self.completed[shard].push(MutChunkRef { ptr: base, len });
+                }
             }
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -515,5 +569,29 @@ mod tests {
         assert_eq!(collect_shard8(1), (10..26).collect::<Vec<u64>>());
         assert_eq!(collect_shard8(2), (100..137).collect::<Vec<u64>>());
         assert!(chunks8[3].is_empty());
+
+        // Direct temporal mode (SWCB_W = 1) across 0, partial, exact chunk, multi-chunk
+        let mut sb1 = SlabBuckets::<u64, 4, 8, 1>::new(64 * 1024);
+        for v in 1..=3u64 {
+            sb1.push(0, v);
+        }
+        for v in 10..18u64 {
+            sb1.push(1, v);
+        }
+        for v in 100..121u64 {
+            sb1.push(2, v);
+        }
+        let (_arena1, chunks1) = sb1.finish();
+        let collect_shard1 = |s: usize| -> Vec<u64> {
+            let mut out = Vec::new();
+            for c in &chunks1[s] {
+                out.extend_from_slice(unsafe { c.as_slice() });
+            }
+            out
+        };
+        assert_eq!(collect_shard1(0), vec![1, 2, 3]);
+        assert_eq!(collect_shard1(1), (10..18).collect::<Vec<u64>>());
+        assert_eq!(collect_shard1(2), (100..121).collect::<Vec<u64>>());
+        assert!(chunks1[3].is_empty());
     }
 }

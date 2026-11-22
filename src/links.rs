@@ -14,19 +14,44 @@ use crate::slab::{HugeBuf, Zeroable};
 
 const LINK_CHUNK_BYTES: usize = 512 * 1024;
 const LINK_SHARDS: usize = 32;
+const LINK_B37_SHARDS: usize = 64;
 const BUILD_TAG_MASK: u32 = 0xFFF0_0000;
 const BUILD_IDX_MASK: u32 = 0x000F_FFFF;
-const REM37_MASK: u64 = (1u64 << 37) - 1;
+const REM36_MASK: u64 = (1u64 << 36) - 1;
+const GROUP_LANES: usize = 6;
 
 #[derive(Clone, Copy)]
-#[repr(C)]
-struct LinkSlotB37 {
-    key_p1: u64, // (h42 & REM37_MASK) + 1; 0 = empty
-    canon: CompactKey64,
+#[repr(C, align(64))]
+struct LinkGroup64 {
+    keys: [u32; GROUP_LANES],    // 24B: (rem36 & 0x7FFF_FFFF) as u32 + 1 (0 = empty)
+    vals_lo: [u32; GROUP_LANES], // 24B: canon low 32 bits (uh42 low32 or comp_id)
+    vals_hi: [u16; GROUP_LANES], // 12B: bits 11..15 = top5 (rem36 >> 31), bit 10 = is_comp, bits 0..9 = uh42 bits 32..41
+    ovf: u32,                    //  4B: non-zero when probing must continue to next group
 }
 
-const _: () = assert!(std::mem::size_of::<LinkSlotB37>() == 16);
-unsafe impl Zeroable for LinkSlotB37 {}
+const _: () = assert!(std::mem::size_of::<LinkGroup64>() == 64);
+const _: () = assert!(std::mem::align_of::<LinkGroup64>() == 64);
+unsafe impl Zeroable for LinkGroup64 {}
+
+#[inline(always)]
+fn encode_b37_canon(canon: CompactKey64) -> (u32, u16) {
+    if canon.is_comp() {
+        (canon.comp_id(), 1u16 << 10)
+    } else {
+        debug_assert!(canon.is_uh42());
+        let h42 = canon.uh42_val();
+        (h42 as u32, (h42 >> 32) as u16)
+    }
+}
+
+#[inline(always)]
+fn decode_b37_canon(v_lo: u32, vh: u16) -> CompactKey64 {
+    if (vh & (1 << 10)) != 0 {
+        CompactKey64::from_comp(v_lo)
+    } else {
+        CompactKey64::from_uh42((((vh & 0x3FF) as u64) << 32) | (v_lo as u64))
+    }
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -89,8 +114,8 @@ pub struct LinkMap {
     bloom: HugeBuf<u64>,
     bloom_shift: u32,
     bloom_sub_mask: usize,
-    slots_b37: HugeBuf<LinkSlotB37>,
-    seg_cap: usize,
+    groups_b37: HugeBuf<LinkGroup64>,
+    seg_groups: usize,
     bloom_hex: HugeBuf<u64>,
     bloom_hex_shift: u32,
     bloom_hex_sub_mask: usize,
@@ -112,8 +137,8 @@ impl LinkMap {
             bloom: HugeBuf::default(),
             bloom_shift: 0,
             bloom_sub_mask: 0,
-            slots_b37: HugeBuf::default(),
-            seg_cap: 0,
+            groups_b37: HugeBuf::default(),
+            seg_groups: 0,
             bloom_hex: HugeBuf::default(),
             bloom_hex_shift: 0,
             bloom_hex_sub_mask: 0,
@@ -138,7 +163,7 @@ impl LinkMap {
     pub fn debug_stats(&self) -> (usize, usize, usize, usize) {
         (
             self.bloom.len() * std::mem::size_of::<u64>(),
-            self.slots_b37.len() * std::mem::size_of::<LinkSlotB37>(),
+            self.groups_b37.len() * std::mem::size_of::<LinkGroup64>(),
             self.bloom_hex.len() * std::mem::size_of::<u64>(),
             self.slots_hex.len() * std::mem::size_of::<LinkSlotHex>(),
         )
@@ -146,7 +171,7 @@ impl LinkMap {
 
     #[inline(always)]
     fn bloom_idx(&self, h42: u64) -> usize {
-        let s = (h42 >> 37) as usize;
+        let s = (h42 >> 36) as usize;
         (s << self.bloom_shift) | (((h42 >> 23) as usize) & self.bloom_sub_mask)
     }
 
@@ -178,16 +203,16 @@ impl LinkMap {
 
     #[inline(always)]
     pub fn prefetch_slot_b37(&self, h42: u64) {
-        if self.empty || self.seg_cap == 0 {
+        if self.empty || self.seg_groups == 0 {
             return;
         }
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let s = (h42 >> 37) as usize;
-            let rem37 = h42 & REM37_MASK;
-            let pos = fast_range32(rem37, self.seg_cap);
+            let s = (h42 >> 36) as usize;
+            let rem36 = h42 & REM36_MASK;
+            let g = fast_range32(rem36, self.seg_groups);
             std::arch::x86_64::_mm_prefetch(
-                self.slots_b37.as_ptr().add(s * self.seg_cap + pos) as *const i8,
+                self.groups_b37.as_ptr().add(s * self.seg_groups + g) as *const i8,
                 std::arch::x86_64::_MM_HINT_T0,
             );
         }
@@ -195,26 +220,61 @@ impl LinkMap {
 
     #[inline(always)]
     pub fn probe_b37(&self, h42: u64) -> Option<CompactKey64> {
-        if self.empty || self.seg_cap == 0 {
+        if self.empty || self.seg_groups == 0 {
             return None;
         }
-        let s = (h42 >> 37) as usize;
-        let rem37 = h42 & REM37_MASK;
-        let key_p1 = rem37 + 1;
-        let seg_cap = self.seg_cap;
-        let base = s * seg_cap;
-        let mut slot = fast_range32(rem37, seg_cap);
+        let s = (h42 >> 36) as usize;
+        let rem36 = h42 & REM36_MASK;
+        let k31_p1 = ((rem36 & 0x7FFF_FFFF) as u32) + 1;
+        let top5 = (rem36 >> 31) as u16;
+        let seg_groups = self.seg_groups;
+        let base = s * seg_groups;
+        let mut g = fast_range32(rem36, seg_groups);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            debug_assert_eq!((self.groups_b37.as_ptr() as usize) & 63, 0);
+            let target = _mm256_set1_epi32(k31_p1 as i32);
+            loop {
+                let grp = &*self.groups_b37.as_ptr().add(base + g);
+                let v = _mm256_load_si256(grp.keys.as_ptr() as *const __m256i);
+                let eq = _mm256_cmpeq_epi32(v, target);
+                let mut m = (_mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32) & 0x3F;
+                while m != 0 {
+                    let lane = m.trailing_zeros() as usize;
+                    let vh = *grp.vals_hi.get_unchecked(lane);
+                    if (vh >> 11) == top5 {
+                        return Some(decode_b37_canon(*grp.vals_lo.get_unchecked(lane), vh));
+                    }
+                    m &= m - 1;
+                }
+                if grp.ovf == 0 {
+                    return None;
+                }
+                g += 1;
+                if g == seg_groups {
+                    g = 0;
+                }
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         loop {
-            let cur = unsafe { *self.slots_b37.get_unchecked(base + slot) };
-            if cur.key_p1 == 0 {
+            let grp = unsafe { &*self.groups_b37.as_ptr().add(base + g) };
+            for lane in 0..GROUP_LANES {
+                let k = grp.keys[lane];
+                if k == 0 {
+                    return None;
+                }
+                if k == k31_p1 && (grp.vals_hi[lane] >> 11) == top5 {
+                    return Some(decode_b37_canon(grp.vals_lo[lane], grp.vals_hi[lane]));
+                }
+            }
+            if grp.ovf == 0 {
                 return None;
             }
-            if cur.key_p1 == key_p1 {
-                return Some(cur.canon);
-            }
-            slot += 1;
-            if slot == seg_cap {
-                slot = 0;
+            g += 1;
+            if g == seg_groups {
+                g = 0;
             }
         }
     }
@@ -326,8 +386,8 @@ impl LinkMap {
 
     pub fn drop_lookup_tables(&mut self) {
         self.bloom = HugeBuf::default();
-        self.slots_b37 = HugeBuf::default();
-        self.seg_cap = 0;
+        self.groups_b37 = HugeBuf::default();
+        self.seg_groups = 0;
         self.bloom_hex = HugeBuf::default();
         self.slots_hex = HugeBuf::default();
         self.hex_seg_cap = 0;
@@ -1073,18 +1133,18 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     let has_long = !long_map.is_empty();
     drop(worker_arenas);
 
-    // Stage L5: partition non-root b37/other inline nodes AND all linked HexRef nodes into 32 shards.
+    // Stage L5: partition non-root b37 (64 shards)/other inline nodes AND all linked HexRef nodes (32 shards).
     let par_workers = if num_inline < 16_384 { 1 } else { n_threads };
     let chunk_sz = ((num_inline + par_workers - 1) / par_workers).max(1);
     let partition_range = |lo: usize,
                            hi: usize|
      -> (
-        Vec<Vec<LinkSlotB37>>,
+        Vec<Vec<(u64, CompactKey64)>>,
         Vec<Vec<LinkSlotHex>>,
         Vec<(CompactKey64, CompactKey64)>,
     ) {
-        let mut b37_segs: Vec<Vec<LinkSlotB37>> =
-            (0..LINK_SHARDS).map(|_| Vec::new()).collect();
+        let mut b37_segs: Vec<Vec<(u64, CompactKey64)>> =
+            (0..LINK_B37_SHARDS).map(|_| Vec::new()).collect();
         let mut hex_segs: Vec<Vec<LinkSlotHex>> =
             (0..LINK_SHARDS).map(|_| Vec::new()).collect();
         let mut others: Vec<(CompactKey64, CompactKey64)> = Vec::new();
@@ -1108,12 +1168,9 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             }
             if k.is_ub37() {
                 let h42 = biject42(k.ub37_val());
-                let s = (h42 >> 37) as usize;
-                let rem37 = h42 & REM37_MASK;
-                b37_segs[s].push(LinkSlotB37 {
-                    key_p1: rem37 + 1,
-                    canon,
-                });
+                let s = (h42 >> 36) as usize;
+                let rem36 = h42 & REM36_MASK;
+                b37_segs[s].push((rem36, canon));
             } else {
                 others.push((k, canon));
             }
@@ -1126,7 +1183,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     } else {
         let mut outs: Vec<
             Option<(
-                Vec<Vec<LinkSlotB37>>,
+                Vec<Vec<(u64, CompactKey64)>>,
                 Vec<Vec<LinkSlotHex>>,
                 Vec<(CompactKey64, CompactKey64)>,
             )>,
@@ -1149,20 +1206,36 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     drop(all_nodes);
     drop(worker_hex);
 
-    let mut shard_b37_inputs: Vec<Vec<Vec<LinkSlotB37>>> = (0..LINK_SHARDS)
+    let mut shard_b37_inputs: Vec<Vec<Vec<(u64, CompactKey64)>>> = (0..LINK_B37_SHARDS)
         .map(|_| Vec::with_capacity(par_workers))
         .collect();
     let mut shard_hex_inputs: Vec<Vec<Vec<LinkSlotHex>>> = (0..LINK_SHARDS)
         .map(|_| Vec::with_capacity(par_workers))
         .collect();
     let mut other_map: HashMap<CompactKey64, CompactKey64> = HashMap::new();
+    let mut inline_root_remap: HashMap<u64, CompactKey64> = HashMap::new();
     let mut b37_total = 0usize;
     let mut hex_total = 0usize;
-    for (w_b37, w_hex, w_others) in part_outs {
-        for (s, v) in w_b37.into_iter().enumerate() {
+    for (mut w_b37, w_hex, w_others) in part_outs {
+        for (s, v) in w_b37.iter_mut().enumerate() {
             if !v.is_empty() {
+                for &mut (_, ref mut canon) in v.iter_mut() {
+                    if !canon.is_uh42() && !canon.is_comp() {
+                        *canon = *inline_root_remap.entry(canon.0).or_insert_with(|| {
+                            let mut ibuf = [0u8; 10];
+                            let len = canon.decode_inline(&mut ibuf);
+                            let span_idx = canon_spans.len();
+                            let off = canon_arena.len() as u32;
+                            canon_arena.extend_from_slice(&ibuf[..len]);
+                            canon_spans.push((off, len as u32));
+                            let cid = canon_hex.len() + span_idx;
+                            assert!(cid < (u32::MAX as usize), "too many canonical link components");
+                            CompactKey64::from_comp(cid as u32)
+                        });
+                    }
+                }
                 b37_total += v.len();
-                shard_b37_inputs[s].push(v);
+                shard_b37_inputs[s].push(std::mem::take(v));
             }
         }
         for (s, v) in w_hex.into_iter().enumerate() {
@@ -1175,9 +1248,33 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             other_map.insert(k, canon);
         }
     }
+    if !inline_root_remap.is_empty() {
+        for v in other_map.values_mut() {
+            if let Some(&c) = inline_root_remap.get(&v.0) {
+                *v = c;
+            }
+        }
+        for (&orig_k, &comp_c) in &inline_root_remap {
+            other_map.insert(CompactKey64(orig_k), comp_c);
+        }
+        for v in long_map.values_mut() {
+            if let Some(&c) = inline_root_remap.get(&v.0) {
+                *v = c;
+            }
+        }
+        for batches in &mut shard_hex_inputs {
+            for batch in batches {
+                for e in batch {
+                    if let Some(&c) = inline_root_remap.get(&e.canon.0) {
+                        e.canon = c;
+                    }
+                }
+            }
+        }
+    }
     let has_other = !other_map.is_empty();
 
-    let (bloom, bloom_shift, bloom_sub_mask, slots_b37, seg_cap) = if b37_total == 0 {
+    let (bloom, bloom_shift, bloom_sub_mask, groups_b37, seg_groups) = if b37_total == 0 {
         (HugeBuf::default(), 0, 0, HugeBuf::default(), 0)
     } else {
         let max_m = shard_b37_inputs
@@ -1185,74 +1282,88 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
             .map(|batches| batches.iter().map(Vec::len).sum::<usize>())
             .max()
             .unwrap_or(0);
-        // 70% load factor for compact L3 footprint with short linear probe chains.
-        let seg_cap = ((max_m * 10 + 6) / 7).max(max_m + 1).max(2);
-        let mut slots_b37 = HugeBuf::<LinkSlotB37>::new_zeroed(LINK_SHARDS * seg_cap);
+        // 74% target load across 6-lane 64B cache-line groups, guaranteeing >= 2 free lanes for termination.
+        let seg_groups = ((max_m * 100 + 443) / 444).max(max_m / GROUP_LANES + 2);
+        let mut groups_b37 = HugeBuf::<LinkGroup64>::new_zeroed(LINK_B37_SHARDS * seg_groups);
 
         let total_words = (b37_total / 7)
-            .max(64)
+            .max(128)
             .next_power_of_two()
             .min(262_144);
-        let words_per_shard = (total_words / LINK_SHARDS).max(2);
+        let words_per_shard = (total_words / LINK_B37_SHARDS).max(2);
         let bloom_shift = words_per_shard.trailing_zeros();
         let bloom_sub_mask = words_per_shard - 1;
-        let mut bloom = HugeBuf::<u64>::new_zeroed(LINK_SHARDS * words_per_shard);
+        let mut bloom = HugeBuf::<u64>::new_zeroed(LINK_B37_SHARDS * words_per_shard);
 
-        let fill_b37_shard =
-            |seg_slots: &mut [LinkSlotB37], bloom_slice: &mut [u64], batches: Vec<Vec<LinkSlotB37>>| {
-                for batch in batches {
-                    for entry in batch {
-                        let rem37 = entry.key_p1 - 1;
-                        let widx = ((rem37 >> 23) as usize) & bloom_sub_mask;
-                        bloom_slice[widx] |= bloom_bits(rem37);
-                        let mut pos = fast_range32(rem37, seg_cap);
-                        while seg_slots[pos].key_p1 != 0 {
-                            pos += 1;
-                            if pos == seg_cap {
-                                pos = 0;
+        let fill_b37_shard = |seg_grps: &mut [LinkGroup64],
+                              bloom_slice: &mut [u64],
+                              batches: Vec<Vec<(u64, CompactKey64)>>| {
+            for batch in batches {
+                for (rem36, canon) in batch {
+                    let widx = ((rem36 >> 23) as usize) & bloom_sub_mask;
+                    bloom_slice[widx] |= bloom_bits(rem36);
+                    let k31_p1 = ((rem36 & 0x7FFF_FFFF) as u32) + 1;
+                    let top5 = (rem36 >> 31) as u16;
+                    let (v_lo, v_hi_canon) = encode_b37_canon(canon);
+                    let vh = (top5 << 11) | v_hi_canon;
+                    let mut g = fast_range32(rem36, seg_groups);
+                    'insert: loop {
+                        let grp = &mut seg_grps[g];
+                        for lane in 0..GROUP_LANES {
+                            if grp.keys[lane] == 0 {
+                                grp.keys[lane] = k31_p1;
+                                grp.vals_lo[lane] = v_lo;
+                                grp.vals_hi[lane] = vh;
+                                break 'insert;
                             }
                         }
-                        seg_slots[pos] = entry;
+                        grp.ovf = 1;
+                        g += 1;
+                        if g == seg_groups {
+                            g = 0;
+                        }
                     }
                 }
-            };
+            }
+        };
 
         if n_threads == 1 {
-            for ((seg_slots, bloom_slice), batches) in slots_b37
-                .chunks_exact_mut(seg_cap)
+            for ((seg_grps, bloom_slice), batches) in groups_b37
+                .chunks_exact_mut(seg_groups)
                 .zip(bloom.chunks_exact_mut(words_per_shard))
                 .zip(shard_b37_inputs.into_iter())
             {
-                fill_b37_shard(seg_slots, bloom_slice, batches);
+                fill_b37_shard(seg_grps, bloom_slice, batches);
             }
         } else {
-            let tasks: Vec<Mutex<Option<(&mut [LinkSlotB37], &mut [u64], Vec<Vec<LinkSlotB37>>)>>> =
-                slots_b37
-                    .chunks_exact_mut(seg_cap)
-                    .zip(bloom.chunks_exact_mut(words_per_shard))
-                    .zip(shard_b37_inputs.into_iter())
-                    .map(|((a, b), c)| Mutex::new(Some((a, b, c))))
-                    .collect();
+            let tasks: Vec<
+                Mutex<Option<(&mut [LinkGroup64], &mut [u64], Vec<Vec<(u64, CompactKey64)>>)>>,
+            > = groups_b37
+                .chunks_exact_mut(seg_groups)
+                .zip(bloom.chunks_exact_mut(words_per_shard))
+                .zip(shard_b37_inputs.into_iter())
+                .map(|((a, b), c)| Mutex::new(Some((a, b, c))))
+                .collect();
             let next_s = AtomicUsize::new(0);
-            let fw = n_threads.min(LINK_SHARDS);
+            let fw = n_threads.min(LINK_B37_SHARDS);
             std::thread::scope(|scope| {
                 let tasks_ref = &tasks;
                 let next_ref = &next_s;
                 for _ in 0..fw {
                     scope.spawn(move || loop {
                         let s = next_ref.fetch_add(1, Ordering::Relaxed);
-                        if s >= LINK_SHARDS {
+                        if s >= LINK_B37_SHARDS {
                             break;
                         }
-                        let (seg_slots, bloom_slice, batches) =
+                        let (seg_grps, bloom_slice, batches) =
                             tasks_ref[s].lock().unwrap().take().unwrap();
-                        fill_b37_shard(seg_slots, bloom_slice, batches);
+                        fill_b37_shard(seg_grps, bloom_slice, batches);
                     });
                 }
             });
         }
 
-        (bloom, bloom_shift, bloom_sub_mask, slots_b37, seg_cap)
+        (bloom, bloom_shift, bloom_sub_mask, groups_b37, seg_groups)
     };
 
     let (bloom_hex, bloom_hex_shift, bloom_hex_sub_mask, slots_hex, hex_seg_cap) = if hex_total == 0
@@ -1342,13 +1453,13 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
         )
     };
 
-    let any_active = !slots_b37.is_empty() || !slots_hex.is_empty() || has_other || has_long;
+    let any_active = !groups_b37.is_empty() || !slots_hex.is_empty() || has_other || has_long;
     Ok(LinkMap {
         bloom,
         bloom_shift,
         bloom_sub_mask,
-        slots_b37,
-        seg_cap,
+        groups_b37,
+        seg_groups,
         bloom_hex,
         bloom_hex_shift,
         bloom_hex_sub_mask,
@@ -1564,6 +1675,47 @@ mod tests {
                 h_root_str.as_bytes()
             );
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_link_group64_overflow_and_inline_root() {
+        let dir = std::env::temp_dir().join("ss_test_links_grp64_ovf");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Force multi-group overflow within shards + inline root ("!z") smaller than 'u*'
+        let mut content = String::from("user_id_a,user_id_b\n");
+        for i in 1..=2200 {
+            content.push_str(&format!("u{i},!z\n"));
+        }
+        for i in 5000..5200 {
+            content.push_str(&format!("u{i},u0\n"));
+        }
+        let p = dir.join("part-0.csv");
+        fs::write(&p, content).unwrap();
+
+        let lm = build_link_map(&[p], 4).unwrap();
+        let mut scratch = [0u8; 40];
+        let mut pad = [0u8; 32];
+        for i in 1..=2200 {
+            let s = format!("u{i}");
+            pad[..s.len()].copy_from_slice(s.as_bytes());
+            let h = biject42(encode_b37_padded(&pad, 0, s.len(), b'u').unwrap());
+            let canon = lm.probe_b37(h).expect("inline root member must hit");
+            assert_eq!(resolve_canon_for_test(&lm, canon, &mut scratch), b"!z");
+        }
+        let h_u0 = biject42(encode_b37_padded(b"u0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 0, 2, b'u').unwrap());
+        assert_eq!(lm.probe_b37(h_u0), None);
+        for i in 5000..5200 {
+            let s = format!("u{i}");
+            pad[..s.len()].copy_from_slice(s.as_bytes());
+            let h = biject42(encode_b37_padded(&pad, 0, s.len(), b'u').unwrap());
+            let canon = lm.probe_b37(h).expect("u0 member must hit");
+            assert_eq!(resolve_canon_for_test(&lm, canon, &mut scratch), b"u0");
+        }
+        let h_miss = biject42(encode_b37_padded(b"umiss99\0\0\0\0\0\0\0\0\0", 0, 7, b'u').unwrap());
+        assert_eq!(lm.probe_b37(h_miss), None);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
