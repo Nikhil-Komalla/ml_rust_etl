@@ -210,6 +210,7 @@ const _: () = assert!(std::mem::size_of::<PersonEventWide>() == 24);
 const CL_TAG_SHIFT: u32 = 62;
 const CL_UB37: u64 = 0u64 << CL_TAG_SHIFT;
 const CL_EXT: u64 = 1u64 << CL_TAG_SHIFT;
+const CL_UCOMP: u64 = 2u64 << CL_TAG_SHIFT;
 const CL_TAG_MASK: u64 = 3u64 << CL_TAG_SHIFT;
 const CL_REM37_MASK: u64 = (1u64 << 37) - 1;
 
@@ -292,6 +293,13 @@ struct DayRange {
     day: i32,
     lo_idx: u32,
     hi_idx: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct ActiveCamp {
+    cnt: u32,
+    enter_idx: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1109,8 +1117,15 @@ trait Stage5Event: Copy + Send + Sync {
 trait Stage5Click: Copy + Send + Sync {
     type Grouped: Copy + Send;
     fn click_person(&self, cl_ext: &[Vec<ExtClick>]) -> ClickPerson;
+    #[inline(always)]
+    fn prefetch_ext(&self, _cl_ext: &[Vec<ExtClick>]) {}
     fn to_grouped(&self, cl_ext: &[Vec<ExtClick>]) -> Self::Grouped;
-    fn sort_grouped(slice: &mut [Self::Grouped]);
+    fn sort_grouped(
+        slice: &mut [Self::Grouped],
+        keys_buf: &mut Vec<u64>,
+        tmp_buf: &mut Vec<Self::Grouped>,
+        radix_scratch: &mut Vec<u64>,
+    );
     fn unpack_full(g: &Self::Grouped) -> (i64, u32, CompactKey64);
     fn within_reach(sess_cmp: i64, click_cmp: i64) -> bool;
 }
@@ -3675,7 +3690,13 @@ impl ClickEmit for PersonClick16 {
             return;
         }
         if canon.is_uh42() {
-            self.w0 = CL_UB37 | (self.w0 & !CL_REM37_MASK) | (canon.uh42_val() & CL_REM37_MASK);
+            self.w0 = CL_UB37
+                | (self.w0 & !CL_TAG_MASK & !CL_REM37_MASK)
+                | (canon.uh42_val() & CL_REM37_MASK);
+        } else if canon.is_comp() {
+            self.w0 = CL_UCOMP
+                | (self.w0 & !CL_TAG_MASK & !CL_REM37_MASK)
+                | (canon.comp_id() as u64);
         } else {
             let ts_rel_ms =
                 ((((self.w0 >> 37) & 0x1FF) << 22) | ((self.w1 >> 42) & 0x3F_FFFF)) as u32;
@@ -5639,6 +5660,273 @@ fn sort_u64_radix21_fixup(slice: &mut [u64], scratch: &mut Vec<u64>) {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod avx2_sort {
+    use std::arch::x86_64::*;
+
+    #[repr(align(32))]
+    struct Aligned16([u64; 16]);
+    #[repr(align(32))]
+    struct Aligned32([u64; 32]);
+    #[repr(align(32))]
+    struct Aligned64([u64; 64]);
+
+    #[inline(always)]
+    unsafe fn minmax4_i64(a: __m256i, b: __m256i) -> (__m256i, __m256i) {
+        let gt = _mm256_cmpgt_epi64(a, b);
+        (_mm256_blendv_epi8(a, b, gt), _mm256_blendv_epi8(b, a, gt))
+    }
+
+    #[inline(always)]
+    unsafe fn rev4(v: __m256i) -> __m256i {
+        _mm256_permute4x64_epi64::<0x1B>(v)
+    }
+
+    #[inline(always)]
+    unsafe fn sort4_reg(v: __m256i) -> __m256i {
+        let s1 = _mm256_permute4x64_epi64::<0xB1>(v);
+        let (lo, hi) = minmax4_i64(v, s1);
+        let v1 = _mm256_blend_epi32::<0xCC>(lo, hi);
+
+        let s2 = _mm256_permute4x64_epi64::<0x1B>(v1);
+        let (lo, hi) = minmax4_i64(v1, s2);
+        let v2 = _mm256_blend_epi32::<0xF0>(lo, hi);
+
+        let s3 = _mm256_permute4x64_epi64::<0xB1>(v2);
+        let (lo, hi) = minmax4_i64(v2, s3);
+        _mm256_blend_epi32::<0xCC>(lo, hi)
+    }
+
+    #[inline(always)]
+    unsafe fn bitonic4_finish(v: __m256i) -> __m256i {
+        let s2 = _mm256_permute4x64_epi64::<0x4E>(v);
+        let (lo, hi) = minmax4_i64(v, s2);
+        let v1 = _mm256_blend_epi32::<0xF0>(lo, hi);
+
+        let s1 = _mm256_permute4x64_epi64::<0xB1>(v1);
+        let (lo, hi) = minmax4_i64(v1, s1);
+        _mm256_blend_epi32::<0xCC>(lo, hi)
+    }
+
+    #[inline(always)]
+    unsafe fn merge8(a: __m256i, b: __m256i) -> [__m256i; 2] {
+        let (lo, hi) = minmax4_i64(a, rev4(b));
+        [bitonic4_finish(lo), bitonic4_finish(hi)]
+    }
+
+    #[inline(always)]
+    unsafe fn sort8_reg(x0: __m256i, x1: __m256i) -> [__m256i; 2] {
+        merge8(sort4_reg(x0), sort4_reg(x1))
+    }
+
+    #[inline(always)]
+    unsafe fn bitonic8_finish(x0: __m256i, x1: __m256i) -> [__m256i; 2] {
+        let (y0, y1) = minmax4_i64(x0, x1);
+        [bitonic4_finish(y0), bitonic4_finish(y1)]
+    }
+
+    #[inline(always)]
+    unsafe fn merge16(a: [__m256i; 2], b: [__m256i; 2]) -> [__m256i; 4] {
+        let (lo0, hi0) = minmax4_i64(a[0], rev4(b[1]));
+        let (lo1, hi1) = minmax4_i64(a[1], rev4(b[0]));
+        let l = bitonic8_finish(lo0, lo1);
+        let h = bitonic8_finish(hi0, hi1);
+        [l[0], l[1], h[0], h[1]]
+    }
+
+    #[inline(always)]
+    unsafe fn sort16_reg(x: [__m256i; 4]) -> [__m256i; 4] {
+        merge16(sort8_reg(x[0], x[1]), sort8_reg(x[2], x[3]))
+    }
+
+    #[inline(always)]
+    unsafe fn bitonic16_finish(x: [__m256i; 4]) -> [__m256i; 4] {
+        let (y0, y2) = minmax4_i64(x[0], x[2]);
+        let (y1, y3) = minmax4_i64(x[1], x[3]);
+        let l = bitonic8_finish(y0, y1);
+        let h = bitonic8_finish(y2, y3);
+        [l[0], l[1], h[0], h[1]]
+    }
+
+    #[inline(always)]
+    unsafe fn merge32(a: [__m256i; 4], b: [__m256i; 4]) -> [__m256i; 8] {
+        let (lo0, hi0) = minmax4_i64(a[0], rev4(b[3]));
+        let (lo1, hi1) = minmax4_i64(a[1], rev4(b[2]));
+        let (lo2, hi2) = minmax4_i64(a[2], rev4(b[1]));
+        let (lo3, hi3) = minmax4_i64(a[3], rev4(b[0]));
+        let l = bitonic16_finish([lo0, lo1, lo2, lo3]);
+        let h = bitonic16_finish([hi0, hi1, hi2, hi3]);
+        [l[0], l[1], l[2], l[3], h[0], h[1], h[2], h[3]]
+    }
+
+    #[inline(always)]
+    unsafe fn sort32_reg(x: [__m256i; 8]) -> [__m256i; 8] {
+        merge32(
+            sort16_reg([x[0], x[1], x[2], x[3]]),
+            sort16_reg([x[4], x[5], x[6], x[7]]),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn bitonic32_finish(x: [__m256i; 8]) -> [__m256i; 8] {
+        let (y0, y4) = minmax4_i64(x[0], x[4]);
+        let (y1, y5) = minmax4_i64(x[1], x[5]);
+        let (y2, y6) = minmax4_i64(x[2], x[6]);
+        let (y3, y7) = minmax4_i64(x[3], x[7]);
+        let l = bitonic16_finish([y0, y1, y2, y3]);
+        let h = bitonic16_finish([y4, y5, y6, y7]);
+        [l[0], l[1], l[2], l[3], h[0], h[1], h[2], h[3]]
+    }
+
+    #[inline(always)]
+    unsafe fn merge64(a: [__m256i; 8], b: [__m256i; 8]) -> [__m256i; 16] {
+        let (lo0, hi0) = minmax4_i64(a[0], rev4(b[7]));
+        let (lo1, hi1) = minmax4_i64(a[1], rev4(b[6]));
+        let (lo2, hi2) = minmax4_i64(a[2], rev4(b[5]));
+        let (lo3, hi3) = minmax4_i64(a[3], rev4(b[4]));
+        let (lo4, hi4) = minmax4_i64(a[4], rev4(b[3]));
+        let (lo5, hi5) = minmax4_i64(a[5], rev4(b[2]));
+        let (lo6, hi6) = minmax4_i64(a[6], rev4(b[1]));
+        let (lo7, hi7) = minmax4_i64(a[7], rev4(b[0]));
+        let l = bitonic32_finish([lo0, lo1, lo2, lo3, lo4, lo5, lo6, lo7]);
+        let h = bitonic32_finish([hi0, hi1, hi2, hi3, hi4, hi5, hi6, hi7]);
+        [
+            l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], h[0], h[1], h[2], h[3], h[4], h[5],
+            h[6], h[7],
+        ]
+    }
+
+    #[inline(always)]
+    unsafe fn sort64_reg(x: [__m256i; 16]) -> [__m256i; 16] {
+        merge64(
+            sort32_reg([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]]),
+            sort32_reg([x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15]]),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn store_prefix<const N_VEC: usize>(slice: &mut [u64], s: &[__m256i; N_VEC]) {
+        let n = slice.len();
+        let out = slice.as_mut_ptr();
+        let full = n >> 2;
+        for i in 0..full {
+            _mm256_storeu_si256((out as *mut __m256i).add(i), s[i]);
+        }
+        let rem = n & 3;
+        if rem != 0 {
+            let mut tail = [0u64; 4];
+            _mm256_storeu_si256(tail.as_mut_ptr() as *mut __m256i, s[full]);
+            std::ptr::copy_nonoverlapping(tail.as_ptr(), out.add(full << 2), rem);
+        }
+    }
+
+    #[inline(never)]
+    pub unsafe fn sort_u64_avx2_16(slice: &mut [u64]) {
+        let n = slice.len();
+        debug_assert!((9..=16).contains(&n));
+        let mut buf = Aligned16([0x7FFF_FFFF_FFFF_FFFFu64; 16]);
+        std::ptr::copy_nonoverlapping(slice.as_ptr(), buf.0.as_mut_ptr(), n);
+        let p = buf.0.as_ptr() as *const __m256i;
+        let s = sort16_reg([
+            _mm256_load_si256(p),
+            _mm256_load_si256(p.add(1)),
+            _mm256_load_si256(p.add(2)),
+            _mm256_load_si256(p.add(3)),
+        ]);
+        store_prefix(slice, &s);
+    }
+
+    #[inline(never)]
+    pub unsafe fn sort_u64_avx2_32(slice: &mut [u64]) {
+        let n = slice.len();
+        debug_assert!((17..=32).contains(&n));
+        let mut buf = Aligned32([0x7FFF_FFFF_FFFF_FFFFu64; 32]);
+        std::ptr::copy_nonoverlapping(slice.as_ptr(), buf.0.as_mut_ptr(), n);
+        let p = buf.0.as_ptr() as *const __m256i;
+        let s = sort32_reg([
+            _mm256_load_si256(p),
+            _mm256_load_si256(p.add(1)),
+            _mm256_load_si256(p.add(2)),
+            _mm256_load_si256(p.add(3)),
+            _mm256_load_si256(p.add(4)),
+            _mm256_load_si256(p.add(5)),
+            _mm256_load_si256(p.add(6)),
+            _mm256_load_si256(p.add(7)),
+        ]);
+        store_prefix(slice, &s);
+    }
+
+    #[inline(never)]
+    pub unsafe fn sort_u64_avx2_64(slice: &mut [u64]) {
+        let n = slice.len();
+        debug_assert!((33..=64).contains(&n));
+        let mut buf = Aligned64([0x7FFF_FFFF_FFFF_FFFFu64; 64]);
+        std::ptr::copy_nonoverlapping(slice.as_ptr(), buf.0.as_mut_ptr(), n);
+        let p = buf.0.as_ptr() as *const __m256i;
+        let s = sort64_reg([
+            _mm256_load_si256(p),
+            _mm256_load_si256(p.add(1)),
+            _mm256_load_si256(p.add(2)),
+            _mm256_load_si256(p.add(3)),
+            _mm256_load_si256(p.add(4)),
+            _mm256_load_si256(p.add(5)),
+            _mm256_load_si256(p.add(6)),
+            _mm256_load_si256(p.add(7)),
+            _mm256_load_si256(p.add(8)),
+            _mm256_load_si256(p.add(9)),
+            _mm256_load_si256(p.add(10)),
+            _mm256_load_si256(p.add(11)),
+            _mm256_load_si256(p.add(12)),
+            _mm256_load_si256(p.add(13)),
+            _mm256_load_si256(p.add(14)),
+            _mm256_load_si256(p.add(15)),
+        ]);
+        store_prefix(slice, &s);
+    }
+
+    #[inline(never)]
+    pub fn sort_u64_avx2_65_to_128(slice: &mut [u64], scratch: &mut Vec<u64>) {
+        let n = slice.len();
+        debug_assert!((65..=128).contains(&n));
+        unsafe {
+            sort_u64_avx2_64(&mut slice[..64]);
+        }
+        <super::PersonEvent16 as super::Stage5Event>::sort_grouped(&mut slice[64..n], scratch);
+        if scratch.len() < n {
+            scratch.resize(n, 0);
+        }
+        let tmp = &mut scratch[..n];
+        let mut i = 0usize;
+        let mut j = 64usize;
+        let mut k = 0usize;
+        unsafe {
+            while i < 64 && j < n {
+                let a = *slice.get_unchecked(i);
+                let b = *slice.get_unchecked(j);
+                if a <= b {
+                    *tmp.get_unchecked_mut(k) = a;
+                    i += 1;
+                } else {
+                    *tmp.get_unchecked_mut(k) = b;
+                    j += 1;
+                }
+                k += 1;
+            }
+            while i < 64 {
+                *tmp.get_unchecked_mut(k) = *slice.get_unchecked(i);
+                i += 1;
+                k += 1;
+            }
+            while j < n {
+                *tmp.get_unchecked_mut(k) = *slice.get_unchecked(j);
+                j += 1;
+                k += 1;
+            }
+        }
+        slice.copy_from_slice(tmp);
+    }
+}
+
 impl Stage5Event for PersonEvent16 {
     const FAST_DAY_BOUND: bool = true;
     type Grouped = u64;
@@ -5687,13 +5975,41 @@ impl Stage5Event for PersonEvent16 {
             sort_u64_8(slice);
             return;
         }
-        if n <= 24 {
-            insertion_sort_u64(slice);
-            return;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            if n <= 16 {
+                unsafe {
+                    avx2_sort::sort_u64_avx2_16(slice);
+                }
+                return;
+            }
+            if n <= 32 {
+                unsafe {
+                    avx2_sort::sort_u64_avx2_32(slice);
+                }
+                return;
+            }
+            if n <= 64 {
+                unsafe {
+                    avx2_sort::sort_u64_avx2_64(slice);
+                }
+                return;
+            }
+            if n <= 128 {
+                avx2_sort::sort_u64_avx2_65_to_128(slice, scratch);
+                return;
+            }
         }
-        if n < 256 {
-            slice.sort_unstable();
-            return;
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            if n <= 24 {
+                insertion_sort_u64(slice);
+                return;
+            }
+            if n < 256 {
+                slice.sort_unstable();
+                return;
+            }
         }
         if n < 2048 {
             sort_u64_bucket256(slice, scratch);
@@ -5786,8 +6102,11 @@ impl Stage5Click for PersonClick16 {
 
     #[inline(always)]
     fn click_person(&self, _cl_ext: &[Vec<ExtClick>]) -> ClickPerson {
-        if (self.w0 & CL_TAG_MASK) == CL_UB37 {
+        let tag = self.w0 & CL_TAG_MASK;
+        if tag == CL_UB37 {
             ClickPerson::Uh42Rem(self.w0 & CL_REM37_MASK)
+        } else if tag == CL_UCOMP {
+            ClickPerson::Gen(CompactKey64::from_comp((self.w0 & CL_REM37_MASK) as u32))
         } else {
             let pk = CompactKey64(self.w1);
             if pk.is_uh42() {
@@ -5799,8 +6118,24 @@ impl Stage5Click for PersonClick16 {
     }
 
     #[inline(always)]
+    fn prefetch_ext(&self, cl_ext: &[Vec<ExtClick>]) {
+        if (self.w0 & CL_TAG_MASK) == CL_EXT {
+            let payload = self.w0 & !CL_TAG_MASK;
+            let wid = (payload >> 40) as usize;
+            let idx = (payload & PE_EXT_IDX_MASK) as usize;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    cl_ext.get_unchecked(wid).as_ptr().add(idx) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+    }
+
+    #[inline(always)]
     fn to_grouped(&self, cl_ext: &[Vec<ExtClick>]) -> CompactClick16 {
-        if (self.w0 & CL_TAG_MASK) == CL_UB37 {
+        if (self.w0 & CL_TAG_MASK) != CL_EXT {
             let ts_rel_ms =
                 ((((self.w0 >> 37) & 0x1FF) << 22) | ((self.w1 >> 42) & 0x3F_FFFF)) as u32;
             let camp_id = ((self.w0 >> 46) & 0xFFFF) as u32;
@@ -5823,7 +6158,12 @@ impl Stage5Click for PersonClick16 {
     }
 
     #[inline(always)]
-    fn sort_grouped(slice: &mut [CompactClick16]) {
+    fn sort_grouped(
+        slice: &mut [CompactClick16],
+        keys_buf: &mut Vec<u64>,
+        tmp_buf: &mut Vec<CompactClick16>,
+        radix_scratch: &mut Vec<u64>,
+    ) {
         let n = slice.len();
         if n <= 1 {
             return;
@@ -5851,6 +6191,20 @@ impl Stage5Click for PersonClick16 {
                 unsafe {
                     *slice.get_unchecked_mut(j) = key;
                 }
+            }
+            return;
+        }
+        if n > 64 && n <= u32::MAX as usize {
+            keys_buf.clear();
+            keys_buf.reserve(n);
+            for (idx, c) in slice.iter().enumerate() {
+                keys_buf.push(((c.ts_rel_ms as u64) << 32) | (idx as u64));
+            }
+            <PersonEvent16 as Stage5Event>::sort_grouped(keys_buf, radix_scratch);
+            tmp_buf.clear();
+            tmp_buf.extend_from_slice(slice);
+            for (dst, &k) in slice.iter_mut().zip(keys_buf.iter()) {
+                *dst = unsafe { *tmp_buf.get_unchecked((k as u32) as usize) };
             }
             return;
         }
@@ -5891,7 +6245,12 @@ impl Stage5Click for PersonClickWide {
     }
 
     #[inline(always)]
-    fn sort_grouped(slice: &mut [CompactClickWide]) {
+    fn sort_grouped(
+        slice: &mut [CompactClickWide],
+        _keys_buf: &mut Vec<u64>,
+        _tmp_buf: &mut Vec<CompactClickWide>,
+        _radix_scratch: &mut Vec<u64>,
+    ) {
         if slice.len() > 1 {
             slice.sort_unstable_by_key(|c| c.ts_ms);
         }
@@ -5916,24 +6275,20 @@ fn aux_pos(tag38: u64, p_mask: usize) -> usize {
 
 #[inline(always)]
 fn slot_tag38_and_pos(pk: CompactKey64, p_mask: usize) -> Option<(u64, usize, bool)> {
+    if pk.is_uh42() {
+        let tag38 = pk.0 & CL_REM37_MASK;
+        return Some((tag38, (tag38 as usize) & p_mask, false));
+    }
     if (pk.0 >> 56) == 0 && pk.0 != 0 {
         let top3 = (pk.0 >> 53) as u32;
         if ((0xC3u32 >> top3) & 1) != 0 {
-            let is_uh42 = top3 >= 6;
             let is_hex = top3 == 1;
-            let tag38 = if is_uh42 {
-                pk.0 & CL_REM37_MASK
-            } else if is_hex {
+            let tag38 = if is_hex {
                 (3u64 << 36) | (pk.hex_h20() as u64)
             } else {
                 (2u64 << 36) | ((pk.0 - 1) & 0xFFFF_FFFF)
             };
-            let pos = if is_uh42 {
-                (tag38 as usize) & p_mask
-            } else {
-                aux_pos(tag38, p_mask)
-            };
-            return Some((tag38, pos, is_hex));
+            return Some((tag38, aux_pos(tag38, p_mask), is_hex));
         }
     }
     None
@@ -6182,11 +6537,12 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                 let mut cl_fill: Vec<u32> = Vec::new();
                 let mut grouped_clicks: Vec<C::Grouped> = Vec::new();
                 let mut radix_scratch: Vec<u64> = Vec::new();
+                let mut cl_sort_keys: Vec<u64> = Vec::new();
+                let mut cl_sort_tmp: Vec<C::Grouped> = Vec::new();
 
                 let mut cat_rev = vec![0i64; num_cats];
                 let mut touched_cats: Vec<u32> = Vec::with_capacity(32);
-                let mut active_count = vec![0u32; num_camps];
-                let mut enter_idx = vec![0u32; num_camps];
+                let mut active_camps = vec![ActiveCamp::default(); num_camps];
                 let mut active_list: Vec<u32> = Vec::with_capacity(64);
                 let mut sessions: Vec<SessionInfo> = Vec::with_capacity(256);
                 let mut day_ranges: Vec<DayRange> = Vec::with_capacity(32);
@@ -6496,7 +6852,18 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                             let cl_ptr = grouped_clicks.as_mut_ptr();
                             let mut cpid_idx = 0usize;
                             for chunk in cls_chunks {
-                                for c in unsafe { chunk.as_slice() } {
+                                let batch = unsafe { chunk.as_slice() };
+                                let blen = batch.len();
+                                let pre = blen.min(RING);
+                                for i in 0..pre {
+                                    unsafe { batch.get_unchecked(i) }.prefetch_ext(cl_ext);
+                                }
+                                for ridx in 0..blen {
+                                    if ridx + RING < blen {
+                                        unsafe { batch.get_unchecked(ridx + RING) }
+                                            .prefetch_ext(cl_ext);
+                                    }
+                                    let c = unsafe { &*batch.get_unchecked(ridx) };
                                     let pid = unsafe { *cl_pids.get_unchecked(cpid_idx) };
                                     cpid_idx += 1;
                                     if pid != u32::MAX {
@@ -6587,6 +6954,8 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
 
                                 let next_day = if E::FAST_DAY_BOUND && e_ts < cur_day_end_cmp {
                                     cur_day
+                                } else if E::FAST_DAY_BOUND && e_ts < cur_day_end_cmp + MS_DAY {
+                                    cur_day + 1
                                 } else {
                                     E::day_from_cmp(e_ts, ws_day, ws_rem)
                                 };
@@ -6607,8 +6976,11 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                                             day_rev,
                                         );
                                     }
-                                    let top_cat =
-                                        pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats);
+                                    let top_cat = if day_rev > 0 {
+                                        pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats)
+                                    } else {
+                                        None
+                                    };
                                     let c_u = if PD { rdtsc_now() } else { 0 };
                                     let push_res = writer.push(
                                         person_bytes,
@@ -6625,10 +6997,14 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                                         *err_lock_ref.lock().unwrap() = Some(err);
                                         return;
                                     }
-                                    cur_day = next_day;
                                     if E::FAST_DAY_BOUND {
-                                        cur_day_end_cmp = E::day_end_cmp(cur_day, ws_day, ws_rem);
+                                        cur_day_end_cmp = if next_day == cur_day + 1 {
+                                            cur_day_end_cmp + MS_DAY
+                                        } else {
+                                            E::day_end_cmp(next_day, ws_day, ws_rem)
+                                        };
                                     }
+                                    cur_day = next_day;
                                     day_sessions = 0;
                                     day_purch_sessions = 0;
                                     day_events = 0;
@@ -6651,8 +7027,11 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                             }
                         }
 
-                        let top_cat =
-                            pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats);
+                        let top_cat = if day_rev > 0 {
+                            pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats)
+                        } else {
+                            None
+                        };
                         let c_u = if PD { rdtsc_now() } else { 0 };
                         let push_res = writer.push(
                             person_bytes,
@@ -6730,7 +7109,12 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                         }
 
                         let c_s2 = if PD { rdtsc_now() } else { 0 };
-                        C::sort_grouped(clks);
+                        C::sort_grouped(
+                            clks,
+                            &mut cl_sort_keys,
+                            &mut cl_sort_tmp,
+                            &mut radix_scratch,
+                        );
                         if PD {
                             shard_sort_cyc += rdtsc_now().wrapping_sub(c_s2);
                         }
@@ -6761,11 +7145,11 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                                     best_camp = ccamp;
                                     best_ckey = ckey;
                                 }
-                                let cid = ccamp as usize;
-                                let cnt = active_count[cid];
-                                active_count[cid] = cnt + 1;
+                                let ac = unsafe { active_camps.get_unchecked_mut(ccamp as usize) };
+                                let cnt = ac.cnt;
+                                ac.cnt = cnt + 1;
                                 if cnt == 0 {
-                                    enter_idx[cid] = s_idx as u32;
+                                    ac.enter_idx = s_idx as u32;
                                     active_list.push(ccamp);
                                 }
                                 right += 1;
@@ -6775,14 +7159,15 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                                 if C::within_reach(s.start_cmp, cts) {
                                     break;
                                 }
-                                let cid = ccamp as usize;
-                                let cnt = active_count[cid] - 1;
-                                active_count[cid] = cnt;
+                                let ac = unsafe { active_camps.get_unchecked_mut(ccamp as usize) };
+                                let cnt = ac.cnt - 1;
+                                ac.cnt = cnt;
                                 if cnt == 0 {
+                                    let enter = ac.enter_idx as usize;
                                     emit_session_range_assists(
                                         acc,
                                         ccamp,
-                                        enter_idx[cid] as usize,
+                                        enter,
                                         s_idx,
                                         &sessions,
                                         &day_ranges,
@@ -6799,13 +7184,14 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                         }
                         let n_sess = sessions.len();
                         for &ccamp in &active_list {
-                            let cid = ccamp as usize;
-                            if active_count[cid] > 0 {
-                                active_count[cid] = 0;
+                            let ac = unsafe { active_camps.get_unchecked_mut(ccamp as usize) };
+                            if ac.cnt > 0 {
+                                ac.cnt = 0;
+                                let enter = ac.enter_idx as usize;
                                 emit_session_range_assists(
                                     acc,
                                     ccamp,
-                                    enter_idx[cid] as usize,
+                                    enter,
                                     n_sess,
                                     &sessions,
                                     &day_ranges,
@@ -6875,6 +7261,8 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                         cl_fill,
                         grouped_clicks,
                         radix_scratch,
+                        cl_sort_keys,
+                        cl_sort_tmp,
                     ));
                 }
             });
@@ -7338,7 +7726,7 @@ fn run_pipeline_inner<const PD: bool>(
         use std::io::Write;
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
-        std::process::exit(0);
+        return Ok(());
     }
 
     Ok(())
@@ -7791,7 +8179,7 @@ mod tests {
     #[test]
     fn test_sorting_networks_01_principle() {
         let mut scratch = Vec::new();
-        for n in 2..=8usize {
+        for n in 2..=16usize {
             for bits in 0..(1usize << n) {
                 let mut v = Vec::with_capacity(n);
                 for pos in 0..n {
@@ -7803,6 +8191,30 @@ mod tests {
                 <PersonEvent16 as Stage5Event>::sort_grouped(&mut v, &mut scratch);
                 let got: Vec<u64> = v.iter().map(|&x| x >> 40).collect();
                 assert_eq!(got, expected, "sorting network failed n={n} bits={bits:#b}");
+            }
+        }
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next_u64 = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed
+        };
+        let max_rel = i32::MAX as u64;
+        for n in 1..=256usize {
+            for mode in 0..4u8 {
+                let mut v = Vec::with_capacity(n);
+                for idx in 0..n {
+                    let ts_rel = match mode {
+                        0 => next_u64() & max_rel,
+                        1 => ((n - idx) as u64).min(max_rel),
+                        2 => 0x7FFF_FFFFu64 - ((idx as u64) & 3),
+                        _ => 424_242u64,
+                    };
+                    v.push((ts_rel << 32) | (next_u64() & 0xFFFF_FFFF));
+                }
+                let mut expected = v.clone();
+                expected.sort_unstable();
+                <PersonEvent16 as Stage5Event>::sort_grouped(&mut v, &mut scratch);
+                assert_eq!(v, expected, "sort_grouped exact match failed n={n} mode={mode}");
             }
         }
     }
