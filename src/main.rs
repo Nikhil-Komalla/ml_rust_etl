@@ -9,6 +9,11 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+#[cfg(unix)]
+extern "C" {
+    fn _exit(status: i32) -> !;
+}
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -27,7 +32,17 @@ fn main() -> ExitCode {
 
     let result = pipeline::run_pipeline_with_exit(&data_dir, &out_dir, ncpu, profile, true);
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                unsafe { _exit(0) };
+            }
+            #[cfg(not(unix))]
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("pipeline error: {e}");
             ExitCode::FAILURE

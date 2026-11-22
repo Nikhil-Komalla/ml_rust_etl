@@ -23,4 +23,4 @@ ENV DATA_DIR=/data \
     HOME=/scratch
 
 WORKDIR /app
-ENTRYPOINT ["/app/shopping-sessions"]
+CMD ["/app/shopping-sessions"]

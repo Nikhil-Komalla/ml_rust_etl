@@ -1,41 +1,9 @@
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 pub const USE_MADV_HUGEPAGE: bool = true;
 const HUGE_SLAB_BYTES: usize = 4 * 1024 * 1024;
-
-static RECYCLE_SLABS: AtomicBool = AtomicBool::new(false);
-
-struct PoolEntry {
-    ptr: *mut u8,
-    len: usize,
-}
-unsafe impl Send for PoolEntry {}
-
-static DIRTY_SLAB_POOL: Mutex<Vec<PoolEntry>> = Mutex::new(Vec::new());
-
-/// Enables or disables process-wide recycling of freed `mmap` slabs/huge buffers
-/// (used in `fast_exit` mode to avoid `munmap` TLB shootdowns and page re-faulting).
-pub fn set_slab_recycling(enable: bool) {
-    RECYCLE_SLABS.store(enable, Ordering::Release);
-    if !enable {
-        #[cfg(unix)]
-        {
-            let entries: Vec<PoolEntry> = {
-                let mut pool = DIRTY_SLAB_POOL.lock().unwrap();
-                std::mem::take(&mut *pool)
-            };
-            for e in entries {
-                unsafe {
-                    let _ = os_mem::munmap(e.ptr as *mut std::os::raw::c_void, e.len);
-                }
-            }
-        }
-    }
-}
 
 #[cfg(unix)]
 mod os_mem {
@@ -75,20 +43,15 @@ impl Drop for SlabBacking {
     fn drop(&mut self) {
         match *self {
             #[cfg(unix)]
-            SlabBacking::Mmap(ptr, len) => {
-                if RECYCLE_SLABS.load(Ordering::Acquire) {
-                    DIRTY_SLAB_POOL.lock().unwrap().push(PoolEntry { ptr, len });
-                } else {
-                    unsafe {
-                        let _ = os_mem::munmap(ptr as *mut std::os::raw::c_void, len);
-                    }
-                }
-            }
+            SlabBacking::Mmap(ptr, len) => unsafe {
+                let _ = os_mem::munmap(ptr as *mut std::os::raw::c_void, len);
+            },
             SlabBacking::Heap(_) => {}
         }
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct MutChunkRef<T: Copy> {
     pub ptr: *mut T,
     pub len: usize,
@@ -136,17 +99,8 @@ impl<T: Copy> Drop for HugeBuf<T> {
     fn drop(&mut self) {
         if let HugeBacking::Mmap(ptr, _, mmap_bytes) = self.backing {
             #[cfg(unix)]
-            {
-                if RECYCLE_SLABS.load(Ordering::Acquire) {
-                    DIRTY_SLAB_POOL.lock().unwrap().push(PoolEntry {
-                        ptr: ptr as *mut u8,
-                        len: mmap_bytes,
-                    });
-                } else {
-                    unsafe {
-                        let _ = os_mem::munmap(ptr as *mut std::os::raw::c_void, mmap_bytes);
-                    }
-                }
+            unsafe {
+                let _ = os_mem::munmap(ptr as *mut std::os::raw::c_void, mmap_bytes);
             }
         }
     }
@@ -296,27 +250,6 @@ impl SlabArena {
 
         #[cfg(unix)]
         if self.use_huge_from_start || need >= HUGE_SLAB_BYTES {
-            let min_recycle = min_bytes.max(HUGE_PAGE_ALIGN);
-            if RECYCLE_SLABS.load(Ordering::Acquire) {
-                let pooled = {
-                    let mut pool = DIRTY_SLAB_POOL.lock().unwrap();
-                    let mut best_idx: Option<usize> = None;
-                    let mut best_len = 0usize;
-                    for (i, e) in pool.iter().enumerate() {
-                        if e.len >= min_recycle && e.len > best_len {
-                            best_len = e.len;
-                            best_idx = Some(i);
-                        }
-                    }
-                    best_idx.map(|i| pool.swap_remove(i))
-                };
-                if let Some(entry) = pooled {
-                    self.slabs.push(SlabBacking::Mmap(entry.ptr, entry.len));
-                    self.cur_ptr = entry.ptr;
-                    self.cur_end = unsafe { entry.ptr.add(entry.len) };
-                    return;
-                }
-            }
             let aligned_len = (need + HUGE_SLAB_BYTES - 1) & !(HUGE_SLAB_BYTES - 1);
             unsafe {
                 let p = os_mem::mmap(
