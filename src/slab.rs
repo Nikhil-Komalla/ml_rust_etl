@@ -51,6 +51,7 @@ impl Drop for SlabBacking {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct MutChunkRef<T: Copy> {
     pub ptr: *mut T,
     pub len: usize,

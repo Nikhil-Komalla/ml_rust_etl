@@ -563,18 +563,58 @@ impl DateCache {
     pub fn parse_f3_only_13_padded(padded: &[u8], start: usize) -> Option<(i64, i64)> {
         debug_assert!(padded.len() >= start + 16);
         let ptr = unsafe { padded.as_ptr().add(start) };
-        let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
-        let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
-        if !(is_8_ascii_digits(w0) & is_8_ascii_digits(w5)) {
-            return None;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            target_feature = "sse4.1"
+        ))]
+        unsafe {
+            use std::arch::x86_64::*;
+            let v_raw = _mm_loadu_si128(ptr as *const __m128i);
+            let d_raw = _mm_sub_epi8(v_raw, _mm_set1_epi8(b'0' as i8));
+            let mask13 = _mm_setr_epi8(
+                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0,
+            );
+            let d = _mm_and_si128(d_raw, mask13);
+            let bad = _mm_subs_epu8(d, _mm_set1_epi8(9));
+            if _mm_testz_si128(bad, bad) == 0 {
+                return None;
+            }
+            let pairs = _mm_maddubs_epi16(
+                d,
+                _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 1, 0, 0, 0),
+            );
+            let q01 = _mm_cvtsi128_si64(_mm_madd_epi16(
+                pairs,
+                _mm_setr_epi16(100, 1, 100, 1, 0, 0, 0, 0),
+            )) as u64;
+            let p_hi = _mm_extract_epi64::<1>(pairs) as u64;
+            let q0 = (q01 & 0xFFFF_FFFF) as i64;
+            let q1 = (q01 >> 32) as i64;
+            let d89 = (p_hi & 0xFFFF) as i64;
+            let ms3 = (((p_hi >> 16) & 0xFFFF) * 10 + ((p_hi >> 32) & 0xFFFF)) as i64;
+            let f3_sec = q0 * 1_000_000 + q1 * 100 + d89;
+            Some((f3_sec * MS_SECOND + ms3, f3_sec))
         }
-        let hi8 = parse_8_ascii_digits(w0) as i64;
-        let d89 = (((w5 >> 24) & 0x0F) * 10 + ((w5 >> 32) & 0x0F)) as i64;
-        let f3_sec = hi8 * 100 + d89;
-        let ms3 = (((w5 >> 40) & 0x0F) * 100
-            + ((w5 >> 48) & 0x0F) * 10
-            + ((w5 >> 56) & 0x0F)) as i64;
-        Some((f3_sec * MS_SECOND + ms3, f3_sec))
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            target_feature = "sse4.1"
+        )))]
+        {
+            let w0 = unsafe { u64::from_le_bytes(*(ptr as *const [u8; 8])) };
+            let w5 = unsafe { u64::from_le_bytes(*(ptr.add(5) as *const [u8; 8])) };
+            if !(is_8_ascii_digits(w0) & is_8_ascii_digits(w5)) {
+                return None;
+            }
+            let hi8 = parse_8_ascii_digits(w0) as i64;
+            let d89 = (((w5 >> 24) & 0x0F) * 10 + ((w5 >> 32) & 0x0F)) as i64;
+            let f3_sec = hi8 * 100 + d89;
+            let ms3 = (((w5 >> 40) & 0x0F) * 100
+                + ((w5 >> 48) & 0x0F) * 10
+                + ((w5 >> 56) & 0x0F)) as i64;
+            Some((f3_sec * MS_SECOND + ms3, f3_sec))
+        }
     }
 
     #[inline(always)]
@@ -767,45 +807,11 @@ impl DateCache {
         }
         let w11_ts = unsafe { u64::from_le_bytes(*(p_ts.add(11) as *const [u8; 8])) };
         let w11_ing = unsafe { u64::from_le_bytes(*(p_ing.add(11) as *const [u8; 8])) };
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "ssse3",
-            target_feature = "sse4.1"
-        ))]
-        let (ts_hms, ing_hms) = unsafe {
-            use std::arch::x86_64::*;
-            let v = _mm_set_epi64x(w11_ing as i64, w11_ts as i64);
-            let sub_base = _mm_set1_epi64x(0x3030_3A30_303A_3030u64 as i64);
-            let x = _mm_sub_epi8(v, sub_base);
-            let max_allowed = _mm_set1_epi64x(0x0909_0009_0900_0909u64 as i64);
-            let bad_bytes = _mm_subs_epu8(x, max_allowed);
-            let shuf = _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, 8, 9, 11, 12, 14, 15, -1, -1);
-            let packed = _mm_shuffle_epi8(x, shuf);
-            let hms16 = _mm_maddubs_epi16(packed, _mm_set1_epi16(0x010A));
-            let h_over = _mm_cmpgt_epi16(hms16, _mm_setr_epi16(23, 59, 59, 0, 23, 59, 59, 0));
-            let any_bad = _mm_or_si128(bad_bytes, h_over);
-            if _mm_testz_si128(any_bad, any_bad) == 0 {
-                return None;
-            }
-            let weighted =
-                _mm_madd_epi16(hms16, _mm_setr_epi16(3_600, 60, 1, 0, 3_600, 60, 1, 0));
-            let sum = _mm_add_epi32(weighted, _mm_srli_epi64::<32>(weighted));
-            (_mm_cvtsi128_si32(sum) as i64, _mm_extract_epi32::<2>(sum) as i64)
-        };
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            target_feature = "ssse3",
-            target_feature = "sse4.1"
-        )))]
-        let (ts_hms, ing_hms) = {
-            let (t_h, t_ok) = parse_hms_sec_u64(w11_ts);
-            let (i_h, i_ok) = parse_hms_sec_u64(w11_ing);
-            if !(t_ok & i_ok) {
-                return None;
-            }
-            (t_h, i_h)
-        };
+        let (ts_hms, ts_ok) = parse_hms_sec_u64(w11_ts);
+        let (ing_hms, ing_ok) = parse_hms_sec_u64(w11_ing);
+        if !(ts_ok & ing_ok) {
+            return None;
+        }
 
         let ts_hi = unsafe { u64::from_ne_bytes(*(p_ts as *const [u8; 8])) };
         let ing_hi = unsafe { u64::from_ne_bytes(*(p_ing as *const [u8; 8])) };
@@ -819,6 +825,112 @@ impl DateCache {
         self.parse_f1_pair_rel_sec_slow(
             padded, ts_s, ing_s, ts_hms, ing_hms, ts_hi, ts_lo, ing_hi, ing_lo,
         )
+    }
+
+    #[inline(always)]
+    pub fn parse_f2_pair_rel_sec_padded(
+        &self,
+        padded: &[u8],
+        ts_s: usize,
+        ing_s: usize,
+    ) -> Option<(i64, i64)> {
+        debug_assert!(padded.len() >= ts_s + 32 && padded.len() >= ing_s + 32);
+        let p_ts = unsafe { padded.as_ptr().add(ts_s) };
+        let p_ing = unsafe { padded.as_ptr().add(ing_s) };
+        let sign = unsafe { *p_ts.add(19) };
+        let oh0 = unsafe { *p_ts.add(20) }.wrapping_sub(b'0');
+        let oh1 = unsafe { *p_ts.add(21) }.wrapping_sub(b'0');
+        let om0 = unsafe { *p_ts.add(23) }.wrapping_sub(b'0');
+        let om1 = unsafe { *p_ts.add(24) }.wrapping_sub(b'0');
+        let oh = (oh0 as i64) * 10 + (oh1 as i64);
+        let om = (om0 as i64) * 10 + (om1 as i64);
+        let sep_ok = ((sign == b'+') | (sign == b'-'))
+            & (unsafe { *p_ts.add(22) } == b':')
+            & (unsafe { *p_ts.add(10) } == b'T')
+            & (unsafe { *p_ing.add(10) } == b'T')
+            & (unsafe { *p_ing.add(19) } == b'Z')
+            & (oh0 < 10)
+            & (oh1 < 10)
+            & (om0 < 10)
+            & (om1 < 10)
+            & (oh <= 23)
+            & (om <= 59);
+        if !sep_ok {
+            return None;
+        }
+        let w11_ts = unsafe { u64::from_le_bytes(*(p_ts.add(11) as *const [u8; 8])) };
+        let w11_ing = unsafe { u64::from_le_bytes(*(p_ing.add(11) as *const [u8; 8])) };
+        let (ts_hms, ts_ok) = parse_hms_sec_u64(w11_ts);
+        let (ing_hms, ing_ok) = parse_hms_sec_u64(w11_ing);
+        if !(ts_ok & ing_ok) {
+            return None;
+        }
+
+        let ts_hi = unsafe { u64::from_ne_bytes(*(p_ts as *const [u8; 8])) };
+        let ts_lo = unsafe { u16::from_ne_bytes(*(p_ts.add(8) as *const [u8; 2])) };
+        let ing_hi = unsafe { u64::from_ne_bytes(*(p_ing as *const [u8; 8])) };
+        let ing_lo = unsafe { u16::from_ne_bytes(*(p_ing.add(8) as *const [u8; 2])) };
+        let ts_e = unsafe { *self.entries.get_unchecked(date_cache_idx(ts_lo)) };
+        let ing_e = unsafe { *self.entries.get_unchecked(date_cache_idx(ing_lo)) };
+        if (ts_e.hi == ts_hi)
+            & (ts_e.lo == ts_lo)
+            & (ing_e.hi == ing_hi)
+            & (ing_e.lo == ing_lo)
+        {
+            let off_sec = oh * 3_600 + om * 60;
+            let signed_off = if sign == b'+' { -off_sec } else { off_sec };
+            let ts_rel_sec = (ts_e.day_off_sec as i64)
+                .wrapping_add(ts_hms)
+                .wrapping_add(signed_off);
+            let ing_rel_sec = (ing_e.day_off_sec as i64).wrapping_add(ing_hms);
+            return Some((ts_rel_sec, ing_rel_sec - ts_rel_sec));
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub fn parse_f2_ms_25_padded(&mut self, padded: &[u8], start: usize) -> Option<i64> {
+        if padded.len() >= start + 32 {
+            let p = unsafe { padded.as_ptr().add(start) };
+            let sign = unsafe { *p.add(19) };
+            let oh0 = unsafe { *p.add(20) }.wrapping_sub(b'0');
+            let oh1 = unsafe { *p.add(21) }.wrapping_sub(b'0');
+            let om0 = unsafe { *p.add(23) }.wrapping_sub(b'0');
+            let om1 = unsafe { *p.add(24) }.wrapping_sub(b'0');
+            let oh = (oh0 as i64) * 10 + (oh1 as i64);
+            let om = (om0 as i64) * 10 + (om1 as i64);
+            let sep_ok = ((sign == b'+') | (sign == b'-'))
+                & (unsafe { *p.add(22) } == b':')
+                & (unsafe { *p.add(10) } == b'T')
+                & (oh0 < 10)
+                & (oh1 < 10)
+                & (om0 < 10)
+                & (om1 < 10)
+                & (oh <= 23)
+                & (om <= 59);
+            if sep_ok {
+                let w11 = unsafe { u64::from_le_bytes(*(p.add(11) as *const [u8; 8])) };
+                let (hms, hms_ok) = parse_hms_sec_u64(w11);
+                if hms_ok {
+                    let ts_hi = unsafe { u64::from_ne_bytes(*(p as *const [u8; 8])) };
+                    let ts_lo = unsafe { u16::from_ne_bytes(*(p.add(8) as *const [u8; 2])) };
+                    let ts_e = unsafe { *self.entries.get_unchecked(date_cache_idx(ts_lo)) };
+                    if (ts_e.hi == ts_hi) & (ts_e.lo == ts_lo) {
+                        let off_sec = oh * 3_600 + om * 60;
+                        let signed_off = if sign == b'+' { -off_sec } else { off_sec };
+                        return Some(
+                            self.base_sec
+                                .wrapping_add(ts_e.day_off_sec as i64)
+                                .wrapping_add(hms)
+                                .wrapping_add(signed_off)
+                                * MS_SECOND,
+                        );
+                    }
+                }
+            }
+        }
+        self.parse_other_ts_padded_hint::<false, false>(padded, start, 25, 0, 0, 0)
+            .map(|(ms, _)| ms)
     }
 
     #[cold]
@@ -1536,6 +1648,36 @@ mod tests {
                     String::from_utf8_lossy(ts),
                     String::from_utf8_lossy(ing)
                 );
+            }
+        }
+
+        let f2_cases: &[(&[u8], &[u8], Option<i64>)] = &[
+            (
+                b"2028-02-28T19:58:10-04:00",
+                b"2028-02-29T00:01:02Z",
+                parse_ts_ms(b"2028-02-28T19:58:10-04:00"),
+            ),
+            (
+                b"2028-03-01T09:15:00+10:00",
+                b"2028-02-29T23:20:00Z",
+                parse_ts_ms(b"2028-03-01T09:15:00+10:00"),
+            ),
+            (b"2028-02-28T19:58:10+24:00", b"2028-02-28T20:00:00Z", None),
+            (b"2028-02-28T19:58:10+05:60", b"2028-02-28T20:00:00Z", None),
+            (b"2027-02-29T10:00:00+00:00", b"2027-03-01T10:00:00Z", None),
+        ];
+        for &(ts, ing, exp_ms) in f2_cases {
+            let mut pad = vec![0x5Au8; 128];
+            pad[4..29].copy_from_slice(ts);
+            pad[40..60].copy_from_slice(ing);
+            assert_eq!(dc.parse_f2_ms_25_padded(&pad, 4), exp_ms);
+            let got = dc.parse_f2_pair_rel_sec_padded(&pad, 4, 40);
+            if let Some(t_ms) = exp_ms {
+                let (i_sec, _, _, _) = dc.parse_f1_sec_with_date(ing).unwrap();
+                let t_sec = t_ms.div_euclid(MS_SECOND);
+                assert_eq!(got, Some((t_sec - ws_sec, i_sec - t_sec)));
+            } else {
+                assert_eq!(got, None);
             }
         }
     }

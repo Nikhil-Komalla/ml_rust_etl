@@ -1,8 +1,8 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 #[inline(always)]
@@ -128,7 +128,7 @@ const EV_CHUNK_MASK: u32 = (EV_CHUNK_LEN as u32) - 1;
 const MAX_DEDUP_U32_CHUNKS: usize = 1023;
 const PE_CHUNK_LEN: usize = 2048;
 const CL_CHUNK_LEN: usize = 1024;
-const P_HEX_DEDUP: usize = 32;
+const P_HEX_DEDUP: usize = 64;
 const _: () = assert!(P_HEX_DEDUP.is_power_of_two());
 const P_HEX_DEDUP_SHIFT: u32 = 64 - P_HEX_DEDUP.trailing_zeros();
 const HX_SWCB_W: usize = 1;
@@ -1295,241 +1295,233 @@ struct ClicksDedupOut<E: Copy, C: Copy> {
 
 const LINK_PENDING: usize = 32;
 
-#[inline(never)]
-fn flush_cl_pending<C: ClickEmit>(
-    n: usize,
-    pending_cl: &mut [C; LINK_PENDING],
-    pending_h42: &[u64; LINK_PENDING],
-    link_map: &LinkMap,
-    wid: usize,
-    cl_ext_out: &mut Vec<ExtClick>,
-    cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
-) {
-    let mut hit_mask = 0u32;
-    for j in 0..n {
-        let h42 = unsafe { *pending_h42.get_unchecked(j) };
-        hit_mask |= u32::from(link_map.bloom_may_contain_b37(h42)) << j;
-    }
-    let mut m = hit_mask;
-    while m != 0 {
-        let j = m.trailing_zeros() as usize;
-        link_map.prefetch_slot_b37(unsafe { *pending_h42.get_unchecked(j) });
-        m &= m - 1;
-    }
-    let valid_mask = if n == LINK_PENDING {
-        !0u32
-    } else {
-        (1u32 << n) - 1
-    };
-    let mut misses = (!hit_mask) & valid_mask;
-    while misses != 0 {
-        let j = misses.trailing_zeros() as usize;
-        misses &= misses - 1;
-        let h42 = unsafe { *pending_h42.get_unchecked(j) };
-        let pshard = pshard_for_uh42(h42);
-        cl_buckets.push(pshard, unsafe { *pending_cl.get_unchecked(j) });
-    }
-    let mut hits = hit_mask;
-    while hits != 0 {
-        let j = hits.trailing_zeros() as usize;
-        hits &= hits - 1;
-        let h42 = unsafe { *pending_h42.get_unchecked(j) };
-        let mut item = unsafe { *pending_cl.get_unchecked(j) };
-        let pshard = if let Some(canon) = link_map.probe_b37(h42) {
-            item.apply_canon(canon, wid, cl_ext_out);
-            pshard_for_person_key(canon, &[])
-        } else {
-            pshard_for_uh42(h42)
-        };
-        cl_buckets.push(pshard, item);
-    }
+struct ClLinkPipe<C: ClickEmit> {
+    pending_cl: [C; LINK_PENDING],
+    pending_h42: [u64; LINK_PENDING],
+    n_b37: usize,
+    pending_hex_cl: [C; LINK_PENDING],
+    pending_hex_h64: [u64; LINK_PENDING],
+    pending_hex_val: [Hex128; LINK_PENDING],
+    n_hex: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn flush_cl_hex_pending<C: ClickEmit>(
-    n: usize,
-    pending_cl: &mut [C; LINK_PENDING],
-    pending_h64: &[u64; LINK_PENDING],
-    pending_hex: &[Hex128; LINK_PENDING],
-    link_map: &LinkMap,
-    wid: usize,
-    cl_ext_out: &mut Vec<ExtClick>,
-    cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
-) {
-    let mut hit_mask = 0u32;
-    for j in 0..n {
-        let h64 = unsafe { *pending_h64.get_unchecked(j) };
-        hit_mask |= u32::from(link_map.bloom_may_contain_hex(h64)) << j;
-    }
-    let mut m = hit_mask;
-    while m != 0 {
-        let j = m.trailing_zeros() as usize;
-        link_map.prefetch_slot_hex(unsafe { *pending_h64.get_unchecked(j) });
-        m &= m - 1;
-    }
-    let valid_mask = if n == LINK_PENDING {
-        !0u32
-    } else {
-        (1u32 << n) - 1
-    };
-    let mut misses = (!hit_mask) & valid_mask;
-    while misses != 0 {
-        let j = misses.trailing_zeros() as usize;
-        misses &= misses - 1;
-        let h64 = unsafe { *pending_h64.get_unchecked(j) };
-        let pshard = (h64 as usize) & (P_PERSON - 1);
-        cl_buckets.push(pshard, unsafe { *pending_cl.get_unchecked(j) });
-    }
-    let mut hits = hit_mask;
-    while hits != 0 {
-        let j = hits.trailing_zeros() as usize;
-        hits &= hits - 1;
-        let h64 = unsafe { *pending_h64.get_unchecked(j) };
-        let hx = unsafe { *pending_hex.get_unchecked(j) };
-        let mut item = unsafe { *pending_cl.get_unchecked(j) };
-        let pshard = if let Some(canon) = link_map.probe_hex(h64, hx) {
-            item.apply_canon(canon, wid, cl_ext_out);
-            pshard_for_person_key(canon, &[])
-        } else {
-            (h64 as usize) & (P_PERSON - 1)
-        };
-        cl_buckets.push(pshard, item);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn flush_dedup_pending<E: DedupEmit, const PD: bool>(
-    n: usize,
-    pending_ev: &mut [E; LINK_PENDING],
-    pending_h42: &[u64; LINK_PENDING],
-    link_map: &LinkMap,
-    person_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
-    mc: &mut P2Micro,
-) {
-    let c0 = if PD { rdtsc_now() } else { 0 };
-    let mut hit_mask = 0u32;
-    for j in 0..n {
-        let h42 = unsafe { *pending_h42.get_unchecked(j) };
-        hit_mask |= u32::from(link_map.bloom_may_contain_b37(h42)) << j;
-    }
-    let mut m = hit_mask;
-    while m != 0 {
-        let j = m.trailing_zeros() as usize;
-        link_map.prefetch_slot_b37(unsafe { *pending_h42.get_unchecked(j) });
-        m &= m - 1;
-    }
-    let c1 = if PD { rdtsc_now() } else { 0 };
-    if PD {
-        let nh = hit_mask.count_ones() as u64;
-        mc.bloom_cyc += c1.wrapping_sub(c0);
-        mc.b37_bloom_hits += nh;
-        mc.b37_misses += (n as u64) - nh;
-    }
-    let valid_mask = if n == LINK_PENDING {
-        !0u32
-    } else {
-        (1u32 << n) - 1
-    };
-    let mut misses = (!hit_mask) & valid_mask;
-    while misses != 0 {
-        let j = misses.trailing_zeros() as usize;
-        misses &= misses - 1;
-        let h42 = unsafe { *pending_h42.get_unchecked(j) };
-        let pshard = pshard_for_uh42(h42);
-        person_out.push(pshard, unsafe { *pending_ev.get_unchecked(j) });
-    }
-    let c2 = if PD { rdtsc_now() } else { 0 };
-    if PD {
-        mc.push_cyc += c2.wrapping_sub(c1);
-    }
-    let mut hits = hit_mask;
-    while hits != 0 {
-        let j = hits.trailing_zeros() as usize;
-        hits &= hits - 1;
-        let h42 = unsafe { *pending_h42.get_unchecked(j) };
-        let mut item = unsafe { *pending_ev.get_unchecked(j) };
-        let pshard = if let Some(canon) = link_map.probe_b37(h42) {
-            if PD {
-                mc.b37_slot_hits += 1;
-            }
-            item.apply_canon(canon);
-            pshard_for_person_key(canon, &[])
-        } else {
-            pshard_for_uh42(h42)
-        };
-        person_out.push(pshard, item);
-    }
-    if PD {
-        mc.probe_cyc += rdtsc_now().wrapping_sub(c2);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn flush_dedup_hex_pending<E: DedupEmit, const PD: bool>(
-    n: usize,
-    pending_ev: &mut [E; LINK_PENDING],
-    pending_pk: &[CompactKey64; LINK_PENDING],
-    ev_worker_hex: &[Vec<Hex128>],
-    link_map: &LinkMap,
-    person_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
-    mc: &mut P2Micro,
-) {
-    let c0 = if PD { rdtsc_now() } else { 0 };
-    let mut vals = [Hex128::default(); LINK_PENDING];
-    let mut h64s = [0u64; LINK_PENDING];
-    for j in 0..n {
-        let pk = unsafe { *pending_pk.get_unchecked(j) };
-        let hx = pk.resolve_hex(ev_worker_hex);
-        let h64 = hash_hex128(hx);
-        unsafe {
-            *vals.get_unchecked_mut(j) = hx;
-            *h64s.get_unchecked_mut(j) = h64;
+impl<C: ClickEmit> ClLinkPipe<C> {
+    fn new(tmpl: C) -> Self {
+        Self {
+            pending_cl: [tmpl; LINK_PENDING],
+            pending_h42: [0u64; LINK_PENDING],
+            n_b37: 0,
+            pending_hex_cl: [tmpl; LINK_PENDING],
+            pending_hex_h64: [0u64; LINK_PENDING],
+            pending_hex_val: [Hex128::default(); LINK_PENDING],
+            n_hex: 0,
         }
+    }
+
+    #[inline(always)]
+    fn push_b37(
+        &mut self,
+        h42: u64,
+        item: C,
+        link_map: &LinkMap,
+        wid: usize,
+        cl_ext_out: &mut Vec<ExtClick>,
+        cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
+    ) {
+        link_map.prefetch_bloom_b37(h42);
+        let np = self.n_b37;
+        unsafe {
+            *self.pending_cl.get_unchecked_mut(np) = item;
+            *self.pending_h42.get_unchecked_mut(np) = h42;
+        }
+        let next = np + 1;
+        if next == LINK_PENDING {
+            self.n_b37 = 0;
+            self.flush_b37(LINK_PENDING, link_map, wid, cl_ext_out, cl_buckets);
+        } else {
+            self.n_b37 = next;
+        }
+    }
+
+    #[inline(always)]
+    fn push_hex(
+        &mut self,
+        h64: u64,
+        hx: Hex128,
+        item: C,
+        link_map: &LinkMap,
+        wid: usize,
+        cl_ext_out: &mut Vec<ExtClick>,
+        cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
+    ) {
         link_map.prefetch_bloom_hex(h64);
+        let nh = self.n_hex;
+        unsafe {
+            *self.pending_hex_cl.get_unchecked_mut(nh) = item;
+            *self.pending_hex_h64.get_unchecked_mut(nh) = h64;
+            *self.pending_hex_val.get_unchecked_mut(nh) = hx;
+        }
+        let next = nh + 1;
+        if next == LINK_PENDING {
+            self.n_hex = 0;
+            self.flush_hex(LINK_PENDING, link_map, wid, cl_ext_out, cl_buckets);
+        } else {
+            self.n_hex = next;
+        }
     }
-    let mut hit_mask = 0u32;
-    for j in 0..n {
-        let h64 = unsafe { *h64s.get_unchecked(j) };
-        hit_mask |= u32::from(link_map.bloom_may_contain_hex(h64)) << j;
+
+    #[inline(never)]
+    fn flush_b37(
+        &mut self,
+        n: usize,
+        link_map: &LinkMap,
+        wid: usize,
+        cl_ext_out: &mut Vec<ExtClick>,
+        cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
+    ) {
+        let mut hit_mask = 0u32;
+        for j in 0..n {
+            let h42 = unsafe { *self.pending_h42.get_unchecked(j) };
+            hit_mask |= u32::from(link_map.bloom_may_contain_b37(h42)) << j;
+        }
+        let mut m = hit_mask;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize;
+            link_map.prefetch_slot_b37(unsafe { *self.pending_h42.get_unchecked(j) });
+            m &= m - 1;
+        }
+        let valid_mask = if n == LINK_PENDING {
+            !0u32
+        } else {
+            (1u32 << n) - 1
+        };
+        let mut misses = (!hit_mask) & valid_mask;
+        while misses != 0 {
+            let j = misses.trailing_zeros() as usize;
+            misses &= misses - 1;
+            let h42 = unsafe { *self.pending_h42.get_unchecked(j) };
+            cl_buckets.push(pshard_for_uh42(h42), unsafe { *self.pending_cl.get_unchecked(j) });
+        }
+        let mut hits = hit_mask;
+        while hits != 0 {
+            let j = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            let h42 = unsafe { *self.pending_h42.get_unchecked(j) };
+            let mut item = unsafe { *self.pending_cl.get_unchecked(j) };
+            let pshard = if let Some(canon) = link_map.probe_b37(h42) {
+                item.apply_canon(canon, wid, cl_ext_out);
+                pshard_for_person_key(canon, &[])
+            } else {
+                pshard_for_uh42(h42)
+            };
+            cl_buckets.push(pshard, item);
+        }
     }
-    let mut m = hit_mask;
-    while m != 0 {
-        let j = m.trailing_zeros() as usize;
-        link_map.prefetch_slot_hex(unsafe { *h64s.get_unchecked(j) });
-        m &= m - 1;
+
+    #[inline(never)]
+    fn flush_hex(
+        &mut self,
+        n: usize,
+        link_map: &LinkMap,
+        wid: usize,
+        cl_ext_out: &mut Vec<ExtClick>,
+        cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
+    ) {
+        let mut hit_mask = 0u32;
+        for j in 0..n {
+            let h64 = unsafe { *self.pending_hex_h64.get_unchecked(j) };
+            hit_mask |= u32::from(link_map.bloom_may_contain_hex(h64)) << j;
+        }
+        let mut m = hit_mask;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize;
+            link_map.prefetch_slot_hex(unsafe { *self.pending_hex_h64.get_unchecked(j) });
+            m &= m - 1;
+        }
+        let valid_mask = if n == LINK_PENDING {
+            !0u32
+        } else {
+            (1u32 << n) - 1
+        };
+        let mut misses = (!hit_mask) & valid_mask;
+        while misses != 0 {
+            let j = misses.trailing_zeros() as usize;
+            misses &= misses - 1;
+            let h64 = unsafe { *self.pending_hex_h64.get_unchecked(j) };
+            cl_buckets.push((h64 as usize) & (P_PERSON - 1), unsafe {
+                *self.pending_hex_cl.get_unchecked(j)
+            });
+        }
+        let mut hits = hit_mask;
+        while hits != 0 {
+            let j = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            let h64 = unsafe { *self.pending_hex_h64.get_unchecked(j) };
+            let hx = unsafe { *self.pending_hex_val.get_unchecked(j) };
+            let mut item = unsafe { *self.pending_hex_cl.get_unchecked(j) };
+            let pshard = if let Some(canon) = link_map.probe_hex(h64, hx) {
+                item.apply_canon(canon, wid, cl_ext_out);
+                pshard_for_person_key(canon, &[])
+            } else {
+                (h64 as usize) & (P_PERSON - 1)
+            };
+            cl_buckets.push(pshard, item);
+        }
     }
-    let valid_mask = if n == LINK_PENDING {
-        !0u32
-    } else {
-        (1u32 << n) - 1
-    };
-    let mut misses = (!hit_mask) & valid_mask;
-    while misses != 0 {
-        let j = misses.trailing_zeros() as usize;
-        misses &= misses - 1;
-        let h64 = unsafe { *h64s.get_unchecked(j) };
-        let pk = unsafe { *pending_pk.get_unchecked(j) };
-        let mut item = unsafe { *pending_ev.get_unchecked(j) };
-        item.apply_canon(CompactKey64::from_hex(
-            pk.hex_wid(),
-            pk.hex_idx(),
-            false,
-            (h64 & 0xF_FFFF) as u32,
-        ));
-        let pshard = (h64 as usize) & (P_PERSON - 1);
-        person_out.push(pshard, item);
+
+    #[inline(never)]
+    fn finish(
+        &mut self,
+        link_map: &LinkMap,
+        wid: usize,
+        cl_ext_out: &mut Vec<ExtClick>,
+        cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
+    ) {
+        if self.n_b37 > 0 {
+            let n = self.n_b37;
+            self.n_b37 = 0;
+            self.flush_b37(n, link_map, wid, cl_ext_out, cl_buckets);
+        }
+        if self.n_hex > 0 {
+            let n = self.n_hex;
+            self.n_hex = 0;
+            self.flush_hex(n, link_map, wid, cl_ext_out, cl_buckets);
+        }
     }
-    let mut hits = hit_mask;
-    while hits != 0 {
-        let j = hits.trailing_zeros() as usize;
-        hits &= hits - 1;
-        let h64 = unsafe { *h64s.get_unchecked(j) };
-        let hx = unsafe { *vals.get_unchecked(j) };
-        let pk = unsafe { *pending_pk.get_unchecked(j) };
-        let mut item = unsafe { *pending_ev.get_unchecked(j) };
+}
+
+struct EvLinkPipe<E: DedupEmit> {
+    b37_stage1_ev: [E; LINK_PENDING],
+    b37_stage1_h42: [u64; LINK_PENDING],
+    b37_stage1_len: usize,
+    hex_stage1_ev: [E; LINK_PENDING],
+    hex_stage1_pk: [CompactKey64; LINK_PENDING],
+    hex_stage1_len: usize,
+}
+
+impl<E: DedupEmit> EvLinkPipe<E> {
+    fn new() -> Self {
+        let tmpl = E::empty_tmpl();
+        Self {
+            b37_stage1_ev: [tmpl; LINK_PENDING],
+            b37_stage1_h42: [0u64; LINK_PENDING],
+            b37_stage1_len: 0,
+            hex_stage1_ev: [tmpl; LINK_PENDING],
+            hex_stage1_pk: [CompactKey64::EMPTY; LINK_PENDING],
+            hex_stage1_len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn emit_hex_resolved<const PD: bool>(
+        mut item: E,
+        h64: u64,
+        hx: Hex128,
+        pk: CompactKey64,
+        link_map: &LinkMap,
+        buckets_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
+        mc: &mut P2Micro,
+    ) {
         let pshard = if let Some(canon) = link_map.probe_hex(h64, hx) {
             if PD {
                 mc.hex_slot_hits += 1;
@@ -1545,13 +1537,229 @@ fn flush_dedup_hex_pending<E: DedupEmit, const PD: bool>(
             ));
             (h64 as usize) & (P_PERSON - 1)
         };
-        person_out.push(pshard, item);
+        buckets_out.push(pshard, item);
     }
-    if PD {
-        let nh = hit_mask.count_ones() as u64;
-        mc.hex_cyc += rdtsc_now().wrapping_sub(c0);
-        mc.hex_bloom_hits += nh;
-        mc.hex_misses += (n as u64) - nh;
+
+    #[inline(always)]
+    fn push_b37<const PD: bool>(
+        &mut self,
+        h42: u64,
+        item: E,
+        link_map: &LinkMap,
+        buckets_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
+        mc: &mut P2Micro,
+    ) {
+        link_map.prefetch_bloom_b37(h42);
+        let np = self.b37_stage1_len;
+        unsafe {
+            *self.b37_stage1_ev.get_unchecked_mut(np) = item;
+            *self.b37_stage1_h42.get_unchecked_mut(np) = h42;
+        }
+        let next_np = np + 1;
+        if next_np == LINK_PENDING {
+            self.b37_stage1_len = 0;
+            self.flush_b37_stage1::<PD>(LINK_PENDING, link_map, buckets_out, mc);
+        } else {
+            self.b37_stage1_len = next_np;
+        }
+    }
+
+    #[inline(never)]
+    fn flush_b37_stage1<const PD: bool>(
+        &mut self,
+        n: usize,
+        link_map: &LinkMap,
+        buckets_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
+        mc: &mut P2Micro,
+    ) {
+        let c0 = if PD { rdtsc_now() } else { 0 };
+        let mut hit_mask = 0u32;
+        for j in 0..n {
+            let h42 = unsafe { *self.b37_stage1_h42.get_unchecked(j) };
+            hit_mask |= u32::from(link_map.bloom_may_contain_b37(h42)) << j;
+        }
+        let mut m = hit_mask;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize;
+            link_map.prefetch_slot_b37(unsafe { *self.b37_stage1_h42.get_unchecked(j) });
+            m &= m - 1;
+        }
+        let c1 = if PD { rdtsc_now() } else { 0 };
+        if PD {
+            let nh = hit_mask.count_ones() as u64;
+            mc.bloom_cyc += c1.wrapping_sub(c0);
+            mc.b37_bloom_hits += nh;
+            mc.b37_misses += (n as u64) - nh;
+        }
+        let valid_mask = if n == LINK_PENDING {
+            !0u32
+        } else {
+            (1u32 << n) - 1
+        };
+        let mut misses = (!hit_mask) & valid_mask;
+        while misses != 0 {
+            let j = misses.trailing_zeros() as usize;
+            misses &= misses - 1;
+            let h42 = unsafe { *self.b37_stage1_h42.get_unchecked(j) };
+            let pshard = pshard_for_uh42(h42);
+            buckets_out.push(pshard, unsafe { *self.b37_stage1_ev.get_unchecked(j) });
+        }
+        let c2 = if PD { rdtsc_now() } else { 0 };
+        if PD {
+            mc.push_cyc += c2.wrapping_sub(c1);
+        }
+        let mut hits = hit_mask;
+        while hits != 0 {
+            let j = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            let h42 = unsafe { *self.b37_stage1_h42.get_unchecked(j) };
+            let mut item = unsafe { *self.b37_stage1_ev.get_unchecked(j) };
+            let pshard = if let Some(canon) = link_map.probe_b37(h42) {
+                if PD {
+                    mc.b37_slot_hits += 1;
+                }
+                item.apply_canon(canon);
+                pshard_for_person_key(canon, &[])
+            } else {
+                pshard_for_uh42(h42)
+            };
+            buckets_out.push(pshard, item);
+        }
+        if PD {
+            mc.probe_cyc += rdtsc_now().wrapping_sub(c2);
+        }
+    }
+
+    #[inline(always)]
+    fn push_hex_pk<const PD: bool>(
+        &mut self,
+        pk: CompactKey64,
+        item: E,
+        ev_worker_hex: &[Vec<Hex128>],
+        link_map: &LinkMap,
+        buckets_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
+        mc: &mut P2Micro,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                ev_worker_hex
+                    .get_unchecked(pk.hex_wid())
+                    .as_ptr()
+                    .add(pk.hex_idx()) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        let nhp = self.hex_stage1_len;
+        unsafe {
+            *self.hex_stage1_ev.get_unchecked_mut(nhp) = item;
+            *self.hex_stage1_pk.get_unchecked_mut(nhp) = pk;
+        }
+        let next_nhp = nhp + 1;
+        if next_nhp == LINK_PENDING {
+            self.hex_stage1_len = 0;
+            self.flush_hex_stage1::<PD>(
+                LINK_PENDING,
+                ev_worker_hex,
+                link_map,
+                buckets_out,
+                mc,
+            );
+        } else {
+            self.hex_stage1_len = next_nhp;
+        }
+    }
+
+    #[inline(never)]
+    fn flush_hex_stage1<const PD: bool>(
+        &mut self,
+        n: usize,
+        ev_worker_hex: &[Vec<Hex128>],
+        link_map: &LinkMap,
+        buckets_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
+        mc: &mut P2Micro,
+    ) {
+        let c0 = if PD { rdtsc_now() } else { 0 };
+        let mut vals = [Hex128::default(); LINK_PENDING];
+        let mut h64s = [0u64; LINK_PENDING];
+        for j in 0..n {
+            let pk = unsafe { *self.hex_stage1_pk.get_unchecked(j) };
+            let hx = pk.resolve_hex(ev_worker_hex);
+            let h64 = hash_hex128(hx);
+            unsafe {
+                *vals.get_unchecked_mut(j) = hx;
+                *h64s.get_unchecked_mut(j) = h64;
+            }
+            link_map.prefetch_bloom_hex(h64);
+        }
+        let mut hit_mask = 0u32;
+        for j in 0..n {
+            let h64 = unsafe { *h64s.get_unchecked(j) };
+            hit_mask |= u32::from(link_map.bloom_may_contain_hex(h64)) << j;
+        }
+        let mut m = hit_mask;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize;
+            link_map.prefetch_slot_hex(unsafe { *h64s.get_unchecked(j) });
+            m &= m - 1;
+        }
+        let valid_mask = if n == LINK_PENDING {
+            !0u32
+        } else {
+            (1u32 << n) - 1
+        };
+        let mut misses = (!hit_mask) & valid_mask;
+        while misses != 0 {
+            let j = misses.trailing_zeros() as usize;
+            misses &= misses - 1;
+            let h64 = unsafe { *h64s.get_unchecked(j) };
+            let pk = unsafe { *self.hex_stage1_pk.get_unchecked(j) };
+            let mut item = unsafe { *self.hex_stage1_ev.get_unchecked(j) };
+            item.apply_canon(CompactKey64::from_hex(
+                pk.hex_wid(),
+                pk.hex_idx(),
+                false,
+                (h64 & 0xF_FFFF) as u32,
+            ));
+            let pshard = (h64 as usize) & (P_PERSON - 1);
+            buckets_out.push(pshard, item);
+        }
+        let mut hits = hit_mask;
+        while hits != 0 {
+            let j = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            let h64 = unsafe { *h64s.get_unchecked(j) };
+            let hx = unsafe { *vals.get_unchecked(j) };
+            let pk = unsafe { *self.hex_stage1_pk.get_unchecked(j) };
+            let item = unsafe { *self.hex_stage1_ev.get_unchecked(j) };
+            Self::emit_hex_resolved::<PD>(item, h64, hx, pk, link_map, buckets_out, mc);
+        }
+        if PD {
+            let nh = hit_mask.count_ones() as u64;
+            mc.hex_cyc += rdtsc_now().wrapping_sub(c0);
+            mc.hex_bloom_hits += nh;
+            mc.hex_misses += (n as u64) - nh;
+        }
+    }
+
+    #[inline(never)]
+    fn drain<const PD: bool>(
+        &mut self,
+        ev_worker_hex: &[Vec<Hex128>],
+        link_map: &LinkMap,
+        buckets_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
+        mc: &mut P2Micro,
+    ) {
+        if self.b37_stage1_len > 0 {
+            let n = self.b37_stage1_len;
+            self.b37_stage1_len = 0;
+            self.flush_b37_stage1::<PD>(n, link_map, buckets_out, mc);
+        }
+        if self.hex_stage1_len > 0 {
+            let n = self.hex_stage1_len;
+            self.hex_stage1_len = 0;
+            self.flush_hex_stage1::<PD>(n, ev_worker_hex, link_map, buckets_out, mc);
+        }
     }
 }
 
@@ -1575,13 +1783,7 @@ fn emit_cl_non_b37<C: ClickEmit>(
     cl_hex_out: &mut Vec<Hex128>,
     cl_ext_out: &mut Vec<ExtClick>,
     cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
-    pending_cl: &mut [C; LINK_PENDING],
-    pending_h42: &mut [u64; LINK_PENDING],
-    n_pending: &mut usize,
-    pending_cl_hex: &mut [C; LINK_PENDING],
-    pending_cl_hex_h64: &mut [u64; LINK_PENDING],
-    pending_cl_hex_val: &mut [Hex128; LINK_PENDING],
-    n_hex_pending: &mut usize,
+    cl_pipe: &mut ClLinkPipe<C>,
 ) {
     let click_id_key = if let Some(k_b37) = encode_b37_padded(padded, cl_s, cl_len, b'k') {
         CompactKey64::from_kb37(k_b37)
@@ -1612,27 +1814,7 @@ fn emit_cl_non_b37<C: ClickEmit>(
             let pshard = pshard_for_uh42(h42);
             cl_buckets.push(pshard, item);
         } else {
-            link_map.prefetch_bloom_b37(h42);
-            let np = *n_pending;
-            unsafe {
-                *pending_cl.get_unchecked_mut(np) = item;
-                *pending_h42.get_unchecked_mut(np) = h42;
-            }
-            let next_np = np + 1;
-            if next_np == LINK_PENDING {
-                flush_cl_pending(
-                    LINK_PENDING,
-                    pending_cl,
-                    pending_h42,
-                    link_map,
-                    wid,
-                    cl_ext_out,
-                    cl_buckets,
-                );
-                *n_pending = 0;
-            } else {
-                *n_pending = next_np;
-            }
+            cl_pipe.push_b37(h42, item, link_map, wid, cl_ext_out, cl_buckets);
         }
         return;
     }
@@ -1655,29 +1837,7 @@ fn emit_cl_non_b37<C: ClickEmit>(
             let pshard = (h64 as usize) & (P_PERSON - 1);
             cl_buckets.push(pshard, item);
         } else {
-            link_map.prefetch_bloom_hex(h64);
-            let nhp = *n_hex_pending;
-            unsafe {
-                *pending_cl_hex.get_unchecked_mut(nhp) = item;
-                *pending_cl_hex_h64.get_unchecked_mut(nhp) = h64;
-                *pending_cl_hex_val.get_unchecked_mut(nhp) = hx_u;
-            }
-            let next_nhp = nhp + 1;
-            if next_nhp == LINK_PENDING {
-                flush_cl_hex_pending(
-                    LINK_PENDING,
-                    pending_cl_hex,
-                    pending_cl_hex_h64,
-                    pending_cl_hex_val,
-                    link_map,
-                    wid,
-                    cl_ext_out,
-                    cl_buckets,
-                );
-                *n_hex_pending = 0;
-            } else {
-                *n_hex_pending = next_nhp;
-            }
+            cl_pipe.push_hex(h64, hx_u, item, link_map, wid, cl_ext_out, cl_buckets);
         }
         return;
     }
@@ -1744,13 +1904,7 @@ fn process_cl_line<C: ClickEmit, const TS_KIND: u8>(
     cl_hex_out: &mut Vec<Hex128>,
     cl_ext_out: &mut Vec<ExtClick>,
     cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
-    pending_cl: &mut [C; LINK_PENDING],
-    pending_h42: &mut [u64; LINK_PENDING],
-    n_pending: &mut usize,
-    pending_cl_hex: &mut [C; LINK_PENDING],
-    pending_cl_hex_h64: &mut [u64; LINK_PENDING],
-    pending_cl_hex_val: &mut [Hex128; LINK_PENDING],
-    n_hex_pending: &mut usize,
+    cl_pipe: &mut ClLinkPipe<C>,
 ) {
     let ls = dl.ls as usize;
     let cm = unsafe { cm_ptr.add(dl.cm_off as usize) };
@@ -1775,9 +1929,15 @@ fn process_cl_line<C: ClickEmit, const TS_KIND: u8>(
     let ts_ms = match TS_KIND {
         0 if ts_len == 20 => dcache.parse_f1_ms_20_padded(padded, ts_s),
         1 if ts_len == 13 => DateCache::parse_f3_only_13_padded(padded, ts_s).map(|(ms, _)| ms),
-        _ => dcache
-            .parse_other_ts_padded_hint::<false, false>(padded, ts_s, ts_len, 0, 0, 0)
-            .map(|(ms, _)| ms),
+        _ => {
+            if ts_len == 25 {
+                dcache.parse_f2_ms_25_padded(padded, ts_s)
+            } else {
+                dcache
+                    .parse_other_ts_padded_hint::<false, false>(padded, ts_s, ts_len, 0, 0, 0)
+                    .map(|(ms, _)| ms)
+            }
+        }
     };
     let Some(ts_ms) = ts_ms else {
         return;
@@ -1796,27 +1956,7 @@ fn process_cl_line<C: ClickEmit, const TS_KIND: u8>(
                 let pshard = pshard_for_uh42(h42);
                 cl_buckets.push(pshard, item);
             } else {
-                link_map.prefetch_bloom_b37(h42);
-                let np = *n_pending;
-                unsafe {
-                    *pending_cl.get_unchecked_mut(np) = item;
-                    *pending_h42.get_unchecked_mut(np) = h42;
-                }
-                let next_np = np + 1;
-                if next_np == LINK_PENDING {
-                    flush_cl_pending(
-                        LINK_PENDING,
-                        pending_cl,
-                        pending_h42,
-                        link_map,
-                        wid,
-                        cl_ext_out,
-                        cl_buckets,
-                    );
-                    *n_pending = 0;
-                } else {
-                    *n_pending = next_np;
-                }
+                cl_pipe.push_b37(h42, item, link_map, wid, cl_ext_out, cl_buckets);
             }
             return;
         }
@@ -1840,13 +1980,7 @@ fn process_cl_line<C: ClickEmit, const TS_KIND: u8>(
         cl_hex_out,
         cl_ext_out,
         cl_buckets,
-        pending_cl,
-        pending_h42,
-        n_pending,
-        pending_cl_hex,
-        pending_cl_hex_h64,
-        pending_cl_hex_val,
-        n_hex_pending,
+        cl_pipe,
     );
 }
 
@@ -1868,13 +2002,7 @@ fn process_cl_hex_line<C: ClickEmit, const TS_KIND: u8>(
     cl_hex_out: &mut Vec<Hex128>,
     cl_ext_out: &mut Vec<ExtClick>,
     cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
-    pending_cl: &mut [C; LINK_PENDING],
-    pending_h42: &mut [u64; LINK_PENDING],
-    n_pending: &mut usize,
-    pending_cl_hex: &mut [C; LINK_PENDING],
-    pending_cl_hex_h64: &mut [u64; LINK_PENDING],
-    pending_cl_hex_val: &mut [Hex128; LINK_PENDING],
-    n_hex_pending: &mut usize,
+    cl_pipe: &mut ClLinkPipe<C>,
 ) {
     let ls = dl.ls as usize;
     let cm = unsafe { cm_ptr.add(dl.cm_off as usize) };
@@ -1899,9 +2027,15 @@ fn process_cl_hex_line<C: ClickEmit, const TS_KIND: u8>(
     let ts_ms = match TS_KIND {
         0 if ts_len == 20 => dcache.parse_f1_ms_20_padded(padded, ts_s),
         1 if ts_len == 13 => DateCache::parse_f3_only_13_padded(padded, ts_s).map(|(ms, _)| ms),
-        _ => dcache
-            .parse_other_ts_padded_hint::<false, false>(padded, ts_s, ts_len, 0, 0, 0)
-            .map(|(ms, _)| ms),
+        _ => {
+            if ts_len == 25 {
+                dcache.parse_f2_ms_25_padded(padded, ts_s)
+            } else {
+                dcache
+                    .parse_other_ts_padded_hint::<false, false>(padded, ts_s, ts_len, 0, 0, 0)
+                    .map(|(ms, _)| ms)
+            }
+        }
     };
     let Some(ts_ms) = ts_ms else {
         return;
@@ -1951,27 +2085,7 @@ fn process_cl_hex_line<C: ClickEmit, const TS_KIND: u8>(
                     if lm_empty {
                         cl_buckets.push(pshard_for_uh42(h42), item);
                     } else {
-                        link_map.prefetch_bloom_b37(h42);
-                        let np = *n_pending;
-                        unsafe {
-                            *pending_cl.get_unchecked_mut(np) = item;
-                            *pending_h42.get_unchecked_mut(np) = h42;
-                        }
-                        let next_np = np + 1;
-                        if next_np == LINK_PENDING {
-                            flush_cl_pending(
-                                LINK_PENDING,
-                                pending_cl,
-                                pending_h42,
-                                link_map,
-                                wid,
-                                cl_ext_out,
-                                cl_buckets,
-                            );
-                            *n_pending = 0;
-                        } else {
-                            *n_pending = next_np;
-                        }
+                        cl_pipe.push_b37(h42, item, link_map, wid, cl_ext_out, cl_buckets);
                     }
                 }
                 RawClkId::Hex(hx_u) => {
@@ -1991,29 +2105,7 @@ fn process_cl_hex_line<C: ClickEmit, const TS_KIND: u8>(
                     if lm_empty {
                         cl_buckets.push((h64 as usize) & (P_PERSON - 1), item);
                     } else {
-                        link_map.prefetch_bloom_hex(h64);
-                        let nhp = *n_hex_pending;
-                        unsafe {
-                            *pending_cl_hex.get_unchecked_mut(nhp) = item;
-                            *pending_cl_hex_h64.get_unchecked_mut(nhp) = h64;
-                            *pending_cl_hex_val.get_unchecked_mut(nhp) = hx_u;
-                        }
-                        let next_nhp = nhp + 1;
-                        if next_nhp == LINK_PENDING {
-                            flush_cl_hex_pending(
-                                LINK_PENDING,
-                                pending_cl_hex,
-                                pending_cl_hex_h64,
-                                pending_cl_hex_val,
-                                link_map,
-                                wid,
-                                cl_ext_out,
-                                cl_buckets,
-                            );
-                            *n_hex_pending = 0;
-                        } else {
-                            *n_hex_pending = next_nhp;
-                        }
+                        cl_pipe.push_hex(h64, hx_u, item, link_map, wid, cl_ext_out, cl_buckets);
                     }
                 }
             }
@@ -2039,13 +2131,7 @@ fn process_cl_hex_line<C: ClickEmit, const TS_KIND: u8>(
         cl_hex_out,
         cl_ext_out,
         cl_buckets,
-        pending_cl,
-        pending_h42,
-        n_pending,
-        pending_cl_hex,
-        pending_cl_hex_h64,
-        pending_cl_hex_val,
-        n_hex_pending,
+        cl_pipe,
     );
 }
 
@@ -2066,13 +2152,7 @@ fn process_cl_batch_direct<C: ClickEmit>(
     cl_hex_out: &mut Vec<Hex128>,
     cl_ext_out: &mut Vec<ExtClick>,
     cl_buckets: &mut SlabBuckets<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>,
-    pending_cl: &mut [C; LINK_PENDING],
-    pending_h42: &mut [u64; LINK_PENDING],
-    n_pending: &mut usize,
-    pending_cl_hex: &mut [C; LINK_PENDING],
-    pending_cl_hex_h64: &mut [u64; LINK_PENDING],
-    pending_cl_hex_val: &mut [Hex128; LINK_PENDING],
-    n_hex_pending: &mut usize,
+    cl_pipe: &mut ClLinkPipe<C>,
 ) {
     debug_assert!(lines.len() <= DIRECT_BATCH_LEN);
     let base = padded.as_ptr();
@@ -2135,13 +2215,7 @@ fn process_cl_batch_direct<C: ClickEmit>(
             cl_hex_out,
             cl_ext_out,
             cl_buckets,
-            pending_cl,
-            pending_h42,
-            n_pending,
-            pending_cl_hex,
-            pending_cl_hex_h64,
-            pending_cl_hex_val,
-            n_hex_pending,
+            cl_pipe,
         );
     }
     for &idx in &f1_hex_idxs[..nf1_hex] {
@@ -2162,13 +2236,7 @@ fn process_cl_batch_direct<C: ClickEmit>(
             cl_hex_out,
             cl_ext_out,
             cl_buckets,
-            pending_cl,
-            pending_h42,
-            n_pending,
-            pending_cl_hex,
-            pending_cl_hex_h64,
-            pending_cl_hex_val,
-            n_hex_pending,
+            cl_pipe,
         );
     }
     for &idx in &f3_b37_idxs[..nf3_b37] {
@@ -2189,13 +2257,7 @@ fn process_cl_batch_direct<C: ClickEmit>(
             cl_hex_out,
             cl_ext_out,
             cl_buckets,
-            pending_cl,
-            pending_h42,
-            n_pending,
-            pending_cl_hex,
-            pending_cl_hex_h64,
-            pending_cl_hex_val,
-            n_hex_pending,
+            cl_pipe,
         );
     }
     for &idx in &f3_hex_idxs[..nf3_hex] {
@@ -2216,13 +2278,7 @@ fn process_cl_batch_direct<C: ClickEmit>(
             cl_hex_out,
             cl_ext_out,
             cl_buckets,
-            pending_cl,
-            pending_h42,
-            n_pending,
-            pending_cl_hex,
-            pending_cl_hex_h64,
-            pending_cl_hex_val,
-            n_hex_pending,
+            cl_pipe,
         );
     }
     for &idx in &oth_idxs[..noth] {
@@ -2243,13 +2299,7 @@ fn process_cl_batch_direct<C: ClickEmit>(
             cl_hex_out,
             cl_ext_out,
             cl_buckets,
-            pending_cl,
-            pending_h42,
-            n_pending,
-            pending_cl_hex,
-            pending_cl_hex_h64,
-            pending_cl_hex_val,
-            n_hex_pending,
+            cl_pipe,
         );
     }
 }
@@ -2266,12 +2316,7 @@ fn handle_p2_non_fast<E: DedupEmit, const PD: bool>(
     ev_worker_hex: &[Vec<Hex128>],
     link_map: &LinkMap,
     buckets_out: &mut SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>,
-    pending_ev: &mut [E; LINK_PENDING],
-    pending_h42: &mut [u64; LINK_PENDING],
-    n_p2_pending: &mut usize,
-    pending_ev_hex: &mut [E; LINK_PENDING],
-    pending_ev_hex_pk: &mut [CompactKey64; LINK_PENDING],
-    n_p2_hex_pending: &mut usize,
+    ev_pipe: &mut EvLinkPipe<E>,
     shard_mc: &mut P2Micro,
 ) {
     if tag == 1 {
@@ -2301,33 +2346,7 @@ fn handle_p2_non_fast<E: DedupEmit, const PD: bool>(
             let pshard = (h64 as usize) & (P_PERSON - 1);
             buckets_out.push(pshard, item);
         } else {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                std::arch::x86_64::_mm_prefetch(
-                    ev_worker_hex.get_unchecked(u_wid).as_ptr().add(u_idx) as *const i8,
-                    std::arch::x86_64::_MM_HINT_T0,
-                );
-            }
-            let nhp = *n_p2_hex_pending;
-            unsafe {
-                *pending_ev_hex.get_unchecked_mut(nhp) = item;
-                *pending_ev_hex_pk.get_unchecked_mut(nhp) = pk;
-            }
-            let next_nhp = nhp + 1;
-            if next_nhp == LINK_PENDING {
-                flush_dedup_hex_pending::<E, PD>(
-                    LINK_PENDING,
-                    pending_ev_hex,
-                    pending_ev_hex_pk,
-                    ev_worker_hex,
-                    link_map,
-                    buckets_out,
-                    shard_mc,
-                );
-                *n_p2_hex_pending = 0;
-            } else {
-                *n_p2_hex_pending = next_nhp;
-            }
+            ev_pipe.push_hex_pk::<PD>(pk, item, ev_worker_hex, link_map, buckets_out, shard_mc);
         }
         return;
     }
@@ -2362,26 +2381,7 @@ fn handle_p2_non_fast<E: DedupEmit, const PD: bool>(
         if lm_empty {
             buckets_out.push(pshard_for_uh42(h42), item);
         } else {
-            link_map.prefetch_bloom_b37(h42);
-            let np = *n_p2_pending;
-            unsafe {
-                *pending_ev.get_unchecked_mut(np) = item;
-                *pending_h42.get_unchecked_mut(np) = h42;
-            }
-            let next_np = np + 1;
-            if next_np == LINK_PENDING {
-                flush_dedup_pending::<E, PD>(
-                    LINK_PENDING,
-                    pending_ev,
-                    pending_h42,
-                    link_map,
-                    buckets_out,
-                    shard_mc,
-                );
-                *n_p2_pending = 0;
-            } else {
-                *n_p2_pending = next_np;
-            }
+            ev_pipe.push_b37::<PD>(h42, item, link_map, buckets_out, shard_mc);
         }
     } else if person_key.is_hex() {
         let mut item = E::from_ext_fields(person_key, ts_ms, window_start_ms, price_cents, cat_id);
@@ -2396,36 +2396,14 @@ fn handle_p2_non_fast<E: DedupEmit, const PD: bool>(
             ));
             buckets_out.push((h64 as usize) & (P_PERSON - 1), item);
         } else {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                std::arch::x86_64::_mm_prefetch(
-                    ev_worker_hex
-                        .get_unchecked(person_key.hex_wid())
-                        .as_ptr()
-                        .add(person_key.hex_idx()) as *const i8,
-                    std::arch::x86_64::_MM_HINT_T0,
-                );
-            }
-            let nhp = *n_p2_hex_pending;
-            unsafe {
-                *pending_ev_hex.get_unchecked_mut(nhp) = item;
-                *pending_ev_hex_pk.get_unchecked_mut(nhp) = person_key;
-            }
-            let next_nhp = nhp + 1;
-            if next_nhp == LINK_PENDING {
-                flush_dedup_hex_pending::<E, PD>(
-                    LINK_PENDING,
-                    pending_ev_hex,
-                    pending_ev_hex_pk,
-                    ev_worker_hex,
-                    link_map,
-                    buckets_out,
-                    shard_mc,
-                );
-                *n_p2_hex_pending = 0;
-            } else {
-                *n_p2_hex_pending = next_nhp;
-            }
+            ev_pipe.push_hex_pk::<PD>(
+                person_key,
+                item,
+                ev_worker_hex,
+                link_map,
+                buckets_out,
+                shard_mc,
+            );
         }
     } else {
         let pk0 = person_key;
@@ -2517,1061 +2495,1161 @@ fn wide_dedup_eq(a: &ParsedEvent16, b: &ParsedEvent16, ev_worker_arenas: &[LongA
     )
 }
 
+struct EvWorkerSlot {
+    slab: Option<SlabArena>,
+    dedup: Vec<Vec<MutChunkRef<ParsedEvent16>>>,
+    hex_slab: Option<SlabArena>,
+    hex_dedup: Vec<Vec<MutChunkRef<HexEvent32>>>,
+    arena: LongArena,
+    hex: Vec<Hex128>,
+    ext: Vec<ExtEvent>,
+}
+
+struct EvShared {
+    ev_slabs: Vec<SlabArena>,
+    dedup_chunks: Vec<Vec<MutChunkRef<ParsedEvent16>>>,
+    hex_slabs: Vec<SlabArena>,
+    hex_dedup_chunks: Vec<Vec<MutChunkRef<HexEvent32>>>,
+    ev_worker_arenas: Vec<LongArena>,
+    ev_worker_hex: Vec<Vec<Hex128>>,
+    ev_worker_ext: Vec<Vec<ExtEvent>>,
+}
+
+struct WorkerPhase2Out<E: Copy, C: Copy> {
+    pe_slab: Option<SlabArena>,
+    dedup_chunks: Vec<Vec<MutChunkRef<E>>>,
+    cl_slab: Option<SlabArena>,
+    cl_chunks: Vec<Vec<MutChunkRef<C>>>,
+    cl_arena: LongArena,
+    cl_hex: Vec<Hex128>,
+    cl_ext: Vec<ExtClick>,
+    err: Option<io::Error>,
+}
+
+impl<E: Copy, C: Copy> WorkerPhase2Out<E, C> {
+    fn new() -> Self {
+        Self {
+            pe_slab: None,
+            dedup_chunks: Vec::new(),
+            cl_slab: None,
+            cl_chunks: Vec::new(),
+            cl_arena: LongArena::default(),
+            cl_hex: Vec::new(),
+            cl_ext: Vec::new(),
+            err: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct P2DetailAcc {
+    unpack_ns: u64,
+    bloom_ns: u64,
+    probe_ns: u64,
+    push_ns: u64,
+    hex_ns: u64,
+    counts: P2Micro,
+}
+
+impl P2DetailAcc {
+    #[inline(always)]
+    fn add_shard(&mut self, s_ns: u64, tot_cyc: u64, mc: &P2Micro) {
+        let tracked = mc.bloom_cyc + mc.probe_cyc + mc.push_cyc + mc.hex_cyc;
+        let unpack_cyc = tot_cyc.saturating_sub(tracked);
+        let cyc_to_ns = |c: u64| -> u64 { ((s_ns as u128 * c as u128) / tot_cyc as u128) as u64 };
+        let u_ns = cyc_to_ns(unpack_cyc);
+        let b_ns = cyc_to_ns(mc.bloom_cyc);
+        let pr_ns = cyc_to_ns(mc.probe_cyc);
+        let pu_ns = cyc_to_ns(mc.push_cyc);
+        self.unpack_ns += u_ns;
+        self.bloom_ns += b_ns;
+        self.probe_ns += pr_ns;
+        self.push_ns += pu_ns;
+        self.hex_ns += s_ns.saturating_sub(u_ns + b_ns + pr_ns + pu_ns);
+        self.counts.b37_bloom_hits += mc.b37_bloom_hits;
+        self.counts.b37_slot_hits += mc.b37_slot_hits;
+        self.counts.b37_misses += mc.b37_misses;
+        self.counts.hex_bloom_hits += mc.hex_bloom_hits;
+        self.counts.hex_slot_hits += mc.hex_slot_hits;
+        self.counts.hex_misses += mc.hex_misses;
+        self.counts.surv_total += mc.surv_total;
+    }
+
+    fn flush_to_detail(&self, detail: &DetailStats, p1_ns: u64, p2_ns: u64) {
+        detail.dedup_p1_ns.fetch_add(p1_ns, Ordering::Relaxed);
+        detail.dedup_p2_ns.fetch_add(p2_ns, Ordering::Relaxed);
+        detail
+            .p2_unpack_ns
+            .fetch_add(self.unpack_ns, Ordering::Relaxed);
+        detail
+            .p2_bloom_ns
+            .fetch_add(self.bloom_ns, Ordering::Relaxed);
+        detail
+            .p2_probe_ns
+            .fetch_add(self.probe_ns, Ordering::Relaxed);
+        detail.p2_push_ns.fetch_add(self.push_ns, Ordering::Relaxed);
+        detail.p2_hex_ns.fetch_add(self.hex_ns, Ordering::Relaxed);
+        detail
+            .p2_b37_bloom_hits
+            .fetch_add(self.counts.b37_bloom_hits, Ordering::Relaxed);
+        detail
+            .p2_b37_slot_hits
+            .fetch_add(self.counts.b37_slot_hits, Ordering::Relaxed);
+        detail
+            .p2_b37_misses
+            .fetch_add(self.counts.b37_misses, Ordering::Relaxed);
+        detail
+            .p2_hex_bloom_hits
+            .fetch_add(self.counts.hex_bloom_hits, Ordering::Relaxed);
+        detail
+            .p2_hex_slot_hits
+            .fetch_add(self.counts.hex_slot_hits, Ordering::Relaxed);
+        detail
+            .p2_hex_misses
+            .fetch_add(self.counts.hex_misses, Ordering::Relaxed);
+        detail
+            .p2_surv_total
+            .fetch_add(self.counts.surv_total, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn wait_gate(gate: &(Mutex<bool>, Condvar), abort: &AtomicBool) -> bool {
+    let mut g = gate.0.lock().unwrap();
+    while !*g && !abort.load(Ordering::Acquire) {
+        g = gate.1.wait(g).unwrap();
+    }
+    !abort.load(Ordering::Acquire)
+}
+
+fn assemble_ev_shared(ev_slots: &[Mutex<Option<EvWorkerSlot>>]) -> EvShared {
+    let n = ev_slots.len();
+    let mut ev_slabs = Vec::with_capacity(n);
+    let mut dedup_chunks: Vec<Vec<MutChunkRef<ParsedEvent16>>> = (0..P_DEDUP)
+        .map(|_| Vec::new())
+        .collect();
+    let mut hex_slabs = Vec::with_capacity(n);
+    let mut hex_dedup_chunks: Vec<Vec<MutChunkRef<HexEvent32>>> = (0..P_HEX_DEDUP)
+        .map(|_| Vec::new())
+        .collect();
+    let mut ev_worker_arenas = Vec::with_capacity(n);
+    let mut ev_worker_hex = Vec::with_capacity(n);
+    let mut ev_worker_ext = Vec::with_capacity(n);
+
+    for slot_m in ev_slots {
+        let Some(slot) = slot_m.lock().unwrap().take() else {
+            ev_worker_arenas.push(LongArena::default());
+            ev_worker_hex.push(Vec::new());
+            ev_worker_ext.push(Vec::new());
+            continue;
+        };
+        if let Some(slab) = slot.slab {
+            ev_slabs.push(slab);
+            for (ds, v) in slot.dedup.into_iter().enumerate() {
+                dedup_chunks[ds].extend(v);
+            }
+        }
+        if let Some(h_slab) = slot.hex_slab {
+            hex_slabs.push(h_slab);
+            for (hs, v) in slot.hex_dedup.into_iter().enumerate() {
+                hex_dedup_chunks[hs].extend(v);
+            }
+        }
+        ev_worker_arenas.push(slot.arena);
+        ev_worker_hex.push(slot.hex);
+        ev_worker_ext.push(slot.ext);
+    }
+
+    EvShared {
+        ev_slabs,
+        dedup_chunks,
+        hex_slabs,
+        hex_dedup_chunks,
+        ev_worker_arenas,
+        ev_worker_hex,
+        ev_worker_ext,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_clicks_and_dedup<
+fn run_parse_clicks_and_dedup<
+    const COMPACT_EV: bool,
     E: DedupEmit,
     C: ClickEmit,
     const PD: bool,
 >(
-    dedup_slots: &[Mutex<Option<Vec<MutChunkRef<ParsedEvent16>>>>],
-    hex_dedup_slots: &[Mutex<Option<Vec<MutChunkRef<HexEvent32>>>>],
-    ev_worker_ext: &[Vec<ExtEvent>],
-    ev_worker_arenas: &[LongArena],
-    ev_worker_hex: &[Vec<Hex128>],
+    event_src: &CsvSource,
+    ev_chunks: &[crate::csv::ChunkTask],
+    ev_hint_bytes: usize,
+    link_paths: &[std::path::PathBuf],
     click_src: &CsvSource,
     cl_chunks: &[crate::csv::ChunkTask],
     cl_hint_bytes: usize,
     pe_hint_bytes: usize,
     lookups: &Lookups,
-    link_map: &LinkMap,
     window_start_ms: i64,
     window_end_ms: i64,
     window_start_sec: i64,
     click_window_start_ms: i64,
+    t_lookups: Instant,
     ncpu: usize,
     detail: &DetailStats,
-) -> io::Result<ClicksDedupOut<E, C>> {
+) -> io::Result<(
+    LinkMap,
+    EvShared,
+    ClicksDedupOut<E, C>,
+    Instant,
+    Instant,
+    bool,
+)> {
     const RING: usize = 16;
 
     let n_workers = ncpu.clamp(1, 63);
-    let lm_empty = link_map.is_empty();
+    let overlap_links = n_workers >= 2 && !link_paths.is_empty() && ev_chunks.len() >= 4;
+
+    let link_map_cell: OnceLock<LinkMap> = OnceLock::new();
+    let lm_gate = (Mutex::new(false), Condvar::new());
+    let mut t_links = t_lookups;
+    if !overlap_links {
+        let t_l0 = Instant::now();
+        let lm = build_link_map(link_paths, n_workers)?;
+        t_links = Instant::now();
+        if PD {
+            detail
+                .links_w_ns
+                .store((t_links - t_l0).as_nanos() as u64, Ordering::Relaxed);
+        }
+        let _ = link_map_cell.set(lm);
+        *lm_gate.0.lock().unwrap() = true;
+    }
+
+    let est_ev_total = (event_src.total_bytes() / 68).max(1);
+    let n_ev_active = n_workers.min(ev_chunks.len().max(1));
+    let est_hex_cap = (est_ev_total / (7 * n_ev_active)).max(512);
+    let est_ext_cap = (est_ev_total / (18 * n_ev_active)).max(256);
+
+    let ev_shared_cell: OnceLock<EvShared> = OnceLock::new();
+    let ev_gate = (Mutex::new(false), Condvar::new());
+    let ev_rem = AtomicUsize::new(n_workers);
+    let abort = AtomicBool::new(false);
+    let t_ev_done_cell: OnceLock<Instant> = OnceLock::new();
+
+    let next_ev = AtomicUsize::new(0);
     let next_cl = AtomicUsize::new(0);
-    let next_d_shard = AtomicUsize::new(0);
-    let next_hx_shard = AtomicUsize::new(0);
+    let next_hx = AtomicUsize::new(0);
+    let next_d = AtomicUsize::new(0);
 
-    let mut cl_worker_slabs: Vec<Option<SlabArena>> = (0..n_workers).map(|_| None).collect();
-    let mut cl_worker_chunks: Vec<Vec<Vec<MutChunkRef<C>>>> =
-        (0..n_workers).map(|_| Vec::new()).collect();
-    let mut cl_worker_arenas: Vec<LongArena> = (0..n_workers).map(|_| LongArena::default()).collect();
-    let mut cl_worker_hex: Vec<Vec<Hex128>> = (0..n_workers).map(|_| Vec::new()).collect();
-    let mut cl_worker_ext: Vec<Vec<ExtClick>> = (0..n_workers).map(|_| Vec::new()).collect();
+    let ev_slots: Vec<Mutex<Option<EvWorkerSlot>>> =
+        (0..n_workers).map(|_| Mutex::new(None)).collect();
+    let mut p2_outs: Vec<WorkerPhase2Out<E, C>> =
+        (0..n_workers).map(|_| WorkerPhase2Out::new()).collect();
+    let mut lm_err: Option<io::Error> = None;
 
-    let mut pe_worker_slabs: Vec<Option<SlabArena>> = (0..n_workers).map(|_| None).collect();
-    let mut dedup_worker_chunks: Vec<Vec<Vec<MutChunkRef<E>>>> =
-        (0..n_workers).map(|_| Vec::new()).collect();
-    let mut worker_errs: Vec<Option<io::Error>> = (0..n_workers).map(|_| None).collect();
+    let run_worker = |wid: usize, p2_out: &mut WorkerPhase2Out<E, C>| {
+        // Phase 1: parse events into local SlabBuckets -> publish to ev_slots[wid].
+        let mut ev_slot = EvWorkerSlot {
+            slab: None,
+            dedup: Vec::new(),
+            hex_slab: None,
+            hex_dedup: Vec::new(),
+            arena: LongArena::default(),
+            hex: Vec::new(),
+            ext: Vec::new(),
+        };
+        if !abort.load(Ordering::Acquire) {
+            run_parse_events_worker::<COMPACT_EV, PD>(
+                event_src,
+                ev_chunks,
+                &next_ev,
+                ev_hint_bytes,
+                est_hex_cap,
+                est_ext_cap,
+                lookups,
+                window_start_ms,
+                window_end_ms,
+                window_start_sec,
+                wid,
+                &abort,
+                detail,
+                &mut ev_slot,
+                &mut p2_out.err,
+            );
+        }
+        if p2_out.err.is_some() {
+            abort.store(true, Ordering::Release);
+            lm_gate.1.notify_all();
+        } else {
+            *ev_slots[wid].lock().unwrap() = Some(ev_slot);
+        }
+        if ev_rem.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if !abort.load(Ordering::Acquire) {
+                let ev_shared = assemble_ev_shared(&ev_slots);
+                let _ = ev_shared_cell.set(ev_shared);
+                let _ = t_ev_done_cell.set(Instant::now());
+            }
+            *ev_gate.0.lock().unwrap() = true;
+            ev_gate.1.notify_all();
+        }
+        if abort.load(Ordering::Acquire) {
+            return;
+        }
 
-    std::thread::scope(|scope| {
-        for (
-            wid,
-            (
-                ((((cl_slab_slot, cl_chunks_slot), (cl_arena_out, cl_hex_out)), cl_ext_out),
-                (pe_slab_slot, ev_out_slot)),
-                err_out,
-            ),
-        ) in cl_worker_slabs
-            .iter_mut()
-            .zip(cl_worker_chunks.iter_mut())
-            .zip(cl_worker_arenas.iter_mut().zip(cl_worker_hex.iter_mut()))
-            .zip(cl_worker_ext.iter_mut())
-            .zip(
-                pe_worker_slabs
-                    .iter_mut()
-                    .zip(dedup_worker_chunks.iter_mut()),
-            )
-            .zip(worker_errs.iter_mut())
-            .enumerate()
-        {
-            let next_cl_ref = &next_cl;
-            let next_d_ref = &next_d_shard;
-            let next_hx_ref = &next_hx_shard;
-            scope.spawn(move || {
-                // Phase A: Parse clicks into SlabBuckets<C, P_PERSON, CL_CHUNK_LEN>.
-                let t_cl = if PD { Some(Instant::now()) } else { None };
+        // Wait for LinkMap (no-op in steady state when overlap_links completes early).
+        if !wait_gate(&lm_gate, &abort) {
+            return;
+        }
+        let Some(link_map) = link_map_cell.get() else {
+            return;
+        };
+        let lm_empty = link_map.is_empty();
+
+        // Phase 2: parse clicks with 2-stage ClLinkPipe without waiting for event stragglers.
+        let t_cl = if PD { Some(Instant::now()) } else { None };
+        if !cl_chunks.is_empty() {
+            let first = next_cl.fetch_add(1, Ordering::Relaxed);
+            if first < cl_chunks.len() {
                 let mut buf = Vec::new();
-                if !cl_chunks.is_empty() {
-                    let first = next_cl_ref.fetch_add(1, Ordering::Relaxed);
-                    if first < cl_chunks.len() {
-                        let mut dcache =
-                            DateCache::new_for_window(click_window_start_ms, window_end_ms);
-                        let mut cl_buckets =
-                            SlabBuckets::<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>::new(cl_hint_bytes);
-                        let tmpl =
-                            C::make_b37_pending(0, 0, click_window_start_ms, click_window_start_ms, 0);
-                        let mut pending_cl = [tmpl; LINK_PENDING];
-                        let mut pending_h42 = [0u64; LINK_PENDING];
-                        let mut n_pending = 0usize;
-                        let mut pending_cl_hex = [tmpl; LINK_PENDING];
-                        let mut pending_cl_hex_h64 = [0u64; LINK_PENDING];
-                        let mut pending_cl_hex_val = [Hex128::default(); LINK_PENDING];
-                        let mut n_hex_pending = 0usize;
+                let cl_cap = ((cl_hint_bytes / 16) / 5).max(256);
+                p2_out.cl_hex.reserve(cl_cap);
+                p2_out.cl_ext.reserve(cl_cap);
+                let mut dcache = DateCache::new_for_window(click_window_start_ms, window_end_ms);
+                let mut cl_buckets =
+                    SlabBuckets::<C, P_PERSON, CL_CHUNK_LEN, PERSON_SWCB_W>::new(cl_hint_bytes);
+                let tmpl =
+                    C::make_b37_pending(0, 0, click_window_start_ms, click_window_start_ms, 0);
+                let mut cl_pipe = ClLinkPipe::new(tmpl);
 
-                        let mut cidx = first;
-                        while let Some(&task) = cl_chunks.get(cidx) {
-                            if let Err(e) = click_src.for_each_chunk_direct_batched::<4>(
-                                task,
-                                &mut buf,
-                                |padded, cm_buf, lines| {
-                                    process_cl_batch_direct::<C>(
-                                        padded,
-                                        cm_buf,
-                                        lines,
-                                        &mut dcache,
-                                        lookups,
-                                        link_map,
-                                        lm_empty,
-                                        wid,
-                                        click_window_start_ms,
-                                        window_end_ms,
-                                        cl_arena_out,
-                                        cl_hex_out,
-                                        cl_ext_out,
-                                        &mut cl_buckets,
-                                        &mut pending_cl,
-                                        &mut pending_h42,
-                                        &mut n_pending,
-                                        &mut pending_cl_hex,
-                                        &mut pending_cl_hex_h64,
-                                        &mut pending_cl_hex_val,
-                                        &mut n_hex_pending,
-                                    );
-                                },
-                            ) {
-                                *err_out = Some(e);
-                                return;
+                let mut cidx = first;
+                while let Some(&task) = cl_chunks.get(cidx) {
+                    if abort.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Err(e) = click_src.for_each_chunk_direct_batched::<4>(
+                        task,
+                        &mut buf,
+                        |padded, cm_buf, lines| {
+                            process_cl_batch_direct::<C>(
+                                padded,
+                                cm_buf,
+                                lines,
+                                &mut dcache,
+                                lookups,
+                                link_map,
+                                lm_empty,
+                                wid,
+                                click_window_start_ms,
+                                window_end_ms,
+                                &mut p2_out.cl_arena,
+                                &mut p2_out.cl_hex,
+                                &mut p2_out.cl_ext,
+                                &mut cl_buckets,
+                                &mut cl_pipe,
+                            );
+                        },
+                    ) {
+                        p2_out.err = Some(e);
+                        abort.store(true, Ordering::Release);
+                        lm_gate.1.notify_all();
+                        ev_gate.1.notify_all();
+                        return;
+                    }
+                    cidx = next_cl.fetch_add(1, Ordering::Relaxed);
+                }
+                if !lm_empty {
+                    cl_pipe.finish(
+                        link_map,
+                        wid,
+                        &mut p2_out.cl_ext,
+                        &mut cl_buckets,
+                    );
+                }
+                let (cl_slab, cl_done) = cl_buckets.finish();
+                p2_out.cl_slab = Some(cl_slab);
+                p2_out.cl_chunks = cl_done;
+            }
+        }
+        if let Some(t) = t_cl {
+            detail
+                .cl_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        // Wait for EvShared (no-op whenever clicks outlast event tail).
+        if !wait_gate(&ev_gate, &abort) {
+            return;
+        }
+        let Some(ev_shared) = ev_shared_cell.get() else {
+            return;
+        };
+        let ev_worker_ext = &ev_shared.ev_worker_ext;
+        let ev_worker_arenas = &ev_shared.ev_worker_arenas;
+        let ev_worker_hex = &ev_shared.ev_worker_hex;
+
+        // Phase 3 (lock-free EvShared shards): pull P_HEX_DEDUP (0..64) FIRST, then P_DEDUP (0..256).
+        let mut person_out: Option<SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>> = None;
+        let mut dedup_u32: Vec<u32> = Vec::new();
+        let mut dedup_keys: Vec<u64> = Vec::new();
+        let mut dedup_idxs: Vec<u32> = Vec::new();
+        let mut gen_table: Option<HashTable<u32>> = None;
+        let mut ring_u32 = [DedupProbeU32 {
+            tag12: 0,
+            slot: u32::MAX,
+        }; RING];
+        let mut ring_wide = [0usize; RING];
+        let mut ev_pipe = EvLinkPipe::<E>::new();
+
+        let mut p1_ns = 0u64;
+        let mut p2_ns = 0u64;
+        let mut p2_acc = P2DetailAcc::default();
+
+        // LPT: pull coarser/heavier P_HEX_DEDUP shards before fine P_DEDUP shards.
+        loop {
+            let hs = next_hx.fetch_add(1, Ordering::Relaxed);
+            if hs >= P_HEX_DEDUP {
+                break;
+            }
+            let shard_chunks = &ev_shared.hex_dedup_chunks[hs];
+            let total: usize = shard_chunks.iter().map(|c| c.len).sum();
+            if total == 0 {
+                continue;
+            }
+            let t_p1 = if PD { Some(Instant::now()) } else { None };
+            let buckets_out =
+                person_out.get_or_insert_with(|| SlabBuckets::new(pe_hint_bytes));
+            let n_chunks = shard_chunks.len();
+            if n_chunks <= MAX_HX_U32_CHUNKS {
+                let cap = (total * 2).max(16);
+                dedup_u32.clear();
+                dedup_u32.resize(cap, 0u32);
+                let dedup_u32_ptr = dedup_u32.as_ptr();
+
+                for cidx in 0..n_chunks {
+                    let c_len = shard_chunks[cidx].len;
+                    let c_ptr = shard_chunks[cidx].ptr;
+                    let cbase = (cidx as u32) << HX_CHUNK_SHIFT;
+                    let pre = c_len.min(RING);
+                    for i in 0..pre {
+                        let hx_i = unsafe { &*c_ptr.add(i) };
+                        ring_u32[i] =
+                            unsafe { make_hx_probe_u32(hx_i.ev_hi, hx_i.ev_lo, cap, dedup_u32_ptr) };
+                    }
+                    for ridx in 0..c_len {
+                        let prb = ring_u32[ridx & (RING - 1)];
+                        if ridx + RING < c_len {
+                            let hx_a = unsafe { &*c_ptr.add(ridx + RING) };
+                            ring_u32[ridx & (RING - 1)] = unsafe {
+                                make_hx_probe_u32(hx_a.ev_hi, hx_a.ev_lo, cap, dedup_u32_ptr)
+                            };
+                        }
+                        let hx = unsafe { *c_ptr.add(ridx) };
+                        let mut slot = prb.slot as usize;
+                        loop {
+                            let entry = unsafe { *dedup_u32.get_unchecked(slot) };
+                            if entry == 0 {
+                                unsafe {
+                                    *dedup_u32.get_unchecked_mut(slot) =
+                                        prb.tag12 | (cbase + (ridx as u32) + 1);
+                                }
+                                break;
                             }
-                            cidx = next_cl_ref.fetch_add(1, Ordering::Relaxed);
+                            if (entry & 0xFFF0_0000) == prb.tag12 {
+                                let prev_packed = (entry & 0x000F_FFFF) - 1;
+                                let pc = (prev_packed >> HX_CHUNK_SHIFT) as usize;
+                                let pr = (prev_packed & HX_CHUNK_MASK) as usize;
+                                let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
+                                let prev_hx = unsafe { *prev_ptr };
+                                if prev_hx.ev_hi == hx.ev_hi && prev_hx.ev_lo == hx.ev_lo {
+                                    let hx_ing = hx32_ingest_ms(&hx, window_start_sec, ev_worker_ext);
+                                    let cur_ing =
+                                        hx32_ingest_ms(&prev_hx, window_start_sec, ev_worker_ext);
+                                    unsafe {
+                                        if hx_ing < cur_ing {
+                                            *prev_ptr = hx;
+                                        }
+                                        (*c_ptr.add(ridx)).ts_rel_ms = HX_TS_DEAD;
+                                    }
+                                    break;
+                                }
+                            }
+                            slot += 1;
+                            if slot == cap {
+                                slot = 0;
+                            }
                         }
-                        if n_pending > 0 {
-                            flush_cl_pending(
-                                n_pending,
-                                &mut pending_cl,
-                                &pending_h42,
-                                link_map,
-                                wid,
-                                cl_ext_out,
-                                &mut cl_buckets,
-                            );
-                        }
-                        if n_hex_pending > 0 {
-                            flush_cl_hex_pending(
-                                n_hex_pending,
-                                &mut pending_cl_hex,
-                                &pending_cl_hex_h64,
-                                &pending_cl_hex_val,
-                                link_map,
-                                wid,
-                                cl_ext_out,
-                                &mut cl_buckets,
-                            );
-                        }
-                        let (cl_slab, cl_done) = cl_buckets.finish();
-                        *cl_slab_slot = Some(cl_slab);
-                        *cl_chunks_slot = cl_done;
                     }
                 }
-                drop(buf);
-                if let Some(t) = t_cl {
-                    detail
-                        .cl_ns
-                        .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else {
+                let gt = gen_table.get_or_insert_with(HashTable::new);
+                gt.clear();
+                for cidx in 0..n_chunks {
+                    let c_len = shard_chunks[cidx].len;
+                    let c_ptr = shard_chunks[cidx].ptr;
+                    let cbase = (cidx as u32) << HX_CHUNK_SHIFT;
+                    for ridx in 0..c_len {
+                        let hx = unsafe { *c_ptr.add(ridx) };
+                        let eh = hash_hex128(Hex128 {
+                            hi: hx.ev_hi,
+                            lo: hx.ev_lo,
+                        });
+                        match gt.entry(
+                            eh,
+                            |&packed| {
+                                let pc = (packed >> HX_CHUNK_SHIFT) as usize;
+                                let pr = (packed & HX_CHUNK_MASK) as usize;
+                                let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
+                                prev.ev_hi == hx.ev_hi && prev.ev_lo == hx.ev_lo
+                            },
+                            |&packed| {
+                                let pc = (packed >> HX_CHUNK_SHIFT) as usize;
+                                let pr = (packed & HX_CHUNK_MASK) as usize;
+                                let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
+                                hash_hex128(Hex128 {
+                                    hi: prev.ev_hi,
+                                    lo: prev.ev_lo,
+                                })
+                            },
+                        ) {
+                            hashbrown::hash_table::Entry::Occupied(occ) => {
+                                let packed = *occ.get();
+                                let pc = (packed >> HX_CHUNK_SHIFT) as usize;
+                                let pr = (packed & HX_CHUNK_MASK) as usize;
+                                let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
+                                let prev_hx = unsafe { *prev_ptr };
+                                let hx_ing = hx32_ingest_ms(&hx, window_start_sec, ev_worker_ext);
+                                let cur_ing =
+                                    hx32_ingest_ms(&prev_hx, window_start_sec, ev_worker_ext);
+                                unsafe {
+                                    if hx_ing < cur_ing {
+                                        *prev_ptr = hx;
+                                    }
+                                    (*c_ptr.add(ridx)).ts_rel_ms = HX_TS_DEAD;
+                                }
+                            }
+                            hashbrown::hash_table::Entry::Vacant(vac) => {
+                                vac.insert(cbase | (ridx as u32));
+                            }
+                        }
+                    }
                 }
+            }
+            if let Some(t) = t_p1 {
+                p1_ns += t.elapsed().as_nanos() as u64;
+            }
+            let t_p2 = if PD { Some(Instant::now()) } else { None };
+            let c_p2_0 = if PD { rdtsc_now() } else { 0 };
+            let mut shard_mc = P2Micro::default();
 
-                // Phase B (ZERO barrier): pull P_DEDUP shards & emit into SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>.
-                let mut person_out: Option<SlabBuckets<E, P_PERSON, PE_CHUNK_LEN, PERSON_SWCB_W>> = None;
-                let mut dedup_u32: Vec<u32> = Vec::new();
-                let mut dedup_keys: Vec<u64> = Vec::new();
-                let mut dedup_idxs: Vec<u32> = Vec::new();
-                let mut gen_table: Option<HashTable<u32>> = None;
-                let mut ring_u32 = [DedupProbeU32 {
-                    tag12: 0,
-                    slot: u32::MAX,
-                }; RING];
-                let mut ring_wide = [0usize; RING];
-
-                let mut pending_ev = [E::empty_tmpl(); LINK_PENDING];
-                let mut pending_h42 = [0u64; LINK_PENDING];
-                let mut pending_ev_hex = [E::empty_tmpl(); LINK_PENDING];
-                let mut pending_ev_hex_pk = [CompactKey64::EMPTY; LINK_PENDING];
-                let mut p1_ns = 0u64;
-                let mut p2_ns = 0u64;
-                let mut p2_unpack_ns = 0u64;
-                let mut p2_bloom_ns = 0u64;
-                let mut p2_probe_ns = 0u64;
-                let mut p2_push_ns = 0u64;
-                let mut p2_hex_ns = 0u64;
-                let mut p2_counts = P2Micro::default();
-
-                loop {
-                    let ds = next_d_ref.fetch_add(1, Ordering::Relaxed);
-                    if ds >= P_DEDUP {
-                        break;
-                    }
-                    let Some(shard_chunks) = dedup_slots[ds].lock().unwrap().take() else {
-                        continue;
-                    };
-                    let total: usize = shard_chunks.iter().map(|c| c.len).sum();
-                    if total == 0 {
-                        continue;
-                    }
-                    let t_p1 = if PD { Some(Instant::now()) } else { None };
-                    let buckets_out =
-                        person_out.get_or_insert_with(|| SlabBuckets::new(pe_hint_bytes));
-                    if let Some(gt) = &mut gen_table {
-                        gt.clear();
-                    }
-
-                    let n_chunks = shard_chunks.len();
-                    if n_chunks <= MAX_DEDUP_U32_CHUNKS {
-                        let cap = (total * 2).max(16);
-                        dedup_u32.clear();
-                        dedup_u32.resize(cap, 0u32);
-                        let dedup_u32_ptr = dedup_u32.as_ptr();
-
-                        for cidx in 0..n_chunks {
-                            let c_len = shard_chunks[cidx].len;
-                            let c_ptr = shard_chunks[cidx].ptr;
-                            let cbase = (cidx as u32) << EV_CHUNK_SHIFT;
-                            let pre = c_len.min(RING);
-                            for i in 0..pre {
-                                let w0 = unsafe { (*c_ptr.add(i)).w0 };
-                                ring_u32[i] =
-                                    unsafe { make_dedup_probe_u32(w0, cap, dedup_u32_ptr) };
-                            }
-
-                            for ridx in 0..c_len {
-                                let prb = ring_u32[ridx & (RING - 1)];
-                                if ridx + RING < c_len {
-                                    let w0_a = unsafe { (*c_ptr.add(ridx + RING)).w0 };
-                                    ring_u32[ridx & (RING - 1)] =
-                                        unsafe { make_dedup_probe_u32(w0_a, cap, dedup_u32_ptr) };
-                                }
-
-                                let ev = unsafe { *c_ptr.add(ridx) };
-                                if prb.slot != u32::MAX {
-                                    let ev_rem = ev.w0 & PE_EV_REM_MASK;
-                                    let mut slot = prb.slot as usize;
-                                    loop {
-                                        let entry = unsafe { *dedup_u32.get_unchecked(slot) };
-                                        if entry == 0 {
-                                            unsafe {
-                                                *dedup_u32.get_unchecked_mut(slot) =
-                                                    prb.tag12 | (cbase + (ridx as u32) + 1);
-                                            }
-                                            break;
-                                        }
-                                        if (entry & 0xFFF0_0000) == prb.tag12 {
-                                            let prev_packed = (entry & 0x000F_FFFF) - 1;
-                                            let pc = (prev_packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (prev_packed & EV_CHUNK_MASK) as usize;
-                                            let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
-                                            let prev_ev = unsafe { *prev_ptr };
-                                            if (prev_ev.w0 & PE_EV_REM_MASK) == ev_rem {
-                                                let ev_ing = ev16_ingest_ts(
-                                                    &ev,
-                                                    window_start_sec,
-                                                    ev_worker_ext,
-                                                );
-                                                let cur_ing = ev16_ingest_ts(
-                                                    &prev_ev,
-                                                    window_start_sec,
-                                                    ev_worker_ext,
-                                                );
-                                                unsafe {
-                                                    if ev_ing < cur_ing {
-                                                        *prev_ptr = ev;
-                                                    }
-                                                    (*c_ptr.add(ridx)).w0 = PE_DEAD;
-                                                }
-                                                break;
-                                            }
-                                        }
-                                        slot += 1;
-                                        if slot == cap {
-                                            slot = 0;
-                                        }
-                                    }
-                                } else {
-                                    let gt = gen_table.get_or_insert_with(HashTable::new);
-                                    let ev_key = CompactKey64(ev.w1);
-                                    let eh = hash_raw_key(ev_key, ev_worker_arenas, &[]);
-                                    match gt.entry(
-                                        eh,
-                                        |&packed| {
-                                            let pc = (packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (packed & EV_CHUNK_MASK) as usize;
-                                            let prev_k = CompactKey64(unsafe {
-                                                (*shard_chunks[pc].ptr.add(pr)).w1
-                                            });
-                                            eq_raw_keys(
-                                                prev_k,
-                                                ev_key,
-                                                ev_worker_arenas,
-                                                &[],
-                                                ev_worker_arenas,
-                                                &[],
-                                            )
-                                        },
-                                        |&packed| {
-                                            let pc = (packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (packed & EV_CHUNK_MASK) as usize;
-                                            let prev_k = CompactKey64(unsafe {
-                                                (*shard_chunks[pc].ptr.add(pr)).w1
-                                            });
-                                            hash_raw_key(prev_k, ev_worker_arenas, &[])
-                                        },
-                                    ) {
-                                        hashbrown::hash_table::Entry::Occupied(occ) => {
-                                            let packed = *occ.get();
-                                            let pc = (packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (packed & EV_CHUNK_MASK) as usize;
-                                            let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
-                                            let ev_ing = ev16_ingest_ts(
-                                                &ev,
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            let cur_ing = ev16_ingest_ts(
-                                                unsafe { &*prev_ptr },
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            unsafe {
-                                                if ev_ing < cur_ing {
-                                                    *prev_ptr = ev;
-                                                }
-                                                (*c_ptr.add(ridx)).w0 = PE_DEAD;
-                                            }
-                                        }
-                                        hashbrown::hash_table::Entry::Vacant(vac) => {
-                                            vac.insert(cbase | (ridx as u32));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let cap = (total * 10 / 6).max(16).next_power_of_two();
-                        let mask = cap - 1;
-                        dedup_keys.clear();
-                        dedup_keys.resize(cap, 0u64);
-                        dedup_idxs.resize(cap, 0u32);
-
-                        for cidx in 0..n_chunks {
-                            let c_len = shard_chunks[cidx].len;
-                            let c_ptr = shard_chunks[cidx].ptr;
-                            let cbase = (cidx as u32) << EV_CHUNK_SHIFT;
-                            let pre = c_len.min(RING);
-                            for i in 0..pre {
-                                let w0 = unsafe { (*c_ptr.add(i)).w0 };
-                                ring_wide[i] = if w0 < PE_DEAD {
-                                    let ev_rem = w0 & PE_EV_REM_MASK;
-                                    let slot = (ev_rem as usize) & mask;
-                                    #[cfg(target_arch = "x86_64")]
-                                    unsafe {
-                                        std::arch::x86_64::_mm_prefetch(
-                                            dedup_keys.as_ptr().add(slot) as *const i8,
-                                            std::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    }
-                                    slot
-                                } else {
-                                    usize::MAX
-                                };
-                            }
-                            for ridx in 0..c_len {
-                                let pslot = ring_wide[ridx & (RING - 1)];
-                                if ridx + RING < c_len {
-                                    let w0_a = unsafe { (*c_ptr.add(ridx + RING)).w0 };
-                                    ring_wide[ridx & (RING - 1)] = if w0_a < PE_DEAD {
-                                        let ev_rem = w0_a & PE_EV_REM_MASK;
-                                        let slot = (ev_rem as usize) & mask;
-                                        #[cfg(target_arch = "x86_64")]
-                                        unsafe {
-                                            std::arch::x86_64::_mm_prefetch(
-                                                dedup_keys.as_ptr().add(slot) as *const i8,
-                                                std::arch::x86_64::_MM_HINT_T0,
-                                            );
-                                        }
-                                        slot
-                                    } else {
-                                        usize::MAX
-                                    };
-                                }
-                                let ev = unsafe { *c_ptr.add(ridx) };
-                                if pslot != usize::MAX {
-                                    let ev_key_u = (ev.w0 & PE_EV_REM_MASK) + 1;
-                                    let mut slot = pslot;
-                                    loop {
-                                        let cur = unsafe { *dedup_keys.get_unchecked(slot) };
-                                        if cur == ev_key_u {
-                                            let packed = unsafe { *dedup_idxs.get_unchecked(slot) };
-                                            let pc = (packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (packed & EV_CHUNK_MASK) as usize;
-                                            let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
-                                            let ev_ing = ev16_ingest_ts(
-                                                &ev,
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            let cur_ing = ev16_ingest_ts(
-                                                unsafe { &*prev_ptr },
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            unsafe {
-                                                if ev_ing < cur_ing {
-                                                    *prev_ptr = ev;
-                                                }
-                                                (*c_ptr.add(ridx)).w0 = PE_DEAD;
-                                            }
-                                            break;
-                                        }
-                                        if cur == 0 {
-                                            unsafe {
-                                                *dedup_keys.get_unchecked_mut(slot) = ev_key_u;
-                                                *dedup_idxs.get_unchecked_mut(slot) =
-                                                    cbase | (ridx as u32);
-                                            }
-                                            break;
-                                        }
-                                        slot = (slot + 1) & mask;
-                                    }
-                                } else {
-                                    let gt = gen_table.get_or_insert_with(HashTable::new);
-                                    let eh = wide_dedup_hash(&ev, ev_worker_arenas);
-                                    match gt.entry(
-                                        eh,
-                                        |&packed| {
-                                            let pc = (packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (packed & EV_CHUNK_MASK) as usize;
-                                            let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
-                                            wide_dedup_eq(prev, &ev, ev_worker_arenas)
-                                        },
-                                        |&packed| {
-                                            let pc = (packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (packed & EV_CHUNK_MASK) as usize;
-                                            let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
-                                            wide_dedup_hash(prev, ev_worker_arenas)
-                                        },
-                                    ) {
-                                        hashbrown::hash_table::Entry::Occupied(occ) => {
-                                            let packed = *occ.get();
-                                            let pc = (packed >> EV_CHUNK_SHIFT) as usize;
-                                            let pr = (packed & EV_CHUNK_MASK) as usize;
-                                            let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
-                                            let ev_ing = ev16_ingest_ts(
-                                                &ev,
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            let cur_ing = ev16_ingest_ts(
-                                                unsafe { &*prev_ptr },
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            unsafe {
-                                                if ev_ing < cur_ing {
-                                                    *prev_ptr = ev;
-                                                }
-                                                (*c_ptr.add(ridx)).w0 = PE_DEAD;
-                                            }
-                                        }
-                                        hashbrown::hash_table::Entry::Vacant(vac) => {
-                                            vac.insert(cbase | (ridx as u32));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(t) = t_p1 {
-                        p1_ns += t.elapsed().as_nanos() as u64;
-                    }
-                    let t_p2 = if PD { Some(Instant::now()) } else { None };
-                    let c_p2_0 = if PD { rdtsc_now() } else { 0 };
-                    let mut shard_mc = P2Micro::default();
-
-                    // Pass 2: stream survivors through 2-stage batch-32 Bloom+Slot prefetch -> SlabBuckets<E>.
-                    let mut n_p2_pending = 0usize;
-                    let mut n_p2_hex_pending = 0usize;
-                    for chunk in shard_chunks {
-                        let slice = unsafe { chunk.as_slice() };
-                        let blen = slice.len();
-                        for ridx in 0..blen {
-                            let ev = unsafe { *slice.get_unchecked(ridx) };
-                            let tag = (ev.w0 >> PE_TAG_SHIFT) as u32;
-                            if tag == 0 {
-                                if PD {
-                                    shard_mc.surv_total += 1;
-                                }
-                                let ts_rel_u =
-                                    ((((ev.w0 >> 35) & 0x1FF) << 22) | (ev.w1 >> 42)) as u32;
-                                let h42 = ev.w1 & B37_MASK42;
-                                let item = E::from_fast_ms_b37(h42, ts_rel_u);
-                                if lm_empty {
-                                    buckets_out.push(pshard_for_uh42(h42), item);
-                                } else {
-                                    link_map.prefetch_bloom_b37(h42);
-                                    unsafe {
-                                        *pending_ev.get_unchecked_mut(n_p2_pending) = item;
-                                        *pending_h42.get_unchecked_mut(n_p2_pending) = h42;
-                                    }
-                                    n_p2_pending += 1;
-                                    if n_p2_pending == LINK_PENDING {
-                                        flush_dedup_pending::<E, PD>(
-                                            LINK_PENDING,
-                                            &mut pending_ev,
-                                            &pending_h42,
-                                            link_map,
-                                            buckets_out,
-                                            &mut shard_mc,
-                                        );
-                                        n_p2_pending = 0;
-                                    }
-                                }
-                            } else if tag != 3 && tag != 5 {
-                                handle_p2_non_fast::<E, PD>(
-                                    tag,
-                                    ev,
-                                    window_start_ms,
-                                    lm_empty,
-                                    ev_worker_ext,
-                                    ev_worker_arenas,
-                                    ev_worker_hex,
-                                    link_map,
-                                    buckets_out,
-                                    &mut pending_ev,
-                                    &mut pending_h42,
-                                    &mut n_p2_pending,
-                                    &mut pending_ev_hex,
-                                    &mut pending_ev_hex_pk,
-                                    &mut n_p2_hex_pending,
-                                    &mut shard_mc,
+            for chunk in shard_chunks {
+                let slice = unsafe { chunk.as_slice() };
+                let blen = slice.len();
+                for ridx in 0..blen {
+                    if ridx + RING < blen {
+                        let hx_a = unsafe { *slice.get_unchecked(ridx + RING) };
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            if hx_a.ts_rel_ms == HX_TS_EXT {
+                                let wid_a = (hx_a.person_key.0 >> 40) as usize;
+                                let idx_a = (hx_a.person_key.0 & PE_EXT_IDX_MASK) as usize;
+                                std::arch::x86_64::_mm_prefetch(
+                                    ev_worker_ext.get_unchecked(wid_a).as_ptr().add(idx_a)
+                                        as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T0,
+                                );
+                            } else if hx_a.ts_rel_ms < HX_TS_DEAD && hx_a.person_key.is_hex() {
+                                let pk_a = hx_a.person_key;
+                                std::arch::x86_64::_mm_prefetch(
+                                    ev_worker_hex
+                                        .get_unchecked(pk_a.hex_wid())
+                                        .as_ptr()
+                                        .add(pk_a.hex_idx())
+                                        as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T0,
                                 );
                             }
                         }
                     }
-                    if n_p2_pending > 0 {
-                        flush_dedup_pending::<E, PD>(
-                            n_p2_pending,
-                            &mut pending_ev,
-                            &pending_h42,
-                            link_map,
-                            buckets_out,
-                            &mut shard_mc,
-                        );
-                    }
-                    if n_p2_hex_pending > 0 {
-                        flush_dedup_hex_pending::<E, PD>(
-                            n_p2_hex_pending,
-                            &mut pending_ev_hex,
-                            &pending_ev_hex_pk,
-                            ev_worker_hex,
-                            link_map,
-                            buckets_out,
-                            &mut shard_mc,
-                        );
-                    }
-                    if let Some(t) = t_p2 {
-                        let s_ns = t.elapsed().as_nanos() as u64;
-                        p2_ns += s_ns;
-                        let tot_cyc = rdtsc_now().wrapping_sub(c_p2_0).max(1);
-                        let tracked = shard_mc.bloom_cyc
-                            + shard_mc.probe_cyc
-                            + shard_mc.push_cyc
-                            + shard_mc.hex_cyc;
-                        let unpack_cyc = tot_cyc.saturating_sub(tracked);
-                        let cyc_to_ns = |c: u64| -> u64 {
-                            ((s_ns as u128 * c as u128) / tot_cyc as u128) as u64
-                        };
-                        let u_ns = cyc_to_ns(unpack_cyc);
-                        let b_ns = cyc_to_ns(shard_mc.bloom_cyc);
-                        let pr_ns = cyc_to_ns(shard_mc.probe_cyc);
-                        let pu_ns = cyc_to_ns(shard_mc.push_cyc);
-                        p2_unpack_ns += u_ns;
-                        p2_bloom_ns += b_ns;
-                        p2_probe_ns += pr_ns;
-                        p2_push_ns += pu_ns;
-                        p2_hex_ns += s_ns.saturating_sub(u_ns + b_ns + pr_ns + pu_ns);
-                        p2_counts.b37_bloom_hits += shard_mc.b37_bloom_hits;
-                        p2_counts.b37_slot_hits += shard_mc.b37_slot_hits;
-                        p2_counts.b37_misses += shard_mc.b37_misses;
-                        p2_counts.hex_bloom_hits += shard_mc.hex_bloom_hits;
-                        p2_counts.hex_slot_hits += shard_mc.hex_slot_hits;
-                        p2_counts.hex_misses += shard_mc.hex_misses;
-                        p2_counts.surv_total += shard_mc.surv_total;
-                    }
-                }
-
-                // Pull P_HEX_DEDUP shards & emit HexEvent32 survivors into SlabBuckets<E>.
-                loop {
-                    let hs = next_hx_ref.fetch_add(1, Ordering::Relaxed);
-                    if hs >= P_HEX_DEDUP {
-                        break;
-                    }
-                    let Some(shard_chunks) = hex_dedup_slots[hs].lock().unwrap().take() else {
+                    let hx = unsafe { *slice.get_unchecked(ridx) };
+                    if hx.ts_rel_ms == HX_TS_DEAD || hx.ts_rel_ms == HX_TS_INVALID {
                         continue;
+                    }
+                    if PD {
+                        shard_mc.surv_total += 1;
+                    }
+                    let (person_key, ts_ms, price_cents, cat_id) = if hx.ts_rel_ms == HX_TS_EXT {
+                        let wid_x = (hx.person_key.0 >> 40) as usize;
+                        let idx_x = (hx.person_key.0 & PE_EXT_IDX_MASK) as usize;
+                        let ex = unsafe { *ev_worker_ext.get_unchecked(wid_x).get_unchecked(idx_x) };
+                        if ex.cat_id == u32::MAX {
+                            continue;
+                        }
+                        (ex.person_key, ex.ts_ms, ex.price_cents, ex.cat_id)
+                    } else {
+                        (
+                            hx.person_key,
+                            window_start_ms + (hx.ts_rel_ms as i64),
+                            0,
+                            0,
+                        )
                     };
-                    let total: usize = shard_chunks.iter().map(|c| c.len).sum();
-                    if total == 0 {
-                        continue;
-                    }
-                    let t_p1 = if PD { Some(Instant::now()) } else { None };
-                    let buckets_out =
-                        person_out.get_or_insert_with(|| SlabBuckets::new(pe_hint_bytes));
-                    let n_chunks = shard_chunks.len();
-                    if n_chunks <= MAX_HX_U32_CHUNKS {
-                        let cap = (total * 2).max(16);
-                        dedup_u32.clear();
-                        dedup_u32.resize(cap, 0u32);
-                        let dedup_u32_ptr = dedup_u32.as_ptr();
 
-                        for cidx in 0..n_chunks {
-                            let c_len = shard_chunks[cidx].len;
-                            let c_ptr = shard_chunks[cidx].ptr;
-                            let cbase = (cidx as u32) << HX_CHUNK_SHIFT;
-                            let pre = c_len.min(RING);
-                            for i in 0..pre {
-                                let hx_i = unsafe { &*c_ptr.add(i) };
-                                ring_u32[i] = unsafe {
-                                    make_hx_probe_u32(hx_i.ev_hi, hx_i.ev_lo, cap, dedup_u32_ptr)
-                                };
-                            }
-                            for ridx in 0..c_len {
-                                let prb = ring_u32[ridx & (RING - 1)];
-                                if ridx + RING < c_len {
-                                    let hx_a = unsafe { &*c_ptr.add(ridx + RING) };
-                                    ring_u32[ridx & (RING - 1)] = unsafe {
-                                        make_hx_probe_u32(
-                                            hx_a.ev_hi,
-                                            hx_a.ev_lo,
-                                            cap,
-                                            dedup_u32_ptr,
-                                        )
-                                    };
-                                }
-                                let hx = unsafe { *c_ptr.add(ridx) };
-                                let mut slot = prb.slot as usize;
-                                loop {
-                                    let entry = unsafe { *dedup_u32.get_unchecked(slot) };
-                                    if entry == 0 {
-                                        unsafe {
-                                            *dedup_u32.get_unchecked_mut(slot) =
-                                                prb.tag12 | (cbase + (ridx as u32) + 1);
-                                        }
-                                        break;
-                                    }
-                                    if (entry & 0xFFF0_0000) == prb.tag12 {
-                                        let prev_packed = (entry & 0x000F_FFFF) - 1;
-                                        let pc = (prev_packed >> HX_CHUNK_SHIFT) as usize;
-                                        let pr = (prev_packed & HX_CHUNK_MASK) as usize;
-                                        let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
-                                        let prev_hx = unsafe { *prev_ptr };
-                                        if prev_hx.ev_hi == hx.ev_hi && prev_hx.ev_lo == hx.ev_lo {
-                                            let hx_ing = hx32_ingest_ms(
-                                                &hx,
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            let cur_ing = hx32_ingest_ms(
-                                                &prev_hx,
-                                                window_start_sec,
-                                                ev_worker_ext,
-                                            );
-                                            unsafe {
-                                                if hx_ing < cur_ing {
-                                                    *prev_ptr = hx;
-                                                }
-                                                (*c_ptr.add(ridx)).ts_rel_ms = HX_TS_DEAD;
-                                            }
-                                            break;
-                                        }
-                                    }
-                                    slot += 1;
-                                    if slot == cap {
-                                        slot = 0;
-                                    }
-                                }
-                            }
+                    if person_key.is_uh42() {
+                        let h42 = person_key.uh42_val();
+                        let item = E::from_ext_fields(
+                            person_key,
+                            ts_ms,
+                            window_start_ms,
+                            price_cents,
+                            cat_id,
+                        );
+                        if lm_empty {
+                            buckets_out.push(pshard_for_uh42(h42), item);
+                        } else {
+                            ev_pipe.push_b37::<PD>(h42, item, link_map, buckets_out, &mut shard_mc);
+                        }
+                    } else if person_key.is_hex() {
+                        let mut item = E::from_ext_fields(
+                            person_key,
+                            ts_ms,
+                            window_start_ms,
+                            price_cents,
+                            cat_id,
+                        );
+                        if lm_empty {
+                            let hx_u = person_key.resolve_hex(ev_worker_hex);
+                            let h64 = hash_hex128(hx_u);
+                            item.apply_canon(CompactKey64::from_hex(
+                                person_key.hex_wid(),
+                                person_key.hex_idx(),
+                                false,
+                                (h64 & 0xF_FFFF) as u32,
+                            ));
+                            buckets_out.push((h64 as usize) & (P_PERSON - 1), item);
+                        } else {
+                            ev_pipe.push_hex_pk::<PD>(
+                                person_key,
+                                item,
+                                ev_worker_hex,
+                                link_map,
+                                buckets_out,
+                                &mut shard_mc,
+                            );
                         }
                     } else {
-                        let gt = gen_table.get_or_insert_with(HashTable::new);
-                        gt.clear();
-                        for cidx in 0..n_chunks {
-                            let c_len = shard_chunks[cidx].len;
-                            let c_ptr = shard_chunks[cidx].ptr;
-                            let cbase = (cidx as u32) << HX_CHUNK_SHIFT;
-                            for ridx in 0..c_len {
-                                let hx = unsafe { *c_ptr.add(ridx) };
-                                let eh = hash_hex128(Hex128 {
-                                    hi: hx.ev_hi,
-                                    lo: hx.ev_lo,
-                                });
-                                match gt.entry(
-                                    eh,
-                                    |&packed| {
-                                        let pc = (packed >> HX_CHUNK_SHIFT) as usize;
-                                        let pr = (packed & HX_CHUNK_MASK) as usize;
-                                        let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
-                                        prev.ev_hi == hx.ev_hi && prev.ev_lo == hx.ev_lo
-                                    },
-                                    |&packed| {
-                                        let pc = (packed >> HX_CHUNK_SHIFT) as usize;
-                                        let pr = (packed & HX_CHUNK_MASK) as usize;
-                                        let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
-                                        hash_hex128(Hex128 {
-                                            hi: prev.ev_hi,
-                                            lo: prev.ev_lo,
-                                        })
-                                    },
-                                ) {
-                                    hashbrown::hash_table::Entry::Occupied(occ) => {
-                                        let packed = *occ.get();
-                                        let pc = (packed >> HX_CHUNK_SHIFT) as usize;
-                                        let pr = (packed & HX_CHUNK_MASK) as usize;
-                                        let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
-                                        let prev_hx = unsafe { *prev_ptr };
-                                        let hx_ing =
-                                            hx32_ingest_ms(&hx, window_start_sec, ev_worker_ext);
-                                        let cur_ing = hx32_ingest_ms(
-                                            &prev_hx,
+                        let pk0 = person_key;
+                        let (pk, pshard) = if !lm_empty {
+                            if !pk0.is_ref() {
+                                if let Some(canon) = link_map.resolve_other_inline(pk0) {
+                                    (canon, pshard_for_person_key(canon, &[]))
+                                } else {
+                                    (pk0, ((mix64(pk0.0) >> 52) as usize) & (P_PERSON - 1))
+                                }
+                            } else {
+                                let uid = LongArena::resolve_in(ev_worker_arenas, pk0);
+                                if let Some(canon) = link_map.resolve_long(uid) {
+                                    (canon, pshard_for_person_key(canon, &[]))
+                                } else {
+                                    (pk0, ((hash_bytes_fast(uid) >> 52) as usize) & (P_PERSON - 1))
+                                }
+                            }
+                        } else {
+                            (pk0, pshard_for_person_key(pk0, ev_worker_arenas))
+                        };
+                        buckets_out.push(
+                            pshard,
+                            E::from_ext_fields(pk, ts_ms, window_start_ms, price_cents, cat_id),
+                        );
+                    }
+                }
+            }
+            if let Some(t) = t_p2 {
+                let s_ns = t.elapsed().as_nanos() as u64;
+                p2_ns += s_ns;
+                let tot_cyc = rdtsc_now().wrapping_sub(c_p2_0).max(1);
+                p2_acc.add_shard(s_ns, tot_cyc, &shard_mc);
+            }
+        }
+
+        // Pull P_DEDUP shards (0..256).
+        loop {
+            let ds = next_d.fetch_add(1, Ordering::Relaxed);
+            if ds >= P_DEDUP {
+                break;
+            }
+            let shard_chunks = &ev_shared.dedup_chunks[ds];
+            let total: usize = shard_chunks.iter().map(|c| c.len).sum();
+            if total == 0 {
+                continue;
+            }
+            let t_p1 = if PD { Some(Instant::now()) } else { None };
+            let buckets_out =
+                person_out.get_or_insert_with(|| SlabBuckets::new(pe_hint_bytes));
+            if let Some(gt) = &mut gen_table {
+                gt.clear();
+            }
+
+            let n_chunks = shard_chunks.len();
+            if n_chunks <= MAX_DEDUP_U32_CHUNKS {
+                let cap = (total * 2).max(16);
+                dedup_u32.clear();
+                dedup_u32.resize(cap, 0u32);
+                let dedup_u32_ptr = dedup_u32.as_ptr();
+
+                for cidx in 0..n_chunks {
+                    let c_len = shard_chunks[cidx].len;
+                    let c_ptr = shard_chunks[cidx].ptr;
+                    let cbase = (cidx as u32) << EV_CHUNK_SHIFT;
+                    let pre = c_len.min(RING);
+                    for i in 0..pre {
+                        let w0 = unsafe { (*c_ptr.add(i)).w0 };
+                        ring_u32[i] = unsafe { make_dedup_probe_u32(w0, cap, dedup_u32_ptr) };
+                    }
+
+                    for ridx in 0..c_len {
+                        let prb = ring_u32[ridx & (RING - 1)];
+                        if ridx + RING < c_len {
+                            let w0_a = unsafe { (*c_ptr.add(ridx + RING)).w0 };
+                            ring_u32[ridx & (RING - 1)] =
+                                unsafe { make_dedup_probe_u32(w0_a, cap, dedup_u32_ptr) };
+                        }
+
+                        let ev = unsafe { *c_ptr.add(ridx) };
+                        if prb.slot != u32::MAX {
+                            let ev_rem = ev.w0 & PE_EV_REM_MASK;
+                            let mut slot = prb.slot as usize;
+                            loop {
+                                let entry = unsafe { *dedup_u32.get_unchecked(slot) };
+                                if entry == 0 {
+                                    unsafe {
+                                        *dedup_u32.get_unchecked_mut(slot) =
+                                            prb.tag12 | (cbase + (ridx as u32) + 1);
+                                    }
+                                    break;
+                                }
+                                if (entry & 0xFFF0_0000) == prb.tag12 {
+                                    let prev_packed = (entry & 0x000F_FFFF) - 1;
+                                    let pc = (prev_packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (prev_packed & EV_CHUNK_MASK) as usize;
+                                    let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
+                                    let prev_ev = unsafe { *prev_ptr };
+                                    if (prev_ev.w0 & PE_EV_REM_MASK) == ev_rem {
+                                        let ev_ing =
+                                            ev16_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                        let cur_ing = ev16_ingest_ts(
+                                            &prev_ev,
                                             window_start_sec,
                                             ev_worker_ext,
                                         );
                                         unsafe {
-                                            if hx_ing < cur_ing {
-                                                *prev_ptr = hx;
+                                            if ev_ing < cur_ing {
+                                                *prev_ptr = ev;
                                             }
-                                            (*c_ptr.add(ridx)).ts_rel_ms = HX_TS_DEAD;
+                                            (*c_ptr.add(ridx)).w0 = PE_DEAD;
                                         }
+                                        break;
                                     }
-                                    hashbrown::hash_table::Entry::Vacant(vac) => {
-                                        vac.insert(cbase | (ridx as u32));
+                                }
+                                slot += 1;
+                                if slot == cap {
+                                    slot = 0;
+                                }
+                            }
+                        } else {
+                            let gt = gen_table.get_or_insert_with(HashTable::new);
+                            let ev_key = CompactKey64(ev.w1);
+                            let eh = hash_raw_key(ev_key, ev_worker_arenas, &[]);
+                            match gt.entry(
+                                eh,
+                                |&packed| {
+                                    let pc = (packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (packed & EV_CHUNK_MASK) as usize;
+                                    let prev_k = CompactKey64(unsafe {
+                                        (*shard_chunks[pc].ptr.add(pr)).w1
+                                    });
+                                    eq_raw_keys(
+                                        prev_k,
+                                        ev_key,
+                                        ev_worker_arenas,
+                                        &[],
+                                        ev_worker_arenas,
+                                        &[],
+                                    )
+                                },
+                                |&packed| {
+                                    let pc = (packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (packed & EV_CHUNK_MASK) as usize;
+                                    let prev_k = CompactKey64(unsafe {
+                                        (*shard_chunks[pc].ptr.add(pr)).w1
+                                    });
+                                    hash_raw_key(prev_k, ev_worker_arenas, &[])
+                                },
+                            ) {
+                                hashbrown::hash_table::Entry::Occupied(occ) => {
+                                    let packed = *occ.get();
+                                    let pc = (packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (packed & EV_CHUNK_MASK) as usize;
+                                    let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
+                                    let ev_ing =
+                                        ev16_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                    let cur_ing = ev16_ingest_ts(
+                                        unsafe { &*prev_ptr },
+                                        window_start_sec,
+                                        ev_worker_ext,
+                                    );
+                                    unsafe {
+                                        if ev_ing < cur_ing {
+                                            *prev_ptr = ev;
+                                        }
+                                        (*c_ptr.add(ridx)).w0 = PE_DEAD;
                                     }
+                                }
+                                hashbrown::hash_table::Entry::Vacant(vac) => {
+                                    vac.insert(cbase | (ridx as u32));
                                 }
                             }
                         }
                     }
-                    if let Some(t) = t_p1 {
-                        p1_ns += t.elapsed().as_nanos() as u64;
-                    }
-                    let t_p2 = if PD { Some(Instant::now()) } else { None };
-                    let c_p2_0 = if PD { rdtsc_now() } else { 0 };
-                    let mut shard_mc = P2Micro::default();
+                }
+            } else {
+                let cap = (total * 10 / 6).max(16).next_power_of_two();
+                let mask = cap - 1;
+                dedup_keys.clear();
+                dedup_keys.resize(cap, 0u64);
+                dedup_idxs.resize(cap, 0u32);
 
-                    let mut n_p2_pending = 0usize;
-                    let mut n_p2_hex_pending = 0usize;
-                    for chunk in shard_chunks {
-                        let slice = unsafe { chunk.as_slice() };
-                        let blen = slice.len();
-                        for ridx in 0..blen {
-                            if ridx + RING < blen {
-                                let hx_a = unsafe { *slice.get_unchecked(ridx + RING) };
+                for cidx in 0..n_chunks {
+                    let c_len = shard_chunks[cidx].len;
+                    let c_ptr = shard_chunks[cidx].ptr;
+                    let cbase = (cidx as u32) << EV_CHUNK_SHIFT;
+                    let pre = c_len.min(RING);
+                    for i in 0..pre {
+                        let w0 = unsafe { (*c_ptr.add(i)).w0 };
+                        ring_wide[i] = if w0 < PE_DEAD {
+                            let ev_rem = w0 & PE_EV_REM_MASK;
+                            let slot = (ev_rem as usize) & mask;
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                std::arch::x86_64::_mm_prefetch(
+                                    dedup_keys.as_ptr().add(slot) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                            slot
+                        } else {
+                            usize::MAX
+                        };
+                    }
+                    for ridx in 0..c_len {
+                        let pslot = ring_wide[ridx & (RING - 1)];
+                        if ridx + RING < c_len {
+                            let w0_a = unsafe { (*c_ptr.add(ridx + RING)).w0 };
+                            ring_wide[ridx & (RING - 1)] = if w0_a < PE_DEAD {
+                                let ev_rem = w0_a & PE_EV_REM_MASK;
+                                let slot = (ev_rem as usize) & mask;
                                 #[cfg(target_arch = "x86_64")]
                                 unsafe {
-                                    if hx_a.ts_rel_ms == HX_TS_EXT {
-                                        let wid_a = (hx_a.person_key.0 >> 40) as usize;
-                                        let idx_a = (hx_a.person_key.0 & PE_EXT_IDX_MASK) as usize;
-                                        std::arch::x86_64::_mm_prefetch(
-                                            ev_worker_ext.get_unchecked(wid_a).as_ptr().add(idx_a)
-                                                as *const i8,
-                                            std::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    } else if hx_a.ts_rel_ms < HX_TS_DEAD && hx_a.person_key.is_hex() {
-                                        let pk_a = hx_a.person_key;
-                                        std::arch::x86_64::_mm_prefetch(
-                                            ev_worker_hex
-                                                .get_unchecked(pk_a.hex_wid())
-                                                .as_ptr()
-                                                .add(pk_a.hex_idx())
-                                                as *const i8,
-                                            std::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    }
+                                    std::arch::x86_64::_mm_prefetch(
+                                        dedup_keys.as_ptr().add(slot) as *const i8,
+                                        std::arch::x86_64::_MM_HINT_T0,
+                                    );
                                 }
-                            }
-                            let hx = unsafe { *slice.get_unchecked(ridx) };
-                            if hx.ts_rel_ms == HX_TS_DEAD || hx.ts_rel_ms == HX_TS_INVALID {
-                                continue;
-                            }
-                            if PD {
-                                shard_mc.surv_total += 1;
-                            }
-                            let (person_key, ts_ms, price_cents, cat_id) =
-                                if hx.ts_rel_ms == HX_TS_EXT {
-                                    let wid = (hx.person_key.0 >> 40) as usize;
-                                    let idx = (hx.person_key.0 & PE_EXT_IDX_MASK) as usize;
-                                    let ex = unsafe {
-                                        *ev_worker_ext.get_unchecked(wid).get_unchecked(idx)
-                                    };
-                                    if ex.cat_id == u32::MAX {
-                                        continue;
-                                    }
-                                    (ex.person_key, ex.ts_ms, ex.price_cents, ex.cat_id)
-                                } else {
-                                    (hx.person_key, window_start_ms + (hx.ts_rel_ms as i64), 0, 0)
-                                };
-
-                            if person_key.is_uh42() {
-                                let h42 = person_key.uh42_val();
-                                let item = E::from_ext_fields(
-                                    person_key,
-                                    ts_ms,
-                                    window_start_ms,
-                                    price_cents,
-                                    cat_id,
-                                );
-                                if lm_empty {
-                                    let pshard = pshard_for_uh42(h42);
-                                    buckets_out.push(pshard, item);
-                                } else {
-                                    link_map.prefetch_bloom_b37(h42);
-                                    unsafe {
-                                        *pending_ev.get_unchecked_mut(n_p2_pending) = item;
-                                        *pending_h42.get_unchecked_mut(n_p2_pending) = h42;
-                                    }
-                                    n_p2_pending += 1;
-                                    if n_p2_pending == LINK_PENDING {
-                                        flush_dedup_pending::<E, PD>(
-                                            LINK_PENDING,
-                                            &mut pending_ev,
-                                            &pending_h42,
-                                            link_map,
-                                            buckets_out,
-                                            &mut shard_mc,
-                                        );
-                                        n_p2_pending = 0;
-                                    }
-                                }
-                            } else if person_key.is_hex() {
-                                let mut item = E::from_ext_fields(
-                                    person_key,
-                                    ts_ms,
-                                    window_start_ms,
-                                    price_cents,
-                                    cat_id,
-                                );
-                                if lm_empty {
-                                    let hx_u = person_key.resolve_hex(ev_worker_hex);
-                                    let h64 = hash_hex128(hx_u);
-                                    item.apply_canon(CompactKey64::from_hex(
-                                        person_key.hex_wid(),
-                                        person_key.hex_idx(),
-                                        false,
-                                        (h64 & 0xF_FFFF) as u32,
-                                    ));
-                                    let pshard = (h64 as usize) & (P_PERSON - 1);
-                                    buckets_out.push(pshard, item);
-                                } else {
-                                    #[cfg(target_arch = "x86_64")]
-                                    unsafe {
-                                        std::arch::x86_64::_mm_prefetch(
-                                            ev_worker_hex
-                                                .get_unchecked(person_key.hex_wid())
-                                                .as_ptr()
-                                                .add(person_key.hex_idx())
-                                                as *const i8,
-                                            std::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    }
-                                    unsafe {
-                                        *pending_ev_hex.get_unchecked_mut(n_p2_hex_pending) = item;
-                                        *pending_ev_hex_pk.get_unchecked_mut(n_p2_hex_pending) =
-                                            person_key;
-                                    }
-                                    n_p2_hex_pending += 1;
-                                    if n_p2_hex_pending == LINK_PENDING {
-                                        flush_dedup_hex_pending::<E, PD>(
-                                            LINK_PENDING,
-                                            &mut pending_ev_hex,
-                                            &pending_ev_hex_pk,
-                                            ev_worker_hex,
-                                            link_map,
-                                            buckets_out,
-                                            &mut shard_mc,
-                                        );
-                                        n_p2_hex_pending = 0;
-                                    }
-                                }
+                                slot
                             } else {
-                                let pk0 = person_key;
-                                let (pk, pshard) = if !lm_empty {
-                                    if !pk0.is_ref() {
-                                        if let Some(canon) = link_map.resolve_other_inline(pk0) {
-                                            (canon, pshard_for_person_key(canon, &[]))
-                                        } else {
-                                            (pk0, ((mix64(pk0.0) >> 52) as usize) & (P_PERSON - 1))
+                                usize::MAX
+                            };
+                        }
+                        let ev = unsafe { *c_ptr.add(ridx) };
+                        if pslot != usize::MAX {
+                            let ev_key_u = (ev.w0 & PE_EV_REM_MASK) + 1;
+                            let mut slot = pslot;
+                            loop {
+                                let cur = unsafe { *dedup_keys.get_unchecked(slot) };
+                                if cur == ev_key_u {
+                                    let packed = unsafe { *dedup_idxs.get_unchecked(slot) };
+                                    let pc = (packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (packed & EV_CHUNK_MASK) as usize;
+                                    let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
+                                    let ev_ing =
+                                        ev16_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                    let cur_ing = ev16_ingest_ts(
+                                        unsafe { &*prev_ptr },
+                                        window_start_sec,
+                                        ev_worker_ext,
+                                    );
+                                    unsafe {
+                                        if ev_ing < cur_ing {
+                                            *prev_ptr = ev;
                                         }
-                                    } else {
-                                        let uid = LongArena::resolve_in(ev_worker_arenas, pk0);
-                                        if let Some(canon) = link_map.resolve_long(uid) {
-                                            (canon, pshard_for_person_key(canon, &[]))
-                                        } else {
-                                            (
-                                                pk0,
-                                                ((hash_bytes_fast(uid) >> 52) as usize)
-                                                    & (P_PERSON - 1),
-                                            )
-                                        }
+                                        (*c_ptr.add(ridx)).w0 = PE_DEAD;
                                     }
-                                } else {
-                                    (pk0, pshard_for_person_key(pk0, ev_worker_arenas))
-                                };
-                                buckets_out.push(
-                                    pshard,
-                                    E::from_ext_fields(
-                                        pk,
-                                        ts_ms,
-                                        window_start_ms,
-                                        price_cents,
-                                        cat_id,
-                                    ),
-                                );
+                                    break;
+                                }
+                                if cur == 0 {
+                                    unsafe {
+                                        *dedup_keys.get_unchecked_mut(slot) = ev_key_u;
+                                        *dedup_idxs.get_unchecked_mut(slot) =
+                                            cbase | (ridx as u32);
+                                    }
+                                    break;
+                                }
+                                slot = (slot + 1) & mask;
+                            }
+                        } else {
+                            let gt = gen_table.get_or_insert_with(HashTable::new);
+                            let eh = wide_dedup_hash(&ev, ev_worker_arenas);
+                            match gt.entry(
+                                eh,
+                                |&packed| {
+                                    let pc = (packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (packed & EV_CHUNK_MASK) as usize;
+                                    let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
+                                    wide_dedup_eq(prev, &ev, ev_worker_arenas)
+                                },
+                                |&packed| {
+                                    let pc = (packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (packed & EV_CHUNK_MASK) as usize;
+                                    let prev = unsafe { &*shard_chunks[pc].ptr.add(pr) };
+                                    wide_dedup_hash(prev, ev_worker_arenas)
+                                },
+                            ) {
+                                hashbrown::hash_table::Entry::Occupied(occ) => {
+                                    let packed = *occ.get();
+                                    let pc = (packed >> EV_CHUNK_SHIFT) as usize;
+                                    let pr = (packed & EV_CHUNK_MASK) as usize;
+                                    let prev_ptr = unsafe { shard_chunks[pc].ptr.add(pr) };
+                                    let ev_ing =
+                                        ev16_ingest_ts(&ev, window_start_sec, ev_worker_ext);
+                                    let cur_ing = ev16_ingest_ts(
+                                        unsafe { &*prev_ptr },
+                                        window_start_sec,
+                                        ev_worker_ext,
+                                    );
+                                    unsafe {
+                                        if ev_ing < cur_ing {
+                                            *prev_ptr = ev;
+                                        }
+                                        (*c_ptr.add(ridx)).w0 = PE_DEAD;
+                                    }
+                                }
+                                hashbrown::hash_table::Entry::Vacant(vac) => {
+                                    vac.insert(cbase | (ridx as u32));
+                                }
                             }
                         }
                     }
-                    if n_p2_pending > 0 {
-                        flush_dedup_pending::<E, PD>(
-                            n_p2_pending,
-                            &mut pending_ev,
-                            &pending_h42,
-                            link_map,
-                            buckets_out,
-                            &mut shard_mc,
-                        );
-                    }
-                    if n_p2_hex_pending > 0 {
-                        flush_dedup_hex_pending::<E, PD>(
-                            n_p2_hex_pending,
-                            &mut pending_ev_hex,
-                            &pending_ev_hex_pk,
+                }
+            }
+            if let Some(t) = t_p1 {
+                p1_ns += t.elapsed().as_nanos() as u64;
+            }
+            let t_p2 = if PD { Some(Instant::now()) } else { None };
+            let c_p2_0 = if PD { rdtsc_now() } else { 0 };
+            let mut shard_mc = P2Micro::default();
+
+            for chunk in shard_chunks {
+                let slice = unsafe { chunk.as_slice() };
+                let blen = slice.len();
+                for ridx in 0..blen {
+                    let ev = unsafe { *slice.get_unchecked(ridx) };
+                    let tag = (ev.w0 >> PE_TAG_SHIFT) as u32;
+                    if tag == 0 {
+                        if PD {
+                            shard_mc.surv_total += 1;
+                        }
+                        let ts_rel_u = ((((ev.w0 >> 35) & 0x1FF) << 22) | (ev.w1 >> 42)) as u32;
+                        let h42 = ev.w1 & B37_MASK42;
+                        let item = E::from_fast_ms_b37(h42, ts_rel_u);
+                        if lm_empty {
+                            buckets_out.push(pshard_for_uh42(h42), item);
+                        } else {
+                            ev_pipe.push_b37::<PD>(h42, item, link_map, buckets_out, &mut shard_mc);
+                        }
+                    } else if ((1u32 << tag) & ((1 << 3) | (1 << 5))) == 0 {
+                        handle_p2_non_fast::<E, PD>(
+                            tag,
+                            ev,
+                            window_start_ms,
+                            lm_empty,
+                            ev_worker_ext,
+                            ev_worker_arenas,
                             ev_worker_hex,
                             link_map,
                             buckets_out,
+                            &mut ev_pipe,
                             &mut shard_mc,
                         );
                     }
-                    if let Some(t) = t_p2 {
-                        let s_ns = t.elapsed().as_nanos() as u64;
-                        p2_ns += s_ns;
-                        let tot_cyc = rdtsc_now().wrapping_sub(c_p2_0).max(1);
-                        let tracked = shard_mc.bloom_cyc
-                            + shard_mc.probe_cyc
-                            + shard_mc.push_cyc
-                            + shard_mc.hex_cyc;
-                        let unpack_cyc = tot_cyc.saturating_sub(tracked);
-                        let cyc_to_ns = |c: u64| -> u64 {
-                            ((s_ns as u128 * c as u128) / tot_cyc as u128) as u64
-                        };
-                        let u_ns = cyc_to_ns(unpack_cyc);
-                        let b_ns = cyc_to_ns(shard_mc.bloom_cyc);
-                        let pr_ns = cyc_to_ns(shard_mc.probe_cyc);
-                        let pu_ns = cyc_to_ns(shard_mc.push_cyc);
-                        p2_unpack_ns += u_ns;
-                        p2_bloom_ns += b_ns;
-                        p2_probe_ns += pr_ns;
-                        p2_push_ns += pu_ns;
-                        p2_hex_ns += s_ns.saturating_sub(u_ns + b_ns + pr_ns + pu_ns);
-                        p2_counts.b37_bloom_hits += shard_mc.b37_bloom_hits;
-                        p2_counts.b37_slot_hits += shard_mc.b37_slot_hits;
-                        p2_counts.b37_misses += shard_mc.b37_misses;
-                        p2_counts.hex_bloom_hits += shard_mc.hex_bloom_hits;
-                        p2_counts.hex_slot_hits += shard_mc.hex_slot_hits;
-                        p2_counts.hex_misses += shard_mc.hex_misses;
-                        p2_counts.surv_total += shard_mc.surv_total;
-                    }
                 }
-
-                if let Some(buckets_out) = person_out {
-                    let t_fin = if PD { Some(Instant::now()) } else { None };
-                    let (pe_slab, pe_done) = buckets_out.finish();
-                    *pe_slab_slot = Some(pe_slab);
-                    *ev_out_slot = pe_done;
-                    if let Some(t) = t_fin {
-                        let f_ns = t.elapsed().as_nanos() as u64;
-                        p2_ns += f_ns;
-                        p2_push_ns += f_ns;
-                    }
-                }
-                if PD {
-                    detail.dedup_p1_ns.fetch_add(p1_ns, Ordering::Relaxed);
-                    detail.dedup_p2_ns.fetch_add(p2_ns, Ordering::Relaxed);
-                    detail.p2_unpack_ns.fetch_add(p2_unpack_ns, Ordering::Relaxed);
-                    detail.p2_bloom_ns.fetch_add(p2_bloom_ns, Ordering::Relaxed);
-                    detail.p2_probe_ns.fetch_add(p2_probe_ns, Ordering::Relaxed);
-                    detail.p2_push_ns.fetch_add(p2_push_ns, Ordering::Relaxed);
-                    detail.p2_hex_ns.fetch_add(p2_hex_ns, Ordering::Relaxed);
-                    detail
-                        .p2_b37_bloom_hits
-                        .fetch_add(p2_counts.b37_bloom_hits, Ordering::Relaxed);
-                    detail
-                        .p2_b37_slot_hits
-                        .fetch_add(p2_counts.b37_slot_hits, Ordering::Relaxed);
-                    detail
-                        .p2_b37_misses
-                        .fetch_add(p2_counts.b37_misses, Ordering::Relaxed);
-                    detail
-                        .p2_hex_bloom_hits
-                        .fetch_add(p2_counts.hex_bloom_hits, Ordering::Relaxed);
-                    detail
-                        .p2_hex_slot_hits
-                        .fetch_add(p2_counts.hex_slot_hits, Ordering::Relaxed);
-                    detail
-                        .p2_hex_misses
-                        .fetch_add(p2_counts.hex_misses, Ordering::Relaxed);
-                    detail
-                        .p2_surv_total
-                        .fetch_add(p2_counts.surv_total, Ordering::Relaxed);
-                }
-            });
+            }
+            if let Some(t) = t_p2 {
+                let s_ns = t.elapsed().as_nanos() as u64;
+                p2_ns += s_ns;
+                let tot_cyc = rdtsc_now().wrapping_sub(c_p2_0).max(1);
+                p2_acc.add_shard(s_ns, tot_cyc, &shard_mc);
+            }
         }
-    });
 
-    for e in worker_errs.into_iter().flatten() {
+        if let Some(mut buckets_out) = person_out {
+            if !lm_empty {
+                let t_dr = if PD { Some(Instant::now()) } else { None };
+                let mut drain_mc = P2Micro::default();
+                ev_pipe.drain::<PD>(ev_worker_hex, link_map, &mut buckets_out, &mut drain_mc);
+                if let Some(t) = t_dr {
+                    let d_ns = t.elapsed().as_nanos() as u64;
+                    p2_ns += d_ns;
+                    p2_acc.probe_ns += d_ns;
+                    p2_acc.counts.b37_bloom_hits += drain_mc.b37_bloom_hits;
+                    p2_acc.counts.b37_slot_hits += drain_mc.b37_slot_hits;
+                    p2_acc.counts.b37_misses += drain_mc.b37_misses;
+                    p2_acc.counts.hex_bloom_hits += drain_mc.hex_bloom_hits;
+                    p2_acc.counts.hex_slot_hits += drain_mc.hex_slot_hits;
+                    p2_acc.counts.hex_misses += drain_mc.hex_misses;
+                }
+            }
+            let t_fin = if PD { Some(Instant::now()) } else { None };
+            let (pe_slab, pe_done) = buckets_out.finish();
+            p2_out.pe_slab = Some(pe_slab);
+            p2_out.dedup_chunks = pe_done;
+            if let Some(t) = t_fin {
+                let f_ns = t.elapsed().as_nanos() as u64;
+                p2_ns += f_ns;
+                p2_acc.push_ns += f_ns;
+            }
+        }
+        if PD {
+            p2_acc.flush_to_detail(detail, p1_ns, p2_ns);
+        }
+    };
+
+    if overlap_links {
+        let link_threads = (if n_workers >= 6 {
+            3
+        } else if n_workers >= 4 {
+            2
+        } else {
+            1
+        })
+        .min(n_workers);
+        let (head, tail) = p2_outs.split_at_mut(link_threads);
+        std::thread::scope(|scope| {
+            for (idx, p2_out) in tail.iter_mut().enumerate() {
+                let wid = link_threads + idx;
+                scope.spawn(move || run_worker(wid, p2_out));
+            }
+
+            let t_l0 = Instant::now();
+            let lm_res = build_link_map(link_paths, link_threads);
+            if PD {
+                detail
+                    .links_w_ns
+                    .store(t_l0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            match lm_res {
+                Ok(lm) => {
+                    let _ = link_map_cell.set(lm);
+                    *lm_gate.0.lock().unwrap() = true;
+                    lm_gate.1.notify_all();
+                }
+                Err(e) => {
+                    lm_err = Some(e);
+                    abort.store(true, Ordering::Release);
+                    *lm_gate.0.lock().unwrap() = true;
+                    lm_gate.1.notify_all();
+                    *ev_gate.0.lock().unwrap() = true;
+                    ev_gate.1.notify_all();
+                }
+            }
+
+            let (first, rest) = head.split_at_mut(1);
+            for (idx, p2_out) in rest.iter_mut().enumerate() {
+                let wid = 1 + idx;
+                scope.spawn(move || run_worker(wid, p2_out));
+            }
+            run_worker(0, &mut first[0]);
+        });
+    } else if n_workers <= 1 {
+        run_worker(0, &mut p2_outs[0]);
+    } else {
+        std::thread::scope(|scope| {
+            let (first, rest) = p2_outs.split_at_mut(1);
+            for (idx, p2_out) in rest.iter_mut().enumerate() {
+                let wid = 1 + idx;
+                scope.spawn(move || run_worker(wid, p2_out));
+            }
+            run_worker(0, &mut first[0]);
+        });
+    }
+
+    if let Some(e) = lm_err {
         return Err(e);
     }
 
-    let pe_slabs: Vec<SlabArena> = pe_worker_slabs.into_iter().flatten().collect();
-    let cl_slabs: Vec<SlabArena> = cl_worker_slabs.into_iter().flatten().collect();
-
+    let mut pe_slabs = Vec::with_capacity(n_workers);
+    let mut cl_slabs = Vec::with_capacity(n_workers);
     let mut person_event_chunks: Vec<Vec<MutChunkRef<E>>> = (0..P_PERSON)
         .map(|_| Vec::new())
         .collect();
     let mut person_event_counts = vec![0usize; P_PERSON];
-    for wouts in dedup_worker_chunks {
-        for (ps, v) in wouts.into_iter().enumerate() {
-            for c in v {
-                person_event_counts[ps] += c.len;
-                person_event_chunks[ps].push(c);
-            }
-        }
-    }
-
     let mut person_click_chunks: Vec<Vec<MutChunkRef<C>>> = (0..P_PERSON)
         .map(|_| Vec::new())
         .collect();
     let mut person_click_counts = vec![0usize; P_PERSON];
-    for wouts in cl_worker_chunks {
-        for (ps, v) in wouts.into_iter().enumerate() {
-            for c in v {
-                person_click_counts[ps] += c.len;
-                person_click_chunks[ps].push(c);
+    let mut cl_worker_arenas = Vec::with_capacity(n_workers);
+    let mut cl_worker_hex = Vec::with_capacity(n_workers);
+    let mut cl_worker_ext = Vec::with_capacity(n_workers);
+
+    for out in p2_outs {
+        if let Some(e) = out.err {
+            return Err(e);
+        }
+        if let Some(slab) = out.pe_slab {
+            pe_slabs.push(slab);
+            for (ps, v) in out.dedup_chunks.into_iter().enumerate() {
+                for c in v {
+                    person_event_counts[ps] += c.len;
+                    person_event_chunks[ps].push(c);
+                }
             }
         }
+        if let Some(slab) = out.cl_slab {
+            cl_slabs.push(slab);
+            for (ps, v) in out.cl_chunks.into_iter().enumerate() {
+                for c in v {
+                    person_click_counts[ps] += c.len;
+                    person_click_chunks[ps].push(c);
+                }
+            }
+        }
+        cl_worker_arenas.push(out.cl_arena);
+        cl_worker_hex.push(out.cl_hex);
+        cl_worker_ext.push(out.cl_ext);
     }
 
-    Ok(ClicksDedupOut {
-        pe_slabs,
-        cl_slabs,
-        person_event_chunks,
-        person_event_counts,
-        person_click_chunks,
-        person_click_counts,
-        cl_worker_arenas,
-        cl_worker_hex,
-        cl_worker_ext,
-    })
+    let link_map = link_map_cell.into_inner().unwrap();
+    let ev_shared = ev_shared_cell.into_inner().unwrap();
+    let t_events_parse = t_ev_done_cell
+        .get()
+        .copied()
+        .unwrap_or_else(Instant::now)
+        .max(t_links);
+
+    Ok((
+        link_map,
+        ev_shared,
+        ClicksDedupOut {
+            pe_slabs,
+            cl_slabs,
+            person_event_chunks,
+            person_event_counts,
+            person_click_chunks,
+            person_click_counts,
+            cl_worker_arenas,
+            cl_worker_hex,
+            cl_worker_ext,
+        },
+        t_links,
+        t_events_parse,
+        overlap_links,
+    ))
 }
 
 impl ClickEmit for PersonClick16 {
@@ -3678,16 +3756,6 @@ impl ClickEmit for PersonClickWide {
             _pad: 0,
         }
     }
-}
-
-struct EvParseOutput {
-    ev_slabs: Vec<SlabArena>,
-    dedup_chunks: Vec<Vec<MutChunkRef<ParsedEvent16>>>,
-    hex_slabs: Vec<SlabArena>,
-    hex_dedup_chunks: Vec<Vec<MutChunkRef<HexEvent32>>>,
-    ev_worker_arenas: Vec<LongArena>,
-    ev_worker_hex: Vec<Vec<Hex128>>,
-    ev_worker_ext: Vec<Vec<ExtEvent>>,
 }
 
 #[inline(always)]
@@ -4126,19 +4194,122 @@ fn process_ev_line_any<const COMPACT: bool, const PD: bool>(
     if ev_len == 0 {
         return;
     }
+    let (u_s, u_e) = unsafe { field_span(base, c0 + 1, c1) };
+    let (ts_s, ts_e) = unsafe { field_span(base, c1 + 1, c2) };
     let (ing_s, ing_e) = unsafe { field_span(base, c2 + 1, c3) };
+    let (et_s, et_e) = unsafe { field_span(base, c3 + 1, c4) };
+    let (p_s, p_e) = unsafe { field_span(base, c4 + 1, c5) };
+    let u_len = u_e - u_s;
+    let ts_len = ts_e - ts_s;
+    let ing_len = ing_e - ing_s;
+    let et_len = et_e - et_s;
+    let p_len = p_e - p_s;
+
+    if COMPACT && ts_len == 25 && ing_len == 20 && et_len == 4 && u_len > 0 && p_len > 0 {
+        let w = unsafe { u32::from_ne_bytes(*(base.add(et_s) as *const [u8; 4])) };
+        if (w == VIEW_U32) | (w == CART_U32) {
+            if let Some((ts_rel_sec, ing_off)) =
+                dcache.parse_f2_pair_rel_sec_padded(padded, ts_s, ing_s)
+            {
+                let ts_rel_ms = ts_rel_sec.wrapping_mul(MS_SECOND);
+                if (ts_rel_ms as u64) < window_span_u64 && ing_off <= 86_400 {
+                    if ev_len == 33 {
+                        if let Some(ev_hex) = encode_hex32_padded(padded, ev_s, 33, b'e') {
+                            let ingest_sec = window_start_sec + ts_rel_sec + ing_off;
+                            let ts_ms = window_start_ms + ts_rel_ms;
+                            emit_hex_ev32::<COMPACT, PD>(
+                                padded,
+                                ev_hex,
+                                u_s,
+                                u_len,
+                                u_e,
+                                true,
+                                false,
+                                ingest_sec,
+                                ingest_sec * MS_SECOND,
+                                ts_ms,
+                                0,
+                                0,
+                                wid,
+                                window_start_ms,
+                                window_start_sec,
+                                ev_arena_out,
+                                ev_hex_out,
+                                ext_out,
+                                hex_buckets,
+                                ev_hint_bytes,
+                                mc,
+                            );
+                            return;
+                        }
+                    } else if ev_len.wrapping_sub(2) <= 7
+                        && (-PE_ING_BIAS..PE_ING_MAX).contains(&ing_off)
+                    {
+                        if u_len.wrapping_sub(2) <= 7 {
+                            if let Some((ev_b37, u_b37)) =
+                                encode_b37_pair_padded(padded, ev_s, ev_len, b'e', u_s, u_len, b'u')
+                            {
+                                let h42 = biject42(ev_b37);
+                                let d_shard = (h42 >> P_DEDUP_H42_SHIFT) as usize;
+                                let ev_rem = h42 & PE_EV_REM_MASK;
+                                let biased = (ing_off + PE_ING_BIAS) as u64;
+                                let ts_rel_u = ts_rel_ms as u64;
+                                let u_h42 = biject42(u_b37);
+                                if PD {
+                                    mc.n_fast_b37 += 1;
+                                }
+                                ev_buckets.push(
+                                    d_shard,
+                                    ParsedEvent16 {
+                                        w0: PE_FAST_B37
+                                            | (biased << 44)
+                                            | ((ts_rel_u >> 22) << 35)
+                                            | ev_rem,
+                                        w1: ((ts_rel_u & 0x3F_FFFF) << 42) | u_h42,
+                                    },
+                                );
+                                return;
+                            }
+                        } else if u_len == 33 && ev_hex_out.len() < (1 << 26) {
+                            if let Some(ev_b37) = encode_b37_padded(padded, ev_s, ev_len, b'e') {
+                                if let Some(hx_u) = encode_hex32_padded(padded, u_s, 33, b'u') {
+                                    let h42 = biject42(ev_b37);
+                                    let d_shard = (h42 >> P_DEDUP_H42_SHIFT) as usize;
+                                    let ev_rem = h42 & PE_EV_REM_MASK;
+                                    let uidx = ev_hex_out.len() as u64;
+                                    ev_hex_out.push(hx_u);
+                                    let biased = (ing_off + PE_ING_BIAS) as u64;
+                                    let ts_rel_u = ts_rel_ms as u64;
+                                    if PD {
+                                        mc.n_fast_uhex += 1;
+                                    }
+                                    ev_buckets.push(
+                                        d_shard,
+                                        ParsedEvent16 {
+                                            w0: PE_FAST_UHEX
+                                                | (biased << 44)
+                                                | ((ts_rel_u >> 22) << 35)
+                                                | ev_rem,
+                                            w1: ((ts_rel_u & 0x3F_FFFF) << 42)
+                                                | ((wid as u64) << 36)
+                                                | uidx,
+                                        },
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let Some((ingest_sec, hint_hi, hint_lo, hint_day_sec)) =
-        dcache.parse_f1_sec_padded_with_hint(padded, ing_s, ing_e - ing_s)
+        dcache.parse_f1_sec_padded_with_hint(padded, ing_s, ing_len)
     else {
         return;
     };
-
-    let (u_s, u_e) = unsafe { field_span(base, c0 + 1, c1) };
-    let u_len = u_e - u_s;
-    let (et_s, et_e) = unsafe { field_span(base, c3 + 1, c4) };
-    let et_len = et_e - et_s;
-    let (p_s, p_e) = unsafe { field_span(base, c4 + 1, c5) };
-    let p_len = p_e - p_s;
 
     let mut valid = false;
     let mut ts_ms = 0i64;
@@ -4165,8 +4336,6 @@ fn process_ev_line_any<const COMPACT: bool, const PD: bool>(
             }
         }
         if need_ts {
-            let (ts_s, ts_e) = unsafe { field_span(base, c1 + 1, c2) };
-            let ts_len = ts_e - ts_s;
             let parsed_ts = if ts_len == 20 {
                 dcache.parse_f1_only_padded_hint::<true>(
                     padded,
@@ -4321,12 +4490,10 @@ fn process_ev_f1_fast<const COMPACT: bool, const PD: bool>(
     let (et_s, et_e) = unsafe { field_span(base, c3 + 1, c4) };
     let (p_s, p_e) = unsafe { field_span(base, c4 + 1, c5) };
     let u_len = u_e - u_s;
-    let ts_len = ts_e - ts_s;
-    let ing_len = ing_e - ing_s;
-    let et_len = et_e - et_s;
     let p_len = p_e - p_s;
+    let fixed_lens_ok = (ts_e - ts_s == 20) & (ing_e - ing_s == 20) & (et_e - et_s == 4);
 
-    if COMPACT && u_len > 0 && p_len > 0 && ts_len == 20 && ing_len == 20 && et_len == 4 {
+    if COMPACT && fixed_lens_ok && u_len > 0 && p_len > 0 {
         let w = unsafe { u32::from_ne_bytes(*(base.add(et_s) as *const [u8; 4])) };
         if (w == VIEW_U32) | (w == CART_U32) {
             if let Some((ts_rel_sec, ing_off)) =
@@ -4430,12 +4597,10 @@ fn process_ev_f3_fast<const COMPACT: bool, const PD: bool>(
     let (et_s, et_e) = unsafe { field_span(base, c3 + 1, c4) };
     let (p_s, p_e) = unsafe { field_span(base, c4 + 1, c5) };
     let u_len = u_e - u_s;
-    let ts_len = ts_e - ts_s;
-    let ing_len = ing_e - ing_s;
-    let et_len = et_e - et_s;
     let p_len = p_e - p_s;
+    let fixed_lens_ok = (ts_e - ts_s == 13) & (ing_e - ing_s == 20) & (et_e - et_s == 4);
 
-    if COMPACT && u_len > 0 && p_len > 0 && ts_len == 13 && ing_len == 20 && et_len == 4 {
+    if COMPACT && fixed_lens_ok && u_len > 0 && p_len > 0 {
         let w = unsafe { u32::from_ne_bytes(*(base.add(et_s) as *const [u8; 4])) };
         if (w == VIEW_U32) | (w == CART_U32) {
             if let Some((t, t_sec)) = DateCache::parse_f3_only_13_padded(padded, ts_s) {
@@ -4538,12 +4703,10 @@ fn process_ev_f1_hex<const COMPACT: bool, const PD: bool>(
     let (et_s, et_e) = unsafe { field_span(base, c3 + 1, c4) };
     let (p_s, p_e) = unsafe { field_span(base, c4 + 1, c5) };
     let u_len = u_e - u_s;
-    let ts_len = ts_e - ts_s;
-    let ing_len = ing_e - ing_s;
-    let et_len = et_e - et_s;
     let p_len = p_e - p_s;
+    let fixed_lens_ok = (ts_e - ts_s == 20) & (ing_e - ing_s == 20) & (et_e - et_s == 4);
 
-    if COMPACT && u_len > 0 && p_len > 0 && ts_len == 20 && ing_len == 20 && et_len == 4 {
+    if COMPACT && fixed_lens_ok && u_len > 0 && p_len > 0 {
         let w = unsafe { u32::from_ne_bytes(*(base.add(et_s) as *const [u8; 4])) };
         if (w == VIEW_U32) | (w == CART_U32) {
             if let Some((ts_rel_sec, ing_off)) =
@@ -4682,12 +4845,10 @@ fn process_ev_f3_hex<const COMPACT: bool, const PD: bool>(
     let (et_s, et_e) = unsafe { field_span(base, c3 + 1, c4) };
     let (p_s, p_e) = unsafe { field_span(base, c4 + 1, c5) };
     let u_len = u_e - u_s;
-    let ts_len = ts_e - ts_s;
-    let ing_len = ing_e - ing_s;
-    let et_len = et_e - et_s;
     let p_len = p_e - p_s;
+    let fixed_lens_ok = (ts_e - ts_s == 13) & (ing_e - ing_s == 20) & (et_e - et_s == 4);
 
-    if COMPACT && u_len > 0 && p_len > 0 && ts_len == 13 && ing_len == 20 && et_len == 4 {
+    if COMPACT && fixed_lens_ok && u_len > 0 && p_len > 0 {
         let w = unsafe { u32::from_ne_bytes(*(base.add(et_s) as *const [u8; 4])) };
         if (w == VIEW_U32) | (w == CART_U32) {
             if let Some((ts_ms, t_sec)) = DateCache::parse_f3_only_13_padded(padded, ts_s) {
@@ -4834,8 +4995,7 @@ fn process_ev_batch_direct<const COMPACT: bool, const PD: bool>(
         let raw_ts = c2 - c1 - 1;
         let raw_ing = c3 - c2 - 1;
         let raw_et = c4 - c3 - 1;
-        let fast_et_ing =
-            ((raw_et == 4) | (raw_et == 6)) & ((raw_ing == 20) | (raw_ing == 22));
+        let fast_et_ing = ((raw_et == 4) | (raw_et == 6)) & ((raw_ing == 20) | (raw_ing == 22));
         let is_f1 = ((raw_ts == 20) | (raw_ts == 22)) & fast_et_ing;
         let is_f3 = ((raw_ts == 13) | (raw_ts == 15)) & fast_et_ing;
         let fast_ids = ((c0 - ls) <= 11) & ((c1 - c0) <= 12);
@@ -4997,22 +5157,18 @@ fn process_ev_batch_direct<const COMPACT: bool, const PD: bool>(
 fn run_parse_events_worker<const COMPACT: bool, const PD: bool>(
     event_src: &CsvSource,
     ev_chunks: &[crate::csv::ChunkTask],
-    order: &[usize],
-    next_ord: &AtomicUsize,
+    next_ev: &AtomicUsize,
     ev_hint_bytes: usize,
+    est_hex_cap: usize,
+    est_ext_cap: usize,
     lookups: &Lookups,
     window_start_ms: i64,
     window_end_ms: i64,
     window_start_sec: i64,
     wid: usize,
+    abort: &AtomicBool,
     detail: &DetailStats,
-    slab_slot: &mut Option<SlabArena>,
-    dedup_slot: &mut Vec<Vec<MutChunkRef<ParsedEvent16>>>,
-    hex_slab_slot: &mut Option<SlabArena>,
-    hex_dedup_slot: &mut Vec<Vec<MutChunkRef<HexEvent32>>>,
-    arena_out: &mut LongArena,
-    hex_out: &mut Vec<Hex128>,
-    ext_out: &mut Vec<ExtEvent>,
+    ev_slot: &mut EvWorkerSlot,
     err_out: &mut Option<io::Error>,
 ) {
     let mut buf = Vec::new();
@@ -5026,15 +5182,21 @@ fn run_parse_events_worker<const COMPACT: bool, const PD: bool>(
     let mut mc = EvMicro::default();
 
     loop {
-        let o = next_ord.fetch_add(1, Ordering::Relaxed);
-        let Some(&cidx) = order.get(o) else {
+        if abort.load(Ordering::Relaxed) {
+            return;
+        }
+        let cidx = next_ev.fetch_add(1, Ordering::Relaxed);
+        let Some(&task) = ev_chunks.get(cidx) else {
             break;
         };
-        let task = ev_chunks[cidx];
         let t_c = if PD { Some(Instant::now()) } else { None };
         let mut dec_ns = 0u64;
         let res = {
-            let buckets = ev_buckets.get_or_insert_with(|| SlabBuckets::new(ev_hint_bytes));
+            let buckets = ev_buckets.get_or_insert_with(|| {
+                ev_slot.hex.reserve(est_hex_cap);
+                ev_slot.ext.reserve(est_ext_cap);
+                SlabBuckets::new(ev_hint_bytes)
+            });
             event_src.for_each_chunk_direct_batched_timed::<7, PD>(
                 task,
                 &mut buf,
@@ -5051,9 +5213,9 @@ fn run_parse_events_worker<const COMPACT: bool, const PD: bool>(
                         window_start_ms,
                         window_end_ms,
                         window_start_sec,
-                        arena_out,
-                        hex_out,
-                        ext_out,
+                        &mut ev_slot.arena,
+                        &mut ev_slot.hex,
+                        &mut ev_slot.ext,
                         buckets,
                         &mut hex_buckets,
                         ev_hint_bytes,
@@ -5072,19 +5234,20 @@ fn run_parse_events_worker<const COMPACT: bool, const PD: bool>(
         }
         if let Err(e) = res {
             *err_out = Some(e);
+            abort.store(true, Ordering::Release);
             return;
         }
     }
 
     if let Some(buckets) = ev_buckets {
         let (slab, w_chunks) = buckets.finish();
-        *slab_slot = Some(slab);
-        *dedup_slot = w_chunks;
+        ev_slot.slab = Some(slab);
+        ev_slot.dedup = w_chunks;
     }
     if let Some(hb) = hex_buckets {
         let (h_slab, h_chunks) = hb.finish();
-        *hex_slab_slot = Some(h_slab);
-        *hex_dedup_slot = h_chunks;
+        ev_slot.hex_slab = Some(h_slab);
+        ev_slot.hex_dedup = h_chunks;
     }
     if PD {
         let scan_ns = io_scan_ns.saturating_sub(pread_ns);
@@ -5114,352 +5277,6 @@ fn run_parse_events_worker<const COMPACT: bool, const PD: bool>(
         detail.ev_n_inv_gen.fetch_add(mc.n_inv_gen, Ordering::Relaxed);
         detail.ev_n_purch.fetch_add(mc.n_purch, Ordering::Relaxed);
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_parse_events_and_links<const COMPACT: bool, const PD: bool>(
-    event_src: &CsvSource,
-    ev_chunks: &[crate::csv::ChunkTask],
-    ev_hint_bytes: usize,
-    link_paths: &[std::path::PathBuf],
-    lookups: &Lookups,
-    window_start_ms: i64,
-    window_end_ms: i64,
-    window_start_sec: i64,
-    ncpu: usize,
-    detail: &DetailStats,
-) -> io::Result<(LinkMap, EvParseOutput, Instant, bool)> {
-    let n_threads = ncpu.clamp(1, 63);
-    let overlap_links = n_threads >= 2 && !link_paths.is_empty() && ev_chunks.len() >= 4;
-
-    let mut link_map_opt: Option<LinkMap> = None;
-    let mut links_w_done = Instant::now();
-    if !overlap_links {
-        let t_l0 = Instant::now();
-        let lm = build_link_map(link_paths, n_threads)?;
-        links_w_done = Instant::now();
-        if PD {
-            detail
-                .links_w_ns
-                .store((links_w_done - t_l0).as_nanos() as u64, Ordering::Relaxed);
-        }
-        link_map_opt = Some(lm);
-    }
-
-    if ev_chunks.is_empty() {
-        return Ok((
-            link_map_opt.unwrap_or_else(LinkMap::empty),
-            EvParseOutput {
-                ev_slabs: Vec::new(),
-                dedup_chunks: (0..P_DEDUP).map(|_| Vec::new()).collect(),
-                hex_slabs: Vec::new(),
-                hex_dedup_chunks: (0..P_HEX_DEDUP).map(|_| Vec::new()).collect(),
-                ev_worker_arenas: Vec::new(),
-                ev_worker_hex: Vec::new(),
-                ev_worker_ext: Vec::new(),
-            },
-            links_w_done,
-            false,
-        ));
-    }
-
-    let n_slots = n_threads.min(ev_chunks.len());
-    let mut order: Vec<usize> = (0..ev_chunks.len()).collect();
-    order.sort_unstable_by(|&a, &b| {
-        let la = ev_chunks[a].end.saturating_sub(ev_chunks[a].start);
-        let lb = ev_chunks[b].end.saturating_sub(ev_chunks[b].start);
-        lb.cmp(&la)
-    });
-    let next_ord = AtomicUsize::new(0);
-
-    let mut worker_slabs: Vec<Option<SlabArena>> = (0..n_slots).map(|_| None).collect();
-    let mut worker_dedup: Vec<Vec<Vec<MutChunkRef<ParsedEvent16>>>> =
-        (0..n_slots).map(|_| Vec::new()).collect();
-    let mut worker_hex_slabs: Vec<Option<SlabArena>> = (0..n_slots).map(|_| None).collect();
-    let mut worker_hex_dedup: Vec<Vec<Vec<MutChunkRef<HexEvent32>>>> =
-        (0..n_slots).map(|_| Vec::new()).collect();
-    let mut ev_worker_arenas: Vec<LongArena> = (0..n_slots).map(|_| LongArena::default()).collect();
-    let mut ev_worker_hex: Vec<Vec<Hex128>> = (0..n_slots).map(|_| Vec::new()).collect();
-    let mut ev_worker_ext: Vec<Vec<ExtEvent>> = (0..n_slots).map(|_| Vec::new()).collect();
-    let mut worker_errs: Vec<Option<io::Error>> = (0..n_slots).map(|_| None).collect();
-
-    if overlap_links {
-        let link_threads = (if n_threads >= 6 {
-            3
-        } else if n_threads >= 4 {
-            2
-        } else {
-            1
-        })
-        .min(n_slots);
-        let mut lm_res: io::Result<LinkMap> = Ok(LinkMap::empty());
-        let order_ref = &order;
-        let next_ref = &next_ord;
-        let slabs_split = worker_slabs.split_at_mut(link_threads);
-        let dedup_split = worker_dedup.split_at_mut(link_threads);
-        let hex_slabs_split = worker_hex_slabs.split_at_mut(link_threads);
-        let hex_dedup_split = worker_hex_dedup.split_at_mut(link_threads);
-        let arenas_split = ev_worker_arenas.split_at_mut(link_threads);
-        let hex_split = ev_worker_hex.split_at_mut(link_threads);
-        let ext_split = ev_worker_ext.split_at_mut(link_threads);
-        let errs_split = worker_errs.split_at_mut(link_threads);
-
-        std::thread::scope(|scope| {
-            // Immediate events workers for slots link_threads..n_slots
-            for (
-                idx,
-                (
-                    ((((((slab_slot, dedup_slot), hex_slab_slot), hex_dedup_slot), arena_out), hex_out), ext_out),
-                    err_out,
-                ),
-            ) in slabs_split
-                .1
-                .iter_mut()
-                .zip(dedup_split.1.iter_mut())
-                .zip(hex_slabs_split.1.iter_mut())
-                .zip(hex_dedup_split.1.iter_mut())
-                .zip(arenas_split.1.iter_mut())
-                .zip(hex_split.1.iter_mut())
-                .zip(ext_split.1.iter_mut())
-                .zip(errs_split.1.iter_mut())
-                .enumerate()
-            {
-                let wid = link_threads + idx;
-                scope.spawn(move || {
-                    run_parse_events_worker::<COMPACT, PD>(
-                        event_src,
-                        ev_chunks,
-                        order_ref,
-                        next_ref,
-                        ev_hint_bytes,
-                        lookups,
-                        window_start_ms,
-                        window_end_ms,
-                        window_start_sec,
-                        wid,
-                        detail,
-                        slab_slot,
-                        dedup_slot,
-                        hex_slab_slot,
-                        hex_dedup_slot,
-                        arena_out,
-                        hex_out,
-                        ext_out,
-                        err_out,
-                    );
-                });
-            }
-
-            // Coordinator builds LinkMap concurrently using `link_threads`, then releases threads to events_parse.
-            let t_l0 = Instant::now();
-            lm_res = build_link_map(link_paths, link_threads);
-            if PD {
-                detail
-                    .links_w_ns
-                    .store(t_l0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-
-            let mut it_slab = slabs_split.0.iter_mut();
-            let mut it_dedup = dedup_split.0.iter_mut();
-            let mut it_hslab = hex_slabs_split.0.iter_mut();
-            let mut it_hdedup = hex_dedup_split.0.iter_mut();
-            let mut it_arena = arenas_split.0.iter_mut();
-            let mut it_hex = hex_split.0.iter_mut();
-            let mut it_ext = ext_split.0.iter_mut();
-            let mut it_err = errs_split.0.iter_mut();
-
-            let s0 = it_slab.next().unwrap();
-            let d0 = it_dedup.next().unwrap();
-            let hs0 = it_hslab.next().unwrap();
-            let hd0 = it_hdedup.next().unwrap();
-            let a0 = it_arena.next().unwrap();
-            let h0 = it_hex.next().unwrap();
-            let x0 = it_ext.next().unwrap();
-            let e0 = it_err.next().unwrap();
-
-            for (
-                idx,
-                (
-                    ((((((slab_slot, dedup_slot), hex_slab_slot), hex_dedup_slot), arena_out), hex_out), ext_out),
-                    err_out,
-                ),
-            ) in it_slab
-                .zip(it_dedup)
-                .zip(it_hslab)
-                .zip(it_hdedup)
-                .zip(it_arena)
-                .zip(it_hex)
-                .zip(it_ext)
-                .zip(it_err)
-                .enumerate()
-            {
-                let wid = 1 + idx;
-                scope.spawn(move || {
-                    run_parse_events_worker::<COMPACT, PD>(
-                        event_src,
-                        ev_chunks,
-                        order_ref,
-                        next_ref,
-                        ev_hint_bytes,
-                        lookups,
-                        window_start_ms,
-                        window_end_ms,
-                        window_start_sec,
-                        wid,
-                        detail,
-                        slab_slot,
-                        dedup_slot,
-                        hex_slab_slot,
-                        hex_dedup_slot,
-                        arena_out,
-                        hex_out,
-                        ext_out,
-                        err_out,
-                    );
-                });
-            }
-
-            run_parse_events_worker::<COMPACT, PD>(
-                event_src,
-                ev_chunks,
-                order_ref,
-                next_ref,
-                ev_hint_bytes,
-                lookups,
-                window_start_ms,
-                window_end_ms,
-                window_start_sec,
-                0,
-                detail,
-                s0,
-                d0,
-                hs0,
-                hd0,
-                a0,
-                h0,
-                x0,
-                e0,
-            );
-        });
-
-        link_map_opt = Some(lm_res?);
-    } else if n_slots <= 1 {
-        run_parse_events_worker::<COMPACT, PD>(
-            event_src,
-            ev_chunks,
-            &order,
-            &next_ord,
-            ev_hint_bytes,
-            lookups,
-            window_start_ms,
-            window_end_ms,
-            window_start_sec,
-            0,
-            detail,
-            &mut worker_slabs[0],
-            &mut worker_dedup[0],
-            &mut worker_hex_slabs[0],
-            &mut worker_hex_dedup[0],
-            &mut ev_worker_arenas[0],
-            &mut ev_worker_hex[0],
-            &mut ev_worker_ext[0],
-            &mut worker_errs[0],
-        );
-    } else {
-        std::thread::scope(|scope| {
-            let order_ref = &order;
-            let next_ref = &next_ord;
-            for (
-                wid,
-                (
-                    ((((((slab_slot, dedup_slot), hex_slab_slot), hex_dedup_slot), arena_out), hex_out), ext_out),
-                    err_out,
-                ),
-            ) in worker_slabs
-                .iter_mut()
-                .zip(worker_dedup.iter_mut())
-                .zip(worker_hex_slabs.iter_mut())
-                .zip(worker_hex_dedup.iter_mut())
-                .zip(ev_worker_arenas.iter_mut())
-                .zip(ev_worker_hex.iter_mut())
-                .zip(ev_worker_ext.iter_mut())
-                .zip(worker_errs.iter_mut())
-                .enumerate()
-            {
-                scope.spawn(move || {
-                    run_parse_events_worker::<COMPACT, PD>(
-                        event_src,
-                        ev_chunks,
-                        order_ref,
-                        next_ref,
-                        ev_hint_bytes,
-                        lookups,
-                        window_start_ms,
-                        window_end_ms,
-                        window_start_sec,
-                        wid,
-                        detail,
-                        slab_slot,
-                        dedup_slot,
-                        hex_slab_slot,
-                        hex_dedup_slot,
-                        arena_out,
-                        hex_out,
-                        ext_out,
-                        err_out,
-                    );
-                });
-            }
-        });
-    }
-
-    for e in worker_errs.into_iter().flatten() {
-        return Err(e);
-    }
-
-    let mut ev_slabs = Vec::with_capacity(n_slots);
-    let mut dedup_chunks: Vec<Vec<MutChunkRef<ParsedEvent16>>> = (0..P_DEDUP)
-        .map(|_| Vec::new())
-        .collect();
-    for (slab_opt, w_chunks) in worker_slabs.into_iter().zip(worker_dedup.into_iter()) {
-        if let Some(slab) = slab_opt {
-            ev_slabs.push(slab);
-            for (ds, v) in w_chunks.into_iter().enumerate() {
-                dedup_chunks[ds].extend(v);
-            }
-        }
-    }
-
-    let mut hex_slabs = Vec::with_capacity(n_slots);
-    let mut hex_dedup_chunks: Vec<Vec<MutChunkRef<HexEvent32>>> = (0..P_HEX_DEDUP)
-        .map(|_| Vec::new())
-        .collect();
-    for (slab_opt, w_chunks) in worker_hex_slabs
-        .into_iter()
-        .zip(worker_hex_dedup.into_iter())
-    {
-        if let Some(slab) = slab_opt {
-            hex_slabs.push(slab);
-            for (hs, v) in w_chunks.into_iter().enumerate() {
-                hex_dedup_chunks[hs].extend(v);
-            }
-        }
-    }
-
-    Ok((
-        link_map_opt.unwrap(),
-        EvParseOutput {
-            ev_slabs,
-            dedup_chunks,
-            hex_slabs,
-            hex_dedup_chunks,
-            ev_worker_arenas,
-            ev_worker_hex,
-            ev_worker_ext,
-        },
-        links_w_done,
-        overlap_links,
-    ))
 }
 
 #[inline(always)]
@@ -5639,6 +5456,49 @@ fn sort_u64_8(s: &mut [u64]) {
     }
 }
 
+#[inline(always)]
+fn sort_u64_2(s: &mut [u64]) {
+    unsafe {
+        let a = *s.get_unchecked(0);
+        let b = *s.get_unchecked(1);
+        *s.get_unchecked_mut(0) = a.min(b);
+        *s.get_unchecked_mut(1) = a.max(b);
+    }
+}
+
+#[inline(always)]
+fn sort_u64_3(s: &mut [u64]) {
+    unsafe {
+        let a = *s.get_unchecked(0);
+        let b = *s.get_unchecked(1);
+        let c = *s.get_unchecked(2);
+        let (a1, b1) = (a.min(b), a.max(b));
+        let (b2, c1) = (b1.min(c), b1.max(c));
+        *s.get_unchecked_mut(0) = a1.min(b2);
+        *s.get_unchecked_mut(1) = a1.max(b2);
+        *s.get_unchecked_mut(2) = c1;
+    }
+}
+
+#[inline(always)]
+fn sort_u64_4(s: &mut [u64]) {
+    unsafe {
+        let a = *s.get_unchecked(0);
+        let b = *s.get_unchecked(1);
+        let c = *s.get_unchecked(2);
+        let d = *s.get_unchecked(3);
+        let (a1, b1) = (a.min(b), a.max(b));
+        let (c1, d1) = (c.min(d), c.max(d));
+        let (a2, c2) = (a1.min(c1), a1.max(c1));
+        let (b2, d2) = (b1.min(d1), b1.max(d1));
+        let (b3, c3) = (b2.min(c2), b2.max(c2));
+        *s.get_unchecked_mut(0) = a2;
+        *s.get_unchecked_mut(1) = b3;
+        *s.get_unchecked_mut(2) = c3;
+        *s.get_unchecked_mut(3) = d2;
+    }
+}
+
 fn sort_u64_bucket256(slice: &mut [u64], scratch: &mut Vec<u64>) {
     let n = slice.len();
     if n <= 1 {
@@ -5800,38 +5660,15 @@ impl Stage5Event for PersonEvent16 {
             return;
         }
         if n == 2 {
-            let (a, b) = (slice[0], slice[1]);
-            slice[0] = a.min(b);
-            slice[1] = a.max(b);
+            sort_u64_2(slice);
             return;
         }
         if n == 3 {
-            let (mut a, mut b, mut c) = (slice[0], slice[1], slice[2]);
-            let (a1, b1) = (a.min(b), a.max(b));
-            let (b2, c1) = (b1.min(c), b1.max(c));
-            a = a1.min(b2);
-            b = a1.max(b2);
-            c = c1;
-            slice[0] = a;
-            slice[1] = b;
-            slice[2] = c;
+            sort_u64_3(slice);
             return;
         }
         if n == 4 {
-            let (mut a, mut b, mut c, mut d) = (slice[0], slice[1], slice[2], slice[3]);
-            let (a1, b1) = (a.min(b), a.max(b));
-            let (c1, d1) = (c.min(d), c.max(d));
-            let (a2, c2) = (a1.min(c1), a1.max(c1));
-            let (b2, d2) = (b1.min(d1), b1.max(d1));
-            let (b3, c3) = (b2.min(c2), b2.max(c2));
-            a = a2;
-            b = b3;
-            c = c3;
-            d = d2;
-            slice[0] = a;
-            slice[1] = b;
-            slice[2] = c;
-            slice[3] = d;
+            sort_u64_4(slice);
             return;
         }
         if n == 5 {
@@ -6255,6 +6092,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
     max_day: i32,
     ws_day: i32,
     ws_rem: u64,
+    fast_exit: bool,
     detail: &DetailStats,
 ) -> io::Result<(Vec<CampDailyAcc>, usize)> {
     let mut shard_order: Vec<usize> = (0..P_PERSON).collect();
@@ -6373,7 +6211,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
 
                     // 1. Unified branchless L1/L2 intern via single 8B p_slots (uh42 + comp + hex32) and rare gen_p_table.
                     let t_ev = if PD { Some(Instant::now()) } else { None };
-                    let mut p_cap = (ev_total / 24).max(256).next_power_of_two();
+                    let mut p_cap = (ev_total / 6).max(256).next_power_of_two();
                     let mut p_mask = p_cap - 1;
                     let mut p_thresh = p_cap * 7 / 10;
                     p_slots.clear();
@@ -6531,7 +6369,7 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                     let ev_ptr = grouped_events.as_mut_ptr();
                     let mut pid_idx = 0usize;
                     for chunk in evs_chunks {
-                        for &ev in unsafe { chunk.as_slice() } {
+                        for ev in unsafe { chunk.as_slice() } {
                             let pid = unsafe { *ev_pids.get_unchecked(pid_idx) } as usize;
                             pid_idx += 1;
                             let pos = unsafe { *ev_fill.get_unchecked(pid) } as usize;
@@ -6813,7 +6651,8 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                             }
                         }
 
-                        let top_cat = pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats);
+                        let top_cat =
+                            pick_and_reset_top_cat_id(&mut cat_rev, &mut touched_cats);
                         let c_u = if PD { rdtsc_now() } else { 0 };
                         let push_res = writer.push(
                             person_bytes,
@@ -7020,6 +6859,24 @@ fn run_stage5<E: Stage5Event, C: Stage5Click, const PD: bool>(
                         .fetch_add(sess_attr_ns, Ordering::Relaxed);
                     detail.s5_ud_ns.fetch_add(ud_ns, Ordering::Relaxed);
                 }
+                if fast_exit {
+                    std::mem::forget((
+                        p_slots,
+                        persons,
+                        ev_counts,
+                        gen_p_table,
+                        ev_pids,
+                        ev_offsets,
+                        ev_fill,
+                        grouped_events,
+                        cl_counts,
+                        cl_pids,
+                        cl_offsets,
+                        cl_fill,
+                        grouped_clicks,
+                        radix_scratch,
+                    ));
+                }
             });
         }
     });
@@ -7069,24 +6926,17 @@ pub fn run_pipeline_with_exit(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_typed_stages<
+    const COMPACT_EV: bool,
     E: DedupEmit + Stage5Event,
     C: ClickEmit + Stage5Click,
     const PD: bool,
 >(
-    dedup_slots: Vec<Mutex<Option<Vec<MutChunkRef<ParsedEvent16>>>>>,
-    hex_dedup_slots: Vec<Mutex<Option<Vec<MutChunkRef<HexEvent32>>>>>,
-    ev_worker_ext: Vec<Vec<ExtEvent>>,
-    ev_worker_arenas: Vec<LongArena>,
-    ev_worker_hex: Vec<Vec<Hex128>>,
-    ev_slabs: Vec<SlabArena>,
-    hex_slabs: Vec<SlabArena>,
+    event_src: CsvSource,
     click_src: CsvSource,
-    cl_chunks: &[crate::csv::ChunkTask],
-    cl_hint_bytes: usize,
-    pe_hint_bytes: usize,
+    link_paths: &[std::path::PathBuf],
     lookups: &Lookups,
-    link_map: &mut LinkMap,
     ud_dir: &Path,
     window_start_ms: i64,
     window_end_ms: i64,
@@ -7096,43 +6946,80 @@ fn run_typed_stages<
     max_day: i32,
     ws_day: i32,
     ws_rem: u64,
+    t_lookups: Instant,
     ncpu: usize,
     fast_exit: bool,
     detail: &DetailStats,
-) -> io::Result<(Instant, Instant, Instant, Vec<CampDailyAcc>, usize)> {
-    let out = run_clicks_and_dedup::<E, C, PD>(
-        &dedup_slots,
-        &hex_dedup_slots,
-        &ev_worker_ext,
-        &ev_worker_arenas,
-        &ev_worker_hex,
-        &click_src,
-        cl_chunks,
-        cl_hint_bytes,
-        pe_hint_bytes,
-        lookups,
-        link_map,
-        window_start_ms,
-        window_end_ms,
-        window_start_sec,
-        click_window_start_ms,
-        ncpu,
-        detail,
-    )?;
+) -> io::Result<(
+    Instant,
+    Instant,
+    Instant,
+    Instant,
+    Instant,
+    (usize, usize, usize, usize),
+    bool,
+    Vec<CampDailyAcc>,
+    usize,
+)> {
+    let mut ev_chunks = event_src.chunks(CHUNK_BYTES);
+    ev_chunks.sort_unstable_by(|a, b| (b.end - b.start).cmp(&(a.end - a.start)));
+    let mut cl_chunks = click_src.chunks(CHUNK_BYTES);
+    cl_chunks.sort_unstable_by(|a, b| (b.end - b.start).cmp(&(a.end - a.start)));
+    let n_workers = ncpu.clamp(1, 63);
+    let n_ev_active = n_workers.min(ev_chunks.len().max(1));
+    let est_ev_total = event_src.total_bytes() / 68;
+    let ev_hint_bytes = (est_ev_total * 16) / n_ev_active.max(1);
+    let cl_active = n_workers.min(cl_chunks.len().max(1));
+    let cl_elem_bytes = if std::mem::size_of::<C>() <= 16 {
+        16usize
+    } else {
+        32usize
+    };
+    let pe_elem_bytes = if std::mem::size_of::<E>() <= 16 {
+        16usize
+    } else {
+        24usize
+    };
+    let cl_hint_bytes = ((click_src.total_bytes() / 42) * cl_elem_bytes) / cl_active.max(1);
+    let pe_hint_bytes = (est_ev_total * pe_elem_bytes) / n_workers.max(1);
+
+    let (mut link_map, ev_shared, out, t_links, t_events_parse, overlap_links) =
+        run_parse_clicks_and_dedup::<COMPACT_EV, E, C, PD>(
+            &event_src,
+            &ev_chunks,
+            ev_hint_bytes,
+            link_paths,
+            &click_src,
+            &cl_chunks,
+            cl_hint_bytes,
+            pe_hint_bytes,
+            lookups,
+            window_start_ms,
+            window_end_ms,
+            window_start_sec,
+            click_window_start_ms,
+            t_lookups,
+            ncpu,
+            detail,
+        )?;
+    let lm_bytes = if PD { link_map.debug_stats() } else { (0, 0, 0, 0) };
+    let ev_worker_arenas = ev_shared.ev_worker_arenas;
+    let ev_worker_hex = ev_shared.ev_worker_hex;
     let t_drop = if PD { Some(Instant::now()) } else { None };
+    drop(event_src);
     drop(click_src);
-    drop(dedup_slots);
-    drop(hex_dedup_slots);
-    drop(ev_worker_ext);
-    drop(ev_slabs);
-    drop(hex_slabs);
+    drop(ev_shared.dedup_chunks);
+    drop(ev_shared.hex_dedup_chunks);
+    drop(ev_shared.ev_worker_ext);
+    drop(ev_shared.ev_slabs);
+    drop(ev_shared.hex_slabs);
     link_map.drop_lookup_tables();
     if let Some(t) = t_drop {
         detail
             .ev_drop_w_ns
             .store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
-    let t_ed = Instant::now();
+    let t_ed = Instant::now().max(t_events_parse);
     let res = run_stage5::<E, C, PD>(
         out.person_event_chunks,
         out.person_click_chunks,
@@ -7143,7 +7030,7 @@ fn run_typed_stages<
         &ev_worker_hex,
         &out.cl_worker_arenas,
         &out.cl_worker_hex,
-        link_map,
+        &link_map,
         lookups,
         ud_dir,
         ncpu,
@@ -7151,16 +7038,34 @@ fn run_typed_stages<
         max_day,
         ws_day,
         ws_rem,
+        fast_exit,
         detail,
     )?;
     if fast_exit {
-        std::mem::forget(out.pe_slabs);
-        std::mem::forget(out.cl_slabs);
+        std::mem::forget((
+            out.pe_slabs,
+            out.cl_slabs,
+            ev_worker_arenas,
+            ev_worker_hex,
+            out.cl_worker_arenas,
+            out.cl_worker_hex,
+            out.cl_worker_ext,
+        ));
     } else {
         drop(out.pe_slabs);
         drop(out.cl_slabs);
     }
-    Ok((t_ed, t_ed, Instant::now(), res.0, res.1))
+    Ok((
+        t_links,
+        t_events_parse,
+        t_ed,
+        t_ed,
+        Instant::now(),
+        lm_bytes,
+        overlap_links,
+        res.0,
+        res.1,
+    ))
 }
 
 fn run_pipeline_inner<const PD: bool>(
@@ -7203,99 +7108,33 @@ fn run_pipeline_inner<const PD: bool>(
         && click_span_ms <= ((1i64 << 31) - 1)
         && lookups.camp_entries.len() < (1 << 16);
 
-    // Parse events while overlapping LinkMap build when multi-threaded.
     let link_paths = list_csv_files(&data_dir.join("links"))?;
     let event_paths = list_csv_files(&data_dir.join("events"))?;
-    let event_src = CsvSource::open(&event_paths)?;
-    let ev_chunks = event_src.chunks(CHUNK_BYTES);
-    let n_ev_workers = ncpu.clamp(1, 63).min(ev_chunks.len().max(1));
-    let est_ev_total = event_src.total_bytes() / 68;
-    let ev_hint_bytes = (est_ev_total * 16) / n_ev_workers.max(1);
-
-    let (mut link_map, ev_out, links_w_done, overlap_links) = if compact_ev_mode {
-        run_parse_events_and_links::<true, PD>(
-            &event_src,
-            &ev_chunks,
-            ev_hint_bytes,
-            &link_paths,
-            &lookups,
-            window_start_ms,
-            window_end_ms,
-            window_start_sec,
-            ncpu,
-            &detail,
-        )?
-    } else {
-        run_parse_events_and_links::<false, PD>(
-            &event_src,
-            &ev_chunks,
-            ev_hint_bytes,
-            &link_paths,
-            &lookups,
-            window_start_ms,
-            window_end_ms,
-            window_start_sec,
-            ncpu,
-            &detail,
-        )?
-    };
-    drop(event_src);
-    let t_events_parse = Instant::now();
-    let t_links = if overlap_links {
-        t_lookups
-    } else {
-        links_w_done
-    };
-    let lm_bytes = if PD { link_map.debug_stats() } else { (0, 0, 0, 0) };
-
-    let ev_slabs = ev_out.ev_slabs;
-    let dedup_slots: Vec<Mutex<Option<Vec<MutChunkRef<ParsedEvent16>>>>> = ev_out
-        .dedup_chunks
-        .into_iter()
-        .map(|v| Mutex::new(Some(v)))
-        .collect();
-    let hex_slabs = ev_out.hex_slabs;
-    let hex_dedup_slots: Vec<Mutex<Option<Vec<MutChunkRef<HexEvent32>>>>> = ev_out
-        .hex_dedup_chunks
-        .into_iter()
-        .map(|v| Mutex::new(Some(v)))
-        .collect();
-    let ev_worker_arenas = ev_out.ev_worker_arenas;
-    let ev_worker_hex = ev_out.ev_worker_hex;
-    let ev_worker_ext = ev_out.ev_worker_ext;
-
-    // Unified clicks parse + events dedup (with LinkMap resolution) in one std::thread::scope.
     let click_paths = list_csv_files(&data_dir.join("clicks"))?;
+    let event_src = CsvSource::open(&event_paths)?;
     let click_src = CsvSource::open(&click_paths)?;
-    let cl_chunks = click_src.chunks(CHUNK_BYTES);
-    let n_pool_workers = ncpu.clamp(1, 63);
-    let cl_active = n_pool_workers.min(cl_chunks.len().max(1));
-    let cl_hint_bytes = ((click_src.total_bytes() / 42) * 16) / cl_active.max(1);
-    let pe_hint_bytes = (est_ev_total * 16) / n_pool_workers.max(1);
 
     let ud_dir = out_dir.join("user_daily");
     let cd_dir = out_dir.join("campaign_daily");
     clean_parquet_dir(&ud_dir)?;
     clean_parquet_dir(&cd_dir)?;
 
-    let (t_events_dedup, t_clicks, t_stage5, worker_accs, total_ud_rows) = match (
-        compact_ev_mode,
-        compact_click_mode,
-    ) {
-        (true, true) => run_typed_stages::<PersonEvent16, PersonClick16, PD>(
-            dedup_slots,
-            hex_dedup_slots,
-            ev_worker_ext,
-            ev_worker_arenas,
-            ev_worker_hex,
-            ev_slabs,
-            hex_slabs,
+    let (
+        t_links_raw,
+        t_events_parse,
+        t_events_dedup,
+        t_clicks,
+        t_stage5,
+        lm_bytes,
+        overlap_links,
+        worker_accs,
+        total_ud_rows,
+    ) = match (compact_ev_mode, compact_click_mode) {
+        (true, true) => run_typed_stages::<true, PersonEvent16, PersonClick16, PD>(
+            event_src,
             click_src,
-            &cl_chunks,
-            cl_hint_bytes,
-            pe_hint_bytes,
+            &link_paths,
             &lookups,
-            &mut link_map,
             &ud_dir,
             window_start_ms,
             window_end_ms,
@@ -7305,24 +7144,16 @@ fn run_pipeline_inner<const PD: bool>(
             max_day,
             ws_day,
             ws_rem,
+            t_lookups,
             ncpu,
             fast_exit,
             &detail,
         )?,
-        (true, false) => run_typed_stages::<PersonEvent16, PersonClickWide, PD>(
-            dedup_slots,
-            hex_dedup_slots,
-            ev_worker_ext,
-            ev_worker_arenas,
-            ev_worker_hex,
-            ev_slabs,
-            hex_slabs,
+        (true, false) => run_typed_stages::<true, PersonEvent16, PersonClickWide, PD>(
+            event_src,
             click_src,
-            &cl_chunks,
-            cl_hint_bytes * 2,
-            pe_hint_bytes,
+            &link_paths,
             &lookups,
-            &mut link_map,
             &ud_dir,
             window_start_ms,
             window_end_ms,
@@ -7332,24 +7163,16 @@ fn run_pipeline_inner<const PD: bool>(
             max_day,
             ws_day,
             ws_rem,
+            t_lookups,
             ncpu,
             fast_exit,
             &detail,
         )?,
-        _ => run_typed_stages::<PersonEventWide, PersonClickWide, PD>(
-            dedup_slots,
-            hex_dedup_slots,
-            ev_worker_ext,
-            ev_worker_arenas,
-            ev_worker_hex,
-            ev_slabs,
-            hex_slabs,
+        _ => run_typed_stages::<false, PersonEventWide, PersonClickWide, PD>(
+            event_src,
             click_src,
-            &cl_chunks,
-            cl_hint_bytes * 2,
-            (est_ev_total * 24) / n_pool_workers.max(1),
+            &link_paths,
             &lookups,
-            &mut link_map,
             &ud_dir,
             window_start_ms,
             window_end_ms,
@@ -7359,10 +7182,16 @@ fn run_pipeline_inner<const PD: bool>(
             max_day,
             ws_day,
             ws_rem,
+            t_lookups,
             ncpu,
             fast_exit,
             &detail,
         )?,
+    };
+    let t_links = if overlap_links {
+        t_lookups
+    } else {
+        t_links_raw
     };
 
     if total_ud_rows == 0 {
@@ -7891,7 +7720,7 @@ mod tests {
             }
         }
 
-        for &n in &[256usize, 384, 500, 1536, 2047, 2048, 2500, 5000] {
+        for &n in &[256usize, 384, 500, 1536, 2047, 2048, 2500, 5000, 50_000] {
             for mode in [0u8, 1, 2, 3, 4, 5] {
                 let mut v = Vec::with_capacity(n);
                 for idx in 0..n {
@@ -7934,6 +7763,27 @@ mod tests {
                 <PersonEvent16 as Stage5Event>::sort_grouped(&mut v_g, &mut scratch);
                 let got_g: Vec<u32> = v_g.iter().map(|x| (x >> 32) as u32).collect();
                 assert_eq!(got_g, expected_hi, "sort_grouped radix21 mismatch n={n} mode={mode}");
+            }
+        }
+
+        for &n in &[9usize, 16, 32, 33, 64, 128, 255, 512] {
+            for span_mode in [0u8, 1, 2, 3, 4] {
+                let mut v = Vec::with_capacity(n);
+                for idx in 0..n {
+                    let ts_rel = match span_mode {
+                        0 => 500_000_000u64, // constant timestamp
+                        1 => 500_000_000u64 + ((idx as u64) * 13), // already sorted
+                        2 => 500_000_000u64 + (next_u64() & 0x3FF), // < 1 second
+                        3 => 500_000_000u64 + (next_u64() % 3_600_000), // < 1 hour
+                        _ => 500_000_000u64 + (((n - idx) as u64) * 5_000), // reverse < 1h
+                    };
+                    v.push((ts_rel << 32) | (next_u64() & 0xFFFF_FFFF));
+                }
+                let mut expected_hi: Vec<u32> = v.iter().map(|x| (x >> 32) as u32).collect();
+                expected_hi.sort_unstable();
+                <PersonEvent16 as Stage5Event>::sort_grouped(&mut v, &mut scratch);
+                let got_g: Vec<u32> = v.iter().map(|x| (x >> 32) as u32).collect();
+                assert_eq!(got_g, expected_hi, "narrow/presorted mismatch n={n} span_mode={span_mode}");
             }
         }
     }

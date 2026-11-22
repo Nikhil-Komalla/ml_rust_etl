@@ -218,12 +218,12 @@ pub fn encode_b37_pair_padded(
 pub fn decode_b37(val: u64, prefix: u8, buf: &mut [u8; 10]) -> usize {
     debug_assert!(val > 0 && val <= B37_MASK42);
     buf[0] = prefix;
-    let hi4 = (val / 1_874_161) as usize;
-    let lo4 = (val % 1_874_161) as usize;
-    let p0 = hi4 / 1369;
-    let p1 = hi4 % 1369;
-    let p2 = lo4 / 1369;
-    let p3 = lo4 % 1369;
+    let hi4 = (val / 1_874_161) as u32;
+    let lo4 = (val - (hi4 as u64) * 1_874_161) as u32;
+    let p0 = (hi4 / 1369) as usize;
+    let p1 = (hi4 % 1369) as usize;
+    let p2 = (lo4 / 1369) as usize;
+    let p3 = (lo4 % 1369) as usize;
     unsafe {
         let a0 = *B37_PAIRS.get_unchecked(p0);
         let a1 = *B37_PAIRS.get_unchecked(p1);
@@ -1586,7 +1586,11 @@ unsafe fn scan_lines_direct_batched_avx2_clmul<const K: usize>(
     });
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(target_feature = "pclmulqdq")
+))]
 unsafe fn scan_lines_direct_batched_avx2_sw<const K: usize>(
     padded_buf: &[u8],
     valid_len: usize,
@@ -1601,10 +1605,17 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
     valid_len: usize,
     on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
 ) {
-    if std::is_x86_feature_detected!("pclmulqdq") {
+    #[cfg(target_feature = "pclmulqdq")]
+    {
         unsafe { scan_lines_direct_batched_avx2_clmul::<K>(padded_buf, valid_len, on_batch) }
-    } else {
-        unsafe { scan_lines_direct_batched_avx2_sw::<K>(padded_buf, valid_len, on_batch) }
+    }
+    #[cfg(not(target_feature = "pclmulqdq"))]
+    {
+        if std::is_x86_feature_detected!("pclmulqdq") {
+            unsafe { scan_lines_direct_batched_avx2_clmul::<K>(padded_buf, valid_len, on_batch) }
+        } else {
+            unsafe { scan_lines_direct_batched_avx2_sw::<K>(padded_buf, valid_len, on_batch) }
+        }
     }
 }
 
@@ -1784,6 +1795,7 @@ pub unsafe fn field_span(base: *const u8, s: usize, e: usize) -> (usize, usize) 
     (s + q, e - q)
 }
 
+#[cfg(any(test, not(target_feature = "pclmulqdq")))]
 #[inline(always)]
 fn prefix_xor_u64(mut x: u64) -> u64 {
     x ^= x << 1;

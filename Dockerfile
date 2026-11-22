@@ -5,7 +5,7 @@ WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
-RUN RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked
+RUN RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq" cargo build --release --locked
 
 FROM debian:bookworm-slim
 
