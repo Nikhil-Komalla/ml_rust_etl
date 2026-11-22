@@ -5,10 +5,9 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use memchr::{memchr, memrchr};
+use memchr::memchr;
 
 pub const CHUNK_BYTES: usize = 2 * 1024 * 1024;
-pub const READ_BLOCK_BYTES: usize = 256 * 1024;
 
 pub const LONG_LEN_OVERFLOW: usize = 0xF_FFFF;
 pub const LONG_LEN_MASK: u64 = 0xF_FFFF;
@@ -1281,6 +1280,53 @@ impl DirectLineRef {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
+unsafe fn extract_cm_lo_hi(cm_mask: u64, p32: u32, dst_base: *mut u32) -> usize {
+    let lo = cm_mask as u32;
+    let hi = (cm_mask >> 32) as u32;
+    let n_lo = lo.count_ones() as usize;
+    let block_cm = n_lo + (hi.count_ones() as usize);
+    {
+        let mut m = lo;
+        let mut dst = dst_base;
+        *dst = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(1) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(2) = p32.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        if m != 0 {
+            dst = dst.add(3);
+            while m != 0 {
+                *dst = p32.wrapping_add(m.trailing_zeros());
+                dst = dst.add(1);
+                m &= m.wrapping_sub(1);
+            }
+        }
+    }
+    if hi != 0 {
+        let mut m = hi;
+        let p32_hi = p32.wrapping_add(32);
+        let mut dst = dst_base.add(n_lo);
+        *dst = p32_hi.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(1) = p32_hi.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        *dst.add(2) = p32_hi.wrapping_add(m.trailing_zeros());
+        m &= m.wrapping_sub(1);
+        if m != 0 {
+            dst = dst.add(3);
+            while m != 0 {
+                *dst = p32_hi.wrapping_add(m.trailing_zeros());
+                dst = dst.add(1);
+                m &= m.wrapping_sub(1);
+            }
+        }
+    }
+    block_cm
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
 unsafe fn scan_direct_batched_step64<const K: usize>(
     padded_buf: &[u8],
     p: usize,
@@ -1329,48 +1375,7 @@ unsafe fn scan_direct_batched_step64<const K: usize>(
     }
 
     let base_tail = *cm_tail;
-    let lo = cm_mask as u32;
-    let hi = (cm_mask >> 32) as u32;
-    let n_lo = lo.count_ones() as usize;
-    let block_cm = n_lo + (hi.count_ones() as usize);
-    let p32 = p as u32;
-    {
-        let mut m = lo;
-        let mut dst = cm_buf.as_mut_ptr().add(base_tail);
-        *dst = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(1) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(2) = p32.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        if m != 0 {
-            dst = dst.add(3);
-            while m != 0 {
-                *dst = p32.wrapping_add(m.trailing_zeros());
-                dst = dst.add(1);
-                m &= m.wrapping_sub(1);
-            }
-        }
-    }
-    if hi != 0 {
-        let mut m = hi;
-        let p32_hi = p32.wrapping_add(32);
-        let mut dst = cm_buf.as_mut_ptr().add(base_tail + n_lo);
-        *dst = p32_hi.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(1) = p32_hi.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        *dst.add(2) = p32_hi.wrapping_add(m.trailing_zeros());
-        m &= m.wrapping_sub(1);
-        if m != 0 {
-            dst = dst.add(3);
-            while m != 0 {
-                *dst = p32_hi.wrapping_add(m.trailing_zeros());
-                dst = dst.add(1);
-                m &= m.wrapping_sub(1);
-            }
-        }
-    }
+    let block_cm = extract_cm_lo_hi(cm_mask, p as u32, cm_buf.as_mut_ptr().add(base_tail));
 
     let mut prev_done = 0u64;
     let lsp = *line_start_parity;
@@ -1666,6 +1671,360 @@ pub fn scan_lines_direct_batched_avx2<const K: usize>(
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
+unsafe fn scan_fused_step64<const K: usize>(
+    padded_buf: &[u8],
+    p: usize,
+    mut nl_mask: u64,
+    cm_mask: u64,
+    qt_mask: u64,
+    na_mask: u64,
+    d_for_ends: u64,
+    next_d0: u64,
+    prev_delim: &mut u64,
+    prev_in_q: &mut u64,
+    line_start: &mut usize,
+    cm_buf: &mut [u32; CM_BUF_CAP + 72],
+    cm_head: &mut usize,
+    cm_tail: &mut usize,
+    line_start_parity: &mut u64,
+    line_bad: &mut u64,
+    line_na: &mut u64,
+    line_qt: &mut u64,
+    on_line: &mut impl FnMut(&[u8], usize, usize, *const u32, bool),
+    mut prefix_xor_fn: impl FnMut(u64) -> u64,
+) {
+    let d = cm_mask | nl_mask;
+    let starts = (d << 1) | *prev_delim;
+    let ends = (d_for_ends >> 1) | (next_d0 << 63);
+    let bad_pos = qt_mask & !(starts ^ ends);
+    let after_q = prefix_xor_fn(qt_mask) ^ *prev_in_q;
+    *prev_delim = d >> 63;
+    *prev_in_q = ((after_q as i64) >> 63) as u64;
+
+    if *cm_tail + 64 > CM_BUF_CAP {
+        let carry = *cm_tail - *cm_head;
+        if carry <= K {
+            std::ptr::copy(cm_buf.as_ptr().add(*cm_head), cm_buf.as_mut_ptr(), carry);
+            *cm_head = 0;
+            *cm_tail = carry;
+        } else {
+            *cm_head = 0;
+            *cm_tail = K + 1;
+        }
+    }
+
+    let base_tail = *cm_tail;
+    let block_cm = extract_cm_lo_hi(cm_mask, p as u32, cm_buf.as_mut_ptr().add(base_tail));
+
+    let mut prev_done = 0u64;
+    let lsp = *line_start_parity;
+    let mut lb_cur = *line_bad;
+    let mut lna_cur = *line_na;
+    let mut lqt_cur = *line_qt;
+    let mut ls = *line_start;
+    let mut ch = *cm_head;
+    let mut cur_lsp = lsp;
+
+    while nl_mask != 0 {
+        let nl_bit = nl_mask.trailing_zeros();
+        let line_end = p + nl_bit as usize;
+        let nl_flag = 1u64 << nl_bit;
+        let before_nl = nl_flag - 1;
+        let seg = before_nl & !prev_done;
+        let seg_inc = (before_nl | nl_flag) & !prev_done;
+        let line_cm_end = base_tail + (cm_mask & before_nl).count_ones() as usize;
+        let n_commas = line_cm_end - ch;
+        let bad_d = (after_q ^ cur_lsp) & (d & seg_inc);
+        let bad = lb_cur | (bad_pos & seg) | bad_d;
+        let lna = lna_cur | (na_mask & seg);
+        let lqt = lqt_cur | (qt_mask & seg);
+        if line_end > ls
+            && n_commas == K - 1
+            && bad == 0
+            && (lna == 0
+                || std::str::from_utf8(padded_buf.get_unchecked(ls..line_end)).is_ok())
+        {
+            on_line(
+                padded_buf,
+                ls,
+                line_end,
+                cm_buf.as_ptr().add(ch),
+                lqt != 0,
+            );
+        }
+        ls = line_end + 1;
+        ch = line_cm_end;
+        cur_lsp = 0u64.wrapping_sub((after_q >> nl_bit) & 1);
+        lb_cur = 0;
+        lna_cur = 0;
+        lqt_cur = 0;
+        prev_done = before_nl | nl_flag;
+        nl_mask &= nl_mask - 1;
+    }
+
+    *line_start = ls;
+    *cm_head = ch;
+    *cm_tail = base_tail + block_cm;
+    *line_start_parity = cur_lsp;
+    let rem_mask = !prev_done;
+    *line_bad = lb_cur | (bad_pos & rem_mask) | ((after_q ^ cur_lsp) & (d & rem_mask));
+    *line_na = lna_cur | (na_mask & rem_mask);
+    *line_qt = lqt_cur | (qt_mask & rem_mask);
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn scan_lines_fused_avx2_inner<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
+    mut prefix_xor_fn: impl FnMut(u64) -> u64,
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    if valid_len == 0 {
+        return;
+    }
+    let mut line_start = 0usize;
+    let mut cm_buf = [0u32; CM_BUF_CAP + 72];
+    let mut cm_head = 0usize;
+    let mut cm_tail = 0usize;
+    let mut prev_delim = 1u64;
+    let mut prev_in_q = 0u64;
+    let mut line_start_parity = 0u64;
+    let mut line_bad = 0u64;
+    let mut line_na = 0u64;
+    let mut line_qt = 0u64;
+    let mut p = 0usize;
+
+    use std::arch::x86_64::*;
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+    let v_cm = _mm256_set1_epi8(b',' as i8);
+    let v_qt = _mm256_set1_epi8(b'"' as i8);
+    let base = padded_buf.as_ptr();
+
+    while p + 64 < valid_len {
+        let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+        let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+        let nl_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32);
+        let cm_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32);
+        let qt_mask = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32);
+        let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+            0u64
+        } else {
+            (_mm256_movemask_epi8(v0) as u32 as u64)
+                | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32)
+        };
+        let nb = *base.add(p + 64);
+        let next_d0 = u64::from((nb == b',') | (nb == b'\n'));
+        scan_fused_step64::<K>(
+            padded_buf,
+            p,
+            nl_mask,
+            cm_mask,
+            qt_mask,
+            na_mask,
+            cm_mask | nl_mask,
+            next_d0,
+            &mut prev_delim,
+            &mut prev_in_q,
+            &mut line_start,
+            &mut cm_buf,
+            &mut cm_head,
+            &mut cm_tail,
+            &mut line_start_parity,
+            &mut line_bad,
+            &mut line_na,
+            &mut line_qt,
+            &mut on_line,
+            &mut prefix_xor_fn,
+        );
+        p += 64;
+    }
+
+    if p < valid_len {
+        let rem = valid_len - p;
+        let valid_mask = if rem == 64 { !0u64 } else { (1u64 << rem) - 1 };
+        let eof_bit = if rem < 64 { 1u64 << rem } else { 0u64 };
+        let tail_next_d0 = u64::from(rem == 64);
+        let v0 = _mm256_loadu_si256(base.add(p) as *const __m256i);
+        let v1 = _mm256_loadu_si256(base.add(p + 32) as *const __m256i);
+        let nl_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)) as u32 as u64) << 32))
+            & valid_mask;
+        let cm_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)) as u32 as u64) << 32))
+            & valid_mask;
+        let qt_mask = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)) as u32 as u64) << 32))
+            & valid_mask;
+        let na_mask = if _mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0 {
+            0u64
+        } else {
+            ((_mm256_movemask_epi8(v0) as u32 as u64)
+                | ((_mm256_movemask_epi8(v1) as u32 as u64) << 32))
+                & valid_mask
+        };
+        scan_fused_step64::<K>(
+            padded_buf,
+            p,
+            nl_mask,
+            cm_mask,
+            qt_mask,
+            na_mask,
+            cm_mask | nl_mask | eof_bit,
+            tail_next_d0,
+            &mut prev_delim,
+            &mut prev_in_q,
+            &mut line_start,
+            &mut cm_buf,
+            &mut cm_head,
+            &mut cm_tail,
+            &mut line_start_parity,
+            &mut line_bad,
+            &mut line_na,
+            &mut line_qt,
+            &mut on_line,
+            &mut prefix_xor_fn,
+        );
+    }
+
+    if line_start < valid_len
+        && (cm_tail - cm_head) == K - 1
+        && line_bad == 0
+        && prev_in_q == line_start_parity
+        && (line_na == 0
+            || std::str::from_utf8(padded_buf.get_unchecked(line_start..valid_len)).is_ok())
+    {
+        on_line(
+            padded_buf,
+            line_start,
+            valid_len,
+            cm_buf.as_ptr().add(cm_head),
+            line_qt != 0,
+        );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "pclmulqdq"
+))]
+#[inline(always)]
+pub fn scan_lines_fused_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let all_ones = _mm_set1_epi8(-1);
+        scan_lines_fused_avx2_inner::<K>(padded_buf, valid_len, on_line, |qt_mask| {
+            let qv = _mm_cvtsi64_si128(qt_mask as i64);
+            _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0x00>(qv, all_ones)) as u64
+        });
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(target_feature = "pclmulqdq")
+))]
+#[target_feature(enable = "avx2,pclmulqdq")]
+unsafe fn scan_lines_fused_avx2_clmul<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
+) {
+    use std::arch::x86_64::*;
+    let all_ones = _mm_set1_epi8(-1);
+    scan_lines_fused_avx2_inner::<K>(padded_buf, valid_len, on_line, |qt_mask| {
+        let qv = _mm_cvtsi64_si128(qt_mask as i64);
+        _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0x00>(qv, all_ones)) as u64
+    });
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(target_feature = "pclmulqdq")
+))]
+unsafe fn scan_lines_fused_avx2_sw<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
+) {
+    scan_lines_fused_avx2_inner::<K>(padded_buf, valid_len, on_line, prefix_xor_u64);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(target_feature = "pclmulqdq")
+))]
+pub fn scan_lines_fused_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
+) {
+    if std::is_x86_feature_detected!("pclmulqdq") {
+        unsafe { scan_lines_fused_avx2_clmul::<K>(padded_buf, valid_len, on_line) }
+    } else {
+        unsafe { scan_lines_fused_avx2_sw::<K>(padded_buf, valid_len, on_line) }
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+pub fn scan_lines_fused_avx2<const K: usize>(
+    padded_buf: &[u8],
+    valid_len: usize,
+    mut on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
+) {
+    assert!(K >= 2);
+    assert!(valid_len < (1 << 31));
+    assert!(padded_buf.len() >= valid_len + 64);
+    let data = &padded_buf[..valid_len];
+    let base = padded_buf.as_ptr() as usize;
+    let mut commas = [0u32; K];
+    for_each_line_fields_slice::<K>(data, |fields| {
+        let raw_0 = (fields[0].as_ptr() as usize) - base;
+        let ls = if raw_0 > 0 && padded_buf[raw_0 - 1] == b'"' {
+            raw_0 - 1
+        } else {
+            raw_0
+        };
+        let mut prev_raw_e = 0usize;
+        let mut le = ls;
+        let mut has_qt = false;
+        for i in 0..K {
+            let f_s = (fields[i].as_ptr() as usize) - base;
+            let f_e = f_s + fields[i].len();
+            let is_q = if i == 0 {
+                f_s > ls
+            } else {
+                f_s > prev_raw_e + 1
+            };
+            has_qt |= is_q;
+            let raw_e = f_e + usize::from(is_q);
+            if i + 1 < K {
+                commas[i] = raw_e as u32;
+            } else {
+                le = raw_e;
+            }
+            prev_raw_e = raw_e;
+        }
+        on_line(padded_buf, ls, le, commas.as_ptr(), has_qt);
+    });
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
 pub fn for_each_line_fields_slice<const K: usize>(slice: &[u8], mut f: impl FnMut([&[u8]; K])) {
     assert!(K >= 2);
     let valid_len = slice.len();
@@ -1782,6 +2141,16 @@ impl<const K: usize> LineBounds<K> {
 pub unsafe fn field_span(base: *const u8, s: usize, e: usize) -> (usize, usize) {
     let q = usize::from(*base.add(s) == b'"');
     (s + q, e - q)
+}
+
+#[inline(always)]
+pub unsafe fn unquote_span(base: *const u8, s: usize, e: usize, has_qt: bool) -> (usize, usize) {
+    if !has_qt {
+        (s, e - s)
+    } else {
+        let q = usize::from(*base.add(s) == b'"');
+        (s + q, (e - s) - (q << 1))
+    }
 }
 
 #[inline(always)]
@@ -2576,134 +2945,85 @@ impl CsvSource {
     ) -> io::Result<()> {
         let file = &self.files[task.file_idx];
         let file_len = self.lens[task.file_idx];
-        if buf.len() < READ_BLOCK_BYTES + pad {
-            buf.resize(READ_BLOCK_BYTES + pad, 0);
+        let read_start = if task.align_start {
+            task.start.saturating_sub(1)
+        } else {
+            task.start
+        };
+        let init_len = task.end.saturating_sub(read_start);
+        if init_len == 0 {
+            return Ok(());
+        }
+        if buf.len() < init_len + 8192 + pad {
+            buf.resize(init_len + 8192 + pad, 0);
         }
 
-        let mut offset = task.start as u64;
-        let mut carry = 0usize;
+        let tr = if PD {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let n = read_at_full(file, &mut buf[..init_len], read_start as u64)?;
+        if let Some(t) = tr {
+            *pread_ns += t.elapsed().as_nanos() as u64;
+        }
+        if n == 0 {
+            return Ok(());
+        }
 
-        if task.skip_header || task.align_start {
-            if task.align_start {
-                offset = (task.start as u64) - 1;
-            }
-            let mut found = false;
-            while offset < task.end as u64 {
-                let to_read = READ_BLOCK_BYTES.min(task.end - offset as usize);
-                if buf.len() < to_read + pad {
-                    buf.resize(to_read + pad, 0);
+        let line0 = if task.skip_header || task.align_start {
+            let Some(nl) = memchr(b'\n', &buf[..n]) else {
+                return Ok(());
+            };
+            nl + 1
+        } else {
+            0
+        };
+        if line0 >= n {
+            return Ok(());
+        }
+
+        let mut total_end = n;
+        if buf[n - 1] != b'\n' && read_start + n < file_len {
+            let mut pos = (read_start + n) as u64;
+            let mut cur_end = n;
+            let mut step_cap = 8192usize;
+            loop {
+                let step = step_cap.min(file_len - pos as usize);
+                if step == 0 {
+                    break;
+                }
+                if buf.len() < cur_end + step + pad {
+                    buf.resize((cur_end + step).next_power_of_two() + pad, 0);
                 }
                 let tr = if PD {
                     Some(std::time::Instant::now())
                 } else {
                     None
                 };
-                let n = read_at_full(file, &mut buf[..to_read], offset)?;
+                let m = read_at_full(file, &mut buf[cur_end..cur_end + step], pos)?;
                 if let Some(t) = tr {
                     *pread_ns += t.elapsed().as_nanos() as u64;
                 }
-                if n == 0 {
+                if m == 0 {
                     break;
                 }
-                offset += n as u64;
-                if let Some(nl) = memchr(b'\n', &buf[..n]) {
-                    let start = nl + 1;
-                    if start < n {
-                        if let Some(rel_last_nl) = memrchr(b'\n', &buf[start..n]) {
-                            let process_len = rel_last_nl + 1;
-                            feed(&buf[start..], process_len);
-                            let abs_end = start + process_len;
-                            buf.copy_within(abs_end..n, 0);
-                            carry = n - abs_end;
-                        } else {
-                            buf.copy_within(start..n, 0);
-                            carry = n - start;
-                        }
-                    }
-                    found = true;
+                pos += m as u64;
+                if let Some(rel_nl) = memchr(b'\n', &buf[cur_end..cur_end + m]) {
+                    cur_end += rel_nl + 1;
                     break;
                 }
+                cur_end += m;
+                step_cap = 65536;
             }
-            if !found {
-                return Ok(());
-            }
+            total_end = cur_end;
         }
 
-        loop {
-            if carry > 0 {
-                if let Some(last_nl) = memrchr(b'\n', &buf[..carry]) {
-                    let process_end = last_nl + 1;
-                    feed(buf, process_end);
-                    let rem = carry - process_end;
-                    buf.copy_within(process_end..carry, 0);
-                    carry = rem;
-                }
-            }
-            if offset >= task.end as u64 {
-                break;
-            }
-            let to_read = READ_BLOCK_BYTES.min(task.end - offset as usize);
-            if buf.len() < carry + to_read + pad {
-                buf.resize((carry + to_read).next_power_of_two() + pad, 0);
-            }
-            let tr = if PD {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let n = read_at_full(file, &mut buf[carry..carry + to_read], offset)?;
-            if let Some(t) = tr {
-                *pread_ns += t.elapsed().as_nanos() as u64;
-            }
-            if n == 0 {
-                break;
-            }
-            offset += n as u64;
-            carry += n;
+        if buf.len() < total_end + pad {
+            buf.resize(total_end + pad, 0);
         }
-
-        if carry > 0 {
-            if task.end < file_len {
-                let mut pos = task.end as u64;
-                let mut line_len = carry;
-                loop {
-                    let step = 65536.min(file_len - pos as usize);
-                    if step == 0 {
-                        break;
-                    }
-                    if buf.len() < line_len + step + pad {
-                        buf.resize((line_len + step).next_power_of_two() + pad, 0);
-                    }
-                    let tr = if PD {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-                    let n = read_at_full(file, &mut buf[line_len..line_len + step], pos)?;
-                    if let Some(t) = tr {
-                        *pread_ns += t.elapsed().as_nanos() as u64;
-                    }
-                    if n == 0 {
-                        break;
-                    }
-                    pos += n as u64;
-                    if let Some(rel_nl) = memchr(b'\n', &buf[line_len..line_len + n]) {
-                        line_len += rel_nl + 1;
-                        break;
-                    }
-                    line_len += n;
-                }
-                if buf.len() < line_len + pad {
-                    buf.resize(line_len + pad, 0);
-                }
-                feed(buf, line_len);
-            } else {
-                if buf.len() < carry + pad {
-                    buf.resize(carry + pad, 0);
-                }
-                feed(buf, carry);
-            }
-        }
+        buf[total_end..total_end + pad].fill(0);
+        feed(&buf[line0..], total_end - line0);
         Ok(())
     }
 
@@ -2719,15 +3039,27 @@ impl CsvSource {
     }
 
     #[inline(always)]
-    pub fn for_each_chunk_direct_batched_timed<const K: usize, const PD: bool>(
+    pub fn for_each_chunk_fused_timed<const K: usize, const PD: bool>(
         &self,
         task: ChunkTask,
         buf: &mut Vec<u8>,
         pread_ns: &mut u64,
-        mut on_batch: impl FnMut(&[u8], &[u32], &[DirectLineRef]),
+        mut on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
     ) -> io::Result<()> {
         self.for_each_chunk_blocks_impl::<PD>(task, buf, 64, pread_ns, |padded, valid_len| {
-            scan_lines_direct_batched_avx2::<K>(padded, valid_len, &mut on_batch);
+            scan_lines_fused_avx2::<K>(padded, valid_len, &mut on_line);
+        })
+    }
+
+    #[inline(always)]
+    pub fn for_each_chunk_fused<const K: usize>(
+        &self,
+        task: ChunkTask,
+        buf: &mut Vec<u8>,
+        mut on_line: impl FnMut(&[u8], usize, usize, *const u32, bool),
+    ) -> io::Result<()> {
+        self.for_each_chunk_blocks(task, buf, 64, |padded, valid_len| {
+            scan_lines_fused_avx2::<K>(padded, valid_len, &mut on_line);
         })
     }
 
@@ -3248,6 +3580,35 @@ mod tests {
             }
         });
         assert_eq!(ev_batched_dir, ev_scalar);
+
+        let mut fused_dir = Vec::new();
+        scan_lines_fused_avx2::<2>(&padded, data.len(), |p, ls, le, cm_ptr, has_qt| {
+            let base = p.as_ptr();
+            let c0 = unsafe { *cm_ptr } as usize;
+            let (s0, l0) = unsafe { unquote_span(base, ls, c0, has_qt) };
+            let (s1, l1) = unsafe { unquote_span(base, c0 + 1, le, has_qt) };
+            fused_dir.push((p[s0..s0 + l0].to_vec(), p[s1..s1 + l1].to_vec()));
+        });
+        assert_eq!(fused_dir, scalar_expected);
+
+        let mut ev_fused_dir = Vec::new();
+        scan_lines_fused_avx2::<7>(&ev_pad, ev_data.len(), |p, ls, le, cm_ptr, has_qt| {
+            let base = p.as_ptr();
+            let mut row = Vec::with_capacity(7);
+            let mut prev = ls;
+            for k in 0..7 {
+                let end = if k < 6 {
+                    unsafe { *cm_ptr.add(k) as usize }
+                } else {
+                    le
+                };
+                let (s, l) = unsafe { unquote_span(base, prev, end, has_qt) };
+                row.push(p[s..s + l].to_vec());
+                prev = end + 1;
+            }
+            ev_fused_dir.push(row);
+        });
+        assert_eq!(ev_fused_dir, ev_scalar);
     }
 
     #[test]
