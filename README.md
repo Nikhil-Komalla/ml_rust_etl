@@ -4,6 +4,12 @@ A standalone, ~17,800-line Rust columnar execution engine (`shopping-sessions`) 
 
 Beyond e-commerce telemetry, this exact five-primitive architecture maps directly onto **high-throughput computational materials science workflows**—specifically unifying millions of **first-principles Density Functional Theory (DFT)** calculations (VASP, Quantum ESPRESSO, GPAW, CP2K, FHI-aims) and **Machine Learning Interatomic Potential (MLIP)** simulations (MACE, CHGNet, M3GNet, NequIP, Allegro, SevenNet, EquiformerV2, DeePMD, MatterSim) across **catalysis, solar/photovoltaics, batteries, and semiconductor defect engineering**.
 
+### Competition Standing
+
+Ranked **#72 out of 408 teams** (Top 18%) on the official **Databricks Buildathon — Shopping Sessions** final leaderboard with a **2.5641 s** final run time:
+
+![Databricks Shopping Sessions Final Leaderboard — Rank #72 of 408 teams (2.5641 s)](assets/leaderboard_rank_72.jpg)
+
 ---
 
 ## Table of Contents
