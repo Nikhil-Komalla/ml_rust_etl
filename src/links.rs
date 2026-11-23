@@ -202,41 +202,39 @@ impl LinkMap {
     }
 
     #[inline(always)]
-    pub fn prefetch_slot_b37(&self, h42: u64) {
+    pub fn prefetch_slot_b37_idx(&self, h42: u64) -> u32 {
         if self.empty || self.seg_groups == 0 {
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let s = (h42 >> 36) as usize;
-            let rem36 = h42 & REM36_MASK;
-            let g = fast_range32(rem36, self.seg_groups);
-            std::arch::x86_64::_mm_prefetch(
-                self.groups_b37.as_ptr().add(s * self.seg_groups + g) as *const i8,
-                std::arch::x86_64::_MM_HINT_T0,
-            );
-        }
-    }
-
-    #[inline(always)]
-    pub fn probe_b37(&self, h42: u64) -> Option<CompactKey64> {
-        if self.empty || self.seg_groups == 0 {
-            return None;
+            return 0;
         }
         let s = (h42 >> 36) as usize;
         let rem36 = h42 & REM36_MASK;
-        let k31_p1 = ((rem36 & 0x7FFF_FFFF) as u32) + 1;
-        let top5 = (rem36 >> 31) as u16;
-        let seg_groups = self.seg_groups;
-        let base = s * seg_groups;
-        let mut g = fast_range32(rem36, seg_groups);
+        let g = fast_range32(rem36, self.seg_groups);
+        let idx = s * self.seg_groups + g;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                self.groups_b37.as_ptr().add(idx) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        idx as u32
+    }
+
+    #[inline(always)]
+    pub fn probe_b37_at(&self, h42: u64, grp_idx: u32) -> Option<CompactKey64> {
+        if self.empty || self.seg_groups == 0 {
+            return None;
+        }
+        let k31_p1 = ((h42 & 0x7FFF_FFFF) as u32) + 1;
+        let top5 = ((h42 >> 31) & 0x1F) as u16;
+        let mut cur = grp_idx as usize;
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         unsafe {
             use std::arch::x86_64::*;
             debug_assert_eq!((self.groups_b37.as_ptr() as usize) & 63, 0);
             let target = _mm256_set1_epi32(k31_p1 as i32);
             loop {
-                let grp = &*self.groups_b37.as_ptr().add(base + g);
+                let grp = &*self.groups_b37.as_ptr().add(cur);
                 let v = _mm256_load_si256(grp.keys.as_ptr() as *const __m256i);
                 let eq = _mm256_cmpeq_epi32(v, target);
                 let mut m = (_mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32) & 0x3F;
@@ -251,15 +249,18 @@ impl LinkMap {
                 if grp.ovf == 0 {
                     return None;
                 }
-                g += 1;
-                if g == seg_groups {
-                    g = 0;
+                let seg_groups = self.seg_groups;
+                let base = ((h42 >> 36) as usize) * seg_groups;
+                let end = base + seg_groups;
+                cur += 1;
+                if cur == end {
+                    cur = base;
                 }
             }
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         loop {
-            let grp = unsafe { &*self.groups_b37.as_ptr().add(base + g) };
+            let grp = unsafe { &*self.groups_b37.as_ptr().add(cur) };
             for lane in 0..GROUP_LANES {
                 let k = grp.keys[lane];
                 if k == 0 {
@@ -272,11 +273,32 @@ impl LinkMap {
             if grp.ovf == 0 {
                 return None;
             }
-            g += 1;
-            if g == seg_groups {
-                g = 0;
+            let seg_groups = self.seg_groups;
+            let base = ((h42 >> 36) as usize) * seg_groups;
+            let end = base + seg_groups;
+            cur += 1;
+            if cur == end {
+                cur = base;
             }
         }
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub fn prefetch_slot_b37(&self, h42: u64) {
+        let _ = self.prefetch_slot_b37_idx(h42);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline(always)]
+    pub fn probe_b37(&self, h42: u64) -> Option<CompactKey64> {
+        if self.empty || self.seg_groups == 0 {
+            return None;
+        }
+        let s = (h42 >> 36) as usize;
+        let rem36 = h42 & REM36_MASK;
+        let g = fast_range32(rem36, self.seg_groups);
+        self.probe_b37_at(h42, (s * self.seg_groups + g) as u32)
     }
 
     #[inline(always)]
@@ -552,6 +574,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     // Stage L1: parallel CsvSource parse into per-worker edge lists and sharded inline/hex32 endpoints.
     let next_chunk = AtomicUsize::new(0);
     let nworkers = n_threads.min(chunks.len());
+    let est_edges = (src.total_bytes() / (18 * nworkers.max(1))).max(256);
     let mut worker_edges: Vec<Vec<(CompactKey64, CompactKey64)>> =
         (0..nworkers).map(|_| Vec::new()).collect();
     let mut worker_inline_buckets: Vec<Vec<Vec<CompactKey64>>> = (0..nworkers)
@@ -571,6 +594,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
                          hex_out: &mut Vec<Hex128>,
                          err_out: &mut Option<io::Error>| {
         let mut buf = Vec::new();
+        edges_out.reserve(est_edges);
         loop {
             let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
             let Some(&task) = chunks.get(cidx) else {
@@ -706,7 +730,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     // Stage L2: shard-parallel interning with 4B tagged slots (tag12 | (local_idx + 1)).
     let intern_shard = |batches: Vec<Vec<CompactKey64>>, w_hex: &[Vec<Hex128>]| {
         let total: usize = batches.iter().map(Vec::len).sum();
-        let mut cap = ((total * 10 / 9).max(16)).next_power_of_two();
+        let mut cap = ((total * 3 / 2).max(16)).next_power_of_two();
         let mut mask = cap - 1;
         let mut slots = vec![0u32; cap];
         let mut nodes: Vec<CompactKey64> = Vec::with_capacity((total / 2).max(16));
@@ -849,7 +873,7 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     all_nodes.append(&mut long_nodes);
 
     let mut parent: Vec<AtomicU32> = Vec::with_capacity(num_nodes);
-    if n_threads == 1 || num_nodes < 16_384 {
+    if n_threads == 1 || num_nodes < 262_144 {
         for i in 0..num_nodes {
             parent.push(AtomicU32::new(i as u32));
         }
@@ -990,11 +1014,28 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
     drop(build_shards);
     drop(long_build_map);
 
-    // Flatten parent in place in parallel to true root r (parent[r] == r).
-    let flatten_range = |lo: usize, hi: usize| {
-        for i in lo..hi {
+    // Flatten parent in place + build canonical CompactKey64 per inline root in one parallel pass.
+    let mut root_canon = vec![CompactKey64::EMPTY; num_nodes];
+    let mut canon_hex: Vec<Hex128> = Vec::new();
+    let mut canon_arena: Vec<u8> = Vec::new();
+    let mut canon_spans: Vec<(u32, u32)> = Vec::new();
+
+    if n_threads == 1 || num_nodes < 16_384 {
+        for i in 0..num_nodes {
             let p0 = parent[i].load(Ordering::Relaxed);
             if p0 as usize == i {
+                if i < num_inline {
+                    let r_key = all_nodes[i];
+                    root_canon[i] = if r_key.is_ub37() {
+                        CompactKey64::from_uh42(biject42(r_key.ub37_val()))
+                    } else if r_key.is_hex() {
+                        let cid = canon_hex.len() as u32;
+                        canon_hex.push(r_key.resolve_hex(&worker_hex));
+                        CompactKey64::from_comp(cid)
+                    } else {
+                        r_key
+                    };
+                }
                 continue;
             }
             let mut r = p0;
@@ -1009,71 +1050,14 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
                 parent[i].store(r, Ordering::Relaxed);
             }
         }
-    };
-    if n_threads == 1 || num_nodes < 16_384 {
-        flatten_range(0, num_nodes);
     } else {
         let chunk_sz = ((num_nodes + n_threads - 1) / n_threads).max(1);
-        std::thread::scope(|scope| {
-            let parent_ref = &parent;
-            for w in 0..n_threads {
-                let lo = (w * chunk_sz).min(num_nodes);
-                let hi = ((w + 1) * chunk_sz).min(num_nodes);
-                if lo < hi {
-                    scope.spawn(move || {
-                        for i in lo..hi {
-                            let p0 = parent_ref[i].load(Ordering::Relaxed);
-                            if p0 as usize == i {
-                                continue;
-                            }
-                            let mut r = p0;
-                            loop {
-                                let p = parent_ref[r as usize].load(Ordering::Relaxed);
-                                if p == r {
-                                    break;
-                                }
-                                r = p;
-                            }
-                            if r != p0 {
-                                parent_ref[i].store(r, Ordering::Relaxed);
-                            }
-                        }
-                    });
-                }
-            }
-        });
-    }
-
-    // Build canonical CompactKey64 per root (parallel over num_inline).
-    let mut root_canon = vec![CompactKey64::EMPTY; num_nodes];
-    let mut canon_hex: Vec<Hex128> = Vec::new();
-    let mut canon_arena: Vec<u8> = Vec::new();
-    let mut canon_spans: Vec<(u32, u32)> = Vec::new();
-
-    if n_threads == 1 || num_inline < 16_384 {
-        for i in 0..num_inline {
-            if parent[i].load(Ordering::Relaxed) as usize != i {
-                continue;
-            }
-            let r_key = all_nodes[i];
-            root_canon[i] = if r_key.is_ub37() {
-                CompactKey64::from_uh42(biject42(r_key.ub37_val()))
-            } else if r_key.is_hex() {
-                let cid = canon_hex.len() as u32;
-                canon_hex.push(r_key.resolve_hex(&worker_hex));
-                CompactKey64::from_comp(cid)
-            } else {
-                r_key
-            };
-        }
-    } else {
-        let chunk_sz = ((num_inline + n_threads - 1) / n_threads).max(1);
         let mut local_hexs: Vec<Vec<(usize, Hex128)>> = (0..n_threads).map(|_| Vec::new()).collect();
         std::thread::scope(|scope| {
-            let parent_slice = &parent;
-            let all_nodes_slice = &all_nodes;
+            let parent_ref = &parent;
+            let all_nodes_ref = &all_nodes;
             let hex_ref = &worker_hex;
-            for (w, (rc_chunk, hex_out)) in root_canon[..num_inline]
+            for (w, (rc_chunk, hex_out)) in root_canon
                 .chunks_mut(chunk_sz)
                 .zip(local_hexs.iter_mut())
                 .enumerate()
@@ -1082,16 +1066,30 @@ pub fn build_link_map(paths: &[PathBuf], ncpu: usize) -> io::Result<LinkMap> {
                 scope.spawn(move || {
                     for (j, rc_slot) in rc_chunk.iter_mut().enumerate() {
                         let i = base + j;
-                        if parent_slice[i].load(Ordering::Relaxed) as usize != i {
+                        let p0 = parent_ref[i].load(Ordering::Relaxed);
+                        if p0 as usize == i {
+                            if i < num_inline {
+                                let r_key = unsafe { *all_nodes_ref.get_unchecked(i) };
+                                if r_key.is_ub37() {
+                                    *rc_slot = CompactKey64::from_uh42(biject42(r_key.ub37_val()));
+                                } else if r_key.is_hex() {
+                                    hex_out.push((i, r_key.resolve_hex(hex_ref)));
+                                } else {
+                                    *rc_slot = r_key;
+                                }
+                            }
                             continue;
                         }
-                        let r_key = unsafe { *all_nodes_slice.get_unchecked(i) };
-                        if r_key.is_ub37() {
-                            *rc_slot = CompactKey64::from_uh42(biject42(r_key.ub37_val()));
-                        } else if r_key.is_hex() {
-                            hex_out.push((i, r_key.resolve_hex(hex_ref)));
-                        } else {
-                            *rc_slot = r_key;
+                        let mut r = p0;
+                        loop {
+                            let p = parent_ref[r as usize].load(Ordering::Relaxed);
+                            if p == r {
+                                break;
+                            }
+                            r = p;
+                        }
+                        if r != p0 {
+                            parent_ref[i].store(r, Ordering::Relaxed);
                         }
                     }
                 });

@@ -816,10 +816,22 @@ impl DateCache {
         let ts_hi = unsafe { u64::from_ne_bytes(*(p_ts as *const [u8; 8])) };
         let ing_hi = unsafe { u64::from_ne_bytes(*(p_ing as *const [u8; 8])) };
         if (ts_hi == ing_hi) & (ts_lo == ing_lo) {
-            let idx = date_cache_idx(ts_lo);
-            let e = unsafe { *self.entries.get_unchecked(idx) };
+            let e = unsafe { *self.entries.get_unchecked(date_cache_idx(ts_lo)) };
             if (e.hi == ts_hi) & (e.lo == ts_lo) {
-                return Some(((e.day_off_sec as i64).wrapping_add(ts_hms), ing_hms - ts_hms));
+                let ts_rel_sec = (e.day_off_sec as i64).wrapping_add(ts_hms);
+                return Some((ts_rel_sec, ing_hms - ts_hms));
+            }
+        } else {
+            let ts_e = unsafe { *self.entries.get_unchecked(date_cache_idx(ts_lo)) };
+            let ing_e = unsafe { *self.entries.get_unchecked(date_cache_idx(ing_lo)) };
+            if (ts_e.hi == ts_hi)
+                & (ts_e.lo == ts_lo)
+                & (ing_e.hi == ing_hi)
+                & (ing_e.lo == ing_lo)
+            {
+                let ts_rel_sec = (ts_e.day_off_sec as i64).wrapping_add(ts_hms);
+                let ing_rel_sec = (ing_e.day_off_sec as i64).wrapping_add(ing_hms);
+                return Some((ts_rel_sec, ing_rel_sec - ts_rel_sec));
             }
         }
         self.parse_f1_pair_rel_sec_slow(
