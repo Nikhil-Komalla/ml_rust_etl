@@ -2476,9 +2476,86 @@ pub struct ChunkTask {
     pub align_start: bool,
 }
 
+#[cfg(unix)]
+struct MmapSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[cfg(unix)]
+unsafe impl Send for MmapSlice {}
+#[cfg(unix)]
+unsafe impl Sync for MmapSlice {}
+
+#[cfg(unix)]
+impl Drop for MmapSlice {
+    fn drop(&mut self) {
+        extern "C" {
+            fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+        }
+        if self.len > 0 && !self.ptr.is_null() {
+            unsafe {
+                let _ = munmap(self.ptr as *mut std::ffi::c_void, self.len);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl MmapSlice {
+    fn map_read_only(file: &File, len: usize) -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn mmap(
+                addr: *mut std::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut std::ffi::c_void;
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const PROT_READ: i32 = 1;
+        const MAP_PRIVATE: i32 = 2;
+        const MADV_SEQUENTIAL: i32 = 2;
+        const MAP_FAILED: usize = usize::MAX;
+        if len == 0 {
+            return None;
+        }
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if (ptr as usize) == MAP_FAILED || ptr.is_null() {
+            return None;
+        }
+        unsafe {
+            let _ = madvise(ptr, len, MADV_SEQUENTIAL);
+        }
+        Some(Self {
+            ptr: ptr as *const u8,
+            len,
+        })
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 pub struct CsvSource {
     files: Vec<File>,
     lens: Vec<usize>,
+    #[cfg(unix)]
+    maps: Vec<Option<MmapSlice>>,
     total_bytes: usize,
 }
 
@@ -2521,12 +2598,20 @@ impl CsvSource {
     pub fn open(paths: &[PathBuf]) -> io::Result<Self> {
         let mut files = Vec::with_capacity(paths.len());
         let mut lens = Vec::with_capacity(paths.len());
+        #[cfg(unix)]
+        let mut maps = Vec::with_capacity(paths.len());
         let mut total_bytes = 0usize;
         for path in paths {
             let file = File::open(path)?;
             let len = file.metadata()?.len() as usize;
             #[cfg(unix)]
-            fadvise_sequential(&file, len);
+            {
+                let map = MmapSlice::map_read_only(&file, len);
+                if map.is_none() {
+                    fadvise_sequential(&file, len);
+                }
+                maps.push(map);
+            }
             files.push(file);
             lens.push(len);
             total_bytes += len;
@@ -2534,6 +2619,8 @@ impl CsvSource {
         Ok(Self {
             files,
             lens,
+            #[cfg(unix)]
+            maps,
             total_bytes,
         })
     }
@@ -2588,6 +2675,78 @@ impl CsvSource {
     ) -> io::Result<()> {
         let file = &self.files[task.file_idx];
         let file_len = self.lens[task.file_idx];
+
+        #[cfg(unix)]
+        if let Some(map) = &self.maps[task.file_idx] {
+            let data = map.as_slice();
+            let end = task.end.min(file_len);
+            if task.start >= end {
+                return Ok(());
+            }
+            let lo = if task.skip_header {
+                match ::memchr::memchr(b'\n', &data[task.start..end]) {
+                    Some(rel) => task.start + rel + 1,
+                    None => return Ok(()),
+                }
+            } else if task.align_start {
+                let scan_from = task.start.saturating_sub(1);
+                match ::memchr::memchr(b'\n', &data[scan_from..end]) {
+                    Some(rel) => scan_from + rel + 1,
+                    None => return Ok(()),
+                }
+            } else {
+                task.start
+            };
+            if lo >= end {
+                return Ok(());
+            }
+            let hi = if data[end - 1] == b'\n' {
+                end
+            } else if let Some(rel) = ::memchr::memchr(b'\n', &data[end..]) {
+                end + rel + 1
+            } else {
+                file_len
+            };
+
+            let safe_end = file_len.saturating_sub(pad);
+            let zc_end = if lo < safe_end {
+                if hi <= safe_end {
+                    hi
+                } else if let Some(rel) = ::memchr::memrchr(b'\n', &data[lo..safe_end]) {
+                    lo + rel + 1
+                } else {
+                    lo
+                }
+            } else {
+                lo
+            };
+
+            let mut pos = lo;
+            while pos < zc_end {
+                let target = (pos + READ_BLOCK_BYTES).min(zc_end);
+                let sub_end = if target == zc_end {
+                    zc_end
+                } else if let Some(rel) = ::memchr::memrchr(b'\n', &data[pos..target]) {
+                    pos + rel + 1
+                } else if let Some(rel) = ::memchr::memchr(b'\n', &data[target..zc_end]) {
+                    target + rel + 1
+                } else {
+                    zc_end
+                };
+                let valid_len = sub_end - pos;
+                feed(&data[pos..sub_end + pad], valid_len);
+                pos = sub_end;
+            }
+
+            if zc_end < hi {
+                let rem = hi - zc_end;
+                buf.clear();
+                buf.extend_from_slice(&data[zc_end..hi]);
+                buf.resize(rem + pad, 0);
+                feed(&buf[..rem + pad], rem);
+            }
+            return Ok(());
+        }
         if buf.len() < READ_BLOCK_BYTES + pad {
             buf.resize(READ_BLOCK_BYTES + pad, 0);
         }

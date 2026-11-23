@@ -342,6 +342,12 @@ impl UserDailyWriter {
                     dst.add(4 + uid_len - 8) as *mut u64,
                     std::ptr::read_unaligned(uptr.add(uid_len - 8) as *const u64),
                 );
+            } else if uid_len >= 4 && uid_len < 8 {
+                let src = user_id.as_ptr();
+                let lo = std::ptr::read_unaligned(src as *const u32);
+                let hi = std::ptr::read_unaligned(src.add(uid_len - 4) as *const u32);
+                std::ptr::write_unaligned(dst.add(4) as *mut u32, lo);
+                std::ptr::write_unaligned(dst.add(4 + uid_len - 4) as *mut u32, hi);
             } else if uid_len == 33 {
                 let uptr = user_id.as_ptr();
                 std::ptr::write_unaligned(
