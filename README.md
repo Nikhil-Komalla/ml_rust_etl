@@ -8,7 +8,7 @@ Beyond e-commerce telemetry, this exact five-primitive architecture maps directl
 
 Ranked **#72 out of 408 teams** (Top 18%) on the official **Databricks Buildathon — Shopping Sessions** final leaderboard with a **2.5641 s** final run time:
 
-![Databricks Shopping Sessions Final Leaderboard — Rank #72 of 408 teams (2.5641 s)](assets/leaderboard_rank_72.jpg)
+![Databricks Shopping Sessions Final Leaderboard — Rank #72 of 408 teams (2.5641 s)](assets/osu_leaderboard%23rank72.png)
 
 ---
 
